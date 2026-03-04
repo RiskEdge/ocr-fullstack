@@ -5,6 +5,12 @@ import asyncio
 import tempfile
 from typing import AsyncGenerator, List, Any
 
+# Max simultaneous Gemini API calls. Tune via OCR_CONCURRENCY env var.
+_CONCURRENCY = int(os.environ.get("OCR_CONCURRENCY", "5"))
+_MAX_RETRIES = 3
+# Keywords that identify a Gemini rate-limit / quota error
+_RATE_LIMIT_SIGNALS = ("quota", "rate limit", "429", "resource exhausted", "too many requests")
+
 from fastapi import UploadFile
 from google import genai
 from PIL import Image
@@ -126,16 +132,36 @@ class OCRProcessor:
                 os.remove(temp_file_path)
     
     async def stream_documents(self, files: List[UploadFile]) -> AsyncGenerator[str, None]:
-        """Processes multiple documents in parallel and streams results."""
+        """Processes documents with bounded concurrency, retrying on rate-limit errors."""
+        semaphore = asyncio.Semaphore(_CONCURRENCY)
+
+        async def process_bounded(content: bytes, filename: str, mime_type: str) -> dict:
+            async with semaphore:
+                for attempt in range(_MAX_RETRIES + 1):
+                    result = await self.process_single_file(content, filename, mime_type)
+                    if result["status"] == "success":
+                        return result
+                    msg = result.get("message", "").lower()
+                    is_rate_limit = any(sig in msg for sig in _RATE_LIMIT_SIGNALS)
+                    if is_rate_limit and attempt < _MAX_RETRIES:
+                        wait = 2 ** attempt   # 1 s, 2 s, 4 s
+                        print(f"Rate limit hit for {filename}, retrying in {wait}s (attempt {attempt + 1})")
+                        await asyncio.sleep(wait)
+                        continue
+                    break
+                # Never expose quota/rate-limit details to the client
+                if any(sig in result.get("message", "").lower() for sig in _RATE_LIMIT_SIGNALS):
+                    result = {**result, "message": "Processing failed. Please try again later."}
+                return result
+
         tasks = []
         for file in files:
             content = await file.read()
-            
             task = asyncio.create_task(
-                self.process_single_file(content, file.filename, file.content_type)
+                process_bounded(content, file.filename, file.content_type)
             )
             tasks.append(task)
-            
+
         for completed_task in asyncio.as_completed(tasks):
             result = await completed_task
             yield json.dumps(result) + "\n"

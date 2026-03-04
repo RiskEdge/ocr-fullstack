@@ -17,7 +17,8 @@ from app.auth_utils import create_access_token, get_current_user, TokenData
 app = FastAPI()
 
 origins = [
-    "http://localhost:3000"
+    "http://localhost:3000",
+    "http://localhost:3010",
 ]
 
 app.add_middleware(
@@ -74,8 +75,8 @@ async def process_invoice_stream(
     current_user: TokenData = Depends(get_current_user)):
     print(f"User {current_user.username} from {current_user.company} is processing {len(files)} files...")
     
-    if len(files) > 10:
-        raise HTTPException(status_code=400, detail="Maximum of 10 files allowed.")
+    if len(files) > 100:
+        raise HTTPException(status_code=400, detail="Maximum of 100 files allowed.")
     
     print(files)
     return StreamingResponse(processor.stream_documents(files), media_type="application/x-ndjson")
