@@ -11,6 +11,7 @@ export default defineConfig({
 		hmr: {
 			overlay: false,
 		},
+		allowedHosts: ['docu-scan.riskedgesolutions.com'],
 	},
 	plugins: [react()],
 	resolve: {
