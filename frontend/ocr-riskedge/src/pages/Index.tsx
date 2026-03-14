@@ -16,6 +16,51 @@ import { Sparkles, RefreshCw, Table2, Eye, History, PanelLeftClose, PanelLeft, C
 import DocumentGridView from "@/components/DocumentGridView";
 
 // ---------------------------------------------------------------------------
+// Session-storage persistence for processing history
+// ---------------------------------------------------------------------------
+
+const HISTORY_STORAGE_KEY = 'ocr_history';
+
+interface StoredHistoryItem {
+  id: string;
+  fileName: string;
+  fileType: string;
+  fileSize: number;
+  processedAt: string; // ISO string
+  fieldsExtracted: number;
+  fileBase64: string;  // data URL — doubles as previewUrl on restore
+  extractedData: TableRow[];
+  totalPages: number;
+  processingDuration: number;
+}
+
+async function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+function saveHistoryToStorage(items: StoredHistoryItem[]): void {
+  try {
+    sessionStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(items));
+  } catch {
+    // Storage quota exceeded — skip silently
+  }
+}
+
+function loadHistoryFromStorage(): StoredHistoryItem[] {
+  try {
+    const raw = sessionStorage.getItem(HISTORY_STORAGE_KEY);
+    return raw ? (JSON.parse(raw) as StoredHistoryItem[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -109,6 +154,39 @@ const Index = () => {
   const [showHistory, setShowHistory] = useState(true);
   const [previewMode, setPreviewMode] = useState<"single" | "grid">("single");
 
+  // Ref that mirrors history in sessionStorage (serialisable format)
+  const storedItemsRef = useRef<StoredHistoryItem[]>(loadHistoryFromStorage());
+
+  // Restore history from sessionStorage on mount
+  useEffect(() => {
+    const stored = storedItemsRef.current;
+    if (stored.length === 0) return;
+    const restore = async () => {
+      const items: HistoryItem[] = await Promise.all(
+        stored.map(async (s) => {
+          const res = await fetch(s.fileBase64);
+          const blob = await res.blob();
+          const file = new File([blob], s.fileName, { type: s.fileType });
+          return {
+            id: s.id,
+            fileName: s.fileName,
+            fileType: s.fileType,
+            fileSize: s.fileSize,
+            processedAt: new Date(s.processedAt),
+            fieldsExtracted: s.fieldsExtracted,
+            previewUrl: s.fileBase64,
+            file,
+            extractedData: s.extractedData,
+            totalPages: s.totalPages,
+            processingDuration: s.processingDuration,
+          };
+        })
+      );
+      setHistory(items);
+    };
+    restore();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
   const currentFile = selectedFiles[activeFileIndex] || null;
   const currentPreviewUrl = previewUrls[activeFileIndex] || null;
 
@@ -164,6 +242,8 @@ const Index = () => {
 
   const handleHistoryDelete = (id: string) => {
     setHistory((prev) => prev.filter((item) => item.id !== id));
+    storedItemsRef.current = storedItemsRef.current.filter((s) => s.id !== id);
+    saveHistoryToStorage(storedItemsRef.current);
     if (selectedHistoryId === id) {
       handleClearFiles();
     }
@@ -174,6 +254,8 @@ const Index = () => {
       URL.revokeObjectURL(item.previewUrl);
     });
     setHistory([]);
+    storedItemsRef.current = [];
+    saveHistoryToStorage([]);
     if (selectedHistoryId) {
       handleClearFiles();
     }
@@ -215,6 +297,10 @@ const Index = () => {
         if (!trimmed) return;
         try {
           const result = JSON.parse(trimmed);
+
+          // Skip control messages — not file results
+          if (result.type === "ping" || result.type === "run_summary") return;
+
           const fileIndex = filesToSend.findIndex((f) => f.name === result.filename);
           const absoluteIndex = fileIndex === -1 ? startIndex + doneCount : startIndex + fileIndex;
 
@@ -292,6 +378,27 @@ const Index = () => {
         if (newHistoryItems.length > 0) {
           setSelectedHistoryId(newHistoryItems[0].id);
         }
+
+        // Persist to sessionStorage (async file → base64 conversion)
+        const newStoredItems = await Promise.all(
+          newHistoryItems.map(async (item) => {
+            const fileBase64 = await fileToBase64(item.file);
+            return {
+              id: item.id,
+              fileName: item.fileName,
+              fileType: item.fileType,
+              fileSize: item.fileSize,
+              processedAt: item.processedAt.toISOString(),
+              fieldsExtracted: item.fieldsExtracted,
+              fileBase64,
+              extractedData: item.extractedData,
+              totalPages: item.totalPages,
+              processingDuration: item.processingDuration,
+            } satisfies StoredHistoryItem;
+          })
+        );
+        storedItemsRef.current = [...newStoredItems, ...storedItemsRef.current];
+        saveHistoryToStorage(storedItemsRef.current);
       }
     } catch {
       const errorStatuses: Record<number, FileStatus> = {};

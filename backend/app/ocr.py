@@ -3,23 +3,49 @@ import os
 import json
 import asyncio
 import tempfile
-from typing import AsyncGenerator, List, Any
+from datetime import datetime, timezone
+from typing import AsyncGenerator, List
 
 # Max simultaneous Gemini API calls. Tune via OCR_CONCURRENCY env var.
 _CONCURRENCY = int(os.environ.get("OCR_CONCURRENCY", "5"))
 _MAX_RETRIES = 3
+_ENVIRONMENT = os.environ.get("ENVIRONMENT", "production")
 # Keywords that identify a Gemini rate-limit / quota error
 _RATE_LIMIT_SIGNALS = ("quota", "rate limit", "429", "resource exhausted", "too many requests")
+
+# Gemini 3 Flash pricing (USD per 1M tokens)
+_INPUT_PRICE_PER_M = 0.50
+_OUTPUT_PRICE_PER_M = 3.00
 
 from fastapi import UploadFile
 from google import genai
 from PIL import Image
 import io
 
+from app.db import get_supabase
+
 
 class OCRProcessor:
     def __init__(self, api_key: str):
         self.client = genai.Client()
+
+    @staticmethod
+    def calculate_cost(input_tokens: int, output_tokens: int, total_pages: int = 1) -> dict:
+        """Returns token counts, cost breakdown, and per-page metrics."""
+        input_cost = (input_tokens / 1_000_000) * _INPUT_PRICE_PER_M
+        output_cost = (output_tokens / 1_000_000) * _OUTPUT_PRICE_PER_M
+        total_cost = input_cost + output_cost
+        per_page_cost = total_cost / total_pages if total_pages > 0 else total_cost
+        return {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+            "total_pages": total_pages,
+            "input_cost_usd": round(input_cost, 6),
+            "output_cost_usd": round(output_cost, 6),
+            "total_cost_usd": round(total_cost, 6),
+            "cost_per_page_usd": round(per_page_cost, 6),
+        }
         
     async def process_image(self, file_bytes: bytes, filename: str) -> dict:
         """Performs OCR on a single image."""
@@ -107,15 +133,23 @@ class OCRProcessor:
                 ]
             )
             
-            # print(response)
-            
+            content = json.loads(response.text)
+            total_pages = content.get("total_pages", 1)
+
+            usage = response.usage_metadata
+            token_usage = self.calculate_cost(
+                input_tokens=usage.prompt_token_count,
+                output_tokens=usage.candidates_token_count,
+                total_pages=total_pages,
+            )
+
             return {
                 "filename": filename,
                 "status": "success",
-                "content": json.loads(response.text)
-                # "text": response.text,
+                "content": content,
+                "token_usage": token_usage,
             }
-            
+
         except Exception as e:
             return {
                 "filename": filename,
@@ -131,7 +165,12 @@ class OCRProcessor:
             if temp_file_path and os.path.exists(temp_file_path):
                 os.remove(temp_file_path)
     
-    async def stream_documents(self, files: List[UploadFile]) -> AsyncGenerator[str, None]:
+    async def stream_documents(
+        self,
+        files: List[UploadFile],
+        user_id: str,
+        company_id: str,
+    ) -> AsyncGenerator[str, None]:
         """Processes documents with bounded concurrency, retrying on rate-limit errors."""
         semaphore = asyncio.Semaphore(_CONCURRENCY)
 
@@ -144,27 +183,94 @@ class OCRProcessor:
                     msg = result.get("message", "").lower()
                     is_rate_limit = any(sig in msg for sig in _RATE_LIMIT_SIGNALS)
                     if is_rate_limit and attempt < _MAX_RETRIES:
-                        wait = 2 ** attempt   # 1 s, 2 s, 4 s
+                        wait = 2 ** attempt
                         print(f"Rate limit hit for {filename}, retrying in {wait}s (attempt {attempt + 1})")
                         await asyncio.sleep(wait)
                         continue
                     break
-                # Never expose quota/rate-limit details to the client
                 if any(sig in result.get("message", "").lower() for sig in _RATE_LIMIT_SIGNALS):
                     result = {**result, "message": "Processing failed. Please try again later."}
                 return result
 
+        # Send a ping immediately to establish chunked transfer encoding.
+        yield json.dumps({"type": "ping"}) + "\n"
+
         tasks = []
+        file_types: dict[str, int] = {}
         for file in files:
             content = await file.read()
-            task = asyncio.create_task(
+            file_types[file.content_type] = file_types.get(file.content_type, 0) + 1
+            tasks.append(asyncio.create_task(
                 process_bounded(content, file.filename, file.content_type)
-            )
-            tasks.append(task)
+            ))
+
+        # Run-level accumulators
+        started_at = datetime.now(timezone.utc)
+        run_successful = 0
+        run_failed = 0
+        run_input_tokens = 0
+        run_output_tokens = 0
+        run_total_pages = 0
+        run_total_fields = 0
 
         for completed_task in asyncio.as_completed(tasks):
             result = await completed_task
+            if result.get("status") == "success":
+                run_successful += 1
+                tu = result.get("token_usage", {})
+                run_input_tokens += tu.get("input_tokens", 0)
+                run_output_tokens += tu.get("output_tokens", 0)
+                run_total_pages += tu.get("total_pages", 0)
+                # Count extracted fields (top-level keys minus confidence_score)
+                for page in result.get("content", {}).get("pages", []):
+                    run_total_fields += max(0, len(page.get("extracted_data", {})) - 1)
+            else:
+                run_failed += 1
             yield json.dumps(result) + "\n"
+            await asyncio.sleep(0)
+
+        completed_at = datetime.now(timezone.utc)
+        run_cost = self.calculate_cost(run_input_tokens, run_output_tokens, run_total_pages)
+
+        if run_failed == 0:
+            run_status = "completed"
+        elif run_successful == 0:
+            run_status = "failed"
+        else:
+            run_status = "partial"
+
+        # Insert run log
+        log_row = {
+            "user_id": user_id,
+            "company_id": company_id,
+            "total_files": len(tasks),
+            "successful_files": run_successful,
+            "failed_files": run_failed,
+            "total_pages": run_total_pages,
+            "total_fields_extracted": run_total_fields,
+            "file_types": file_types,
+            "input_tokens": run_input_tokens,
+            "output_tokens": run_output_tokens,
+            "total_cost_usd": run_cost["total_cost_usd"],
+            "total_duration_ms": int((completed_at - started_at).total_seconds() * 1000),
+            "status": run_status,
+            "started_at": started_at.isoformat(),
+            "completed_at": completed_at.isoformat(),
+            "environment": _ENVIRONMENT,
+        }
+        # print(f"[run_log] inserting: {log_row}")
+        try:
+            def _insert():
+                return get_supabase().table("processing_runs").insert(log_row).execute()
+            result = await asyncio.to_thread(_insert)
+            print(f"[run_log] inserted ok: {result}")
+        except Exception as e:
+            import traceback
+            print(f"[run_log] FAILED: {e}")
+            traceback.print_exc()
+
+        run_summary = {**run_cost, "documents_processed": len(tasks)}
+        yield json.dumps({"type": "run_summary", "token_usage": run_summary}) + "\n"
             
     async def process_multiple_images(self, files: List[tuple]):
         """ 

@@ -88,18 +88,18 @@ const DocumentPreview = ({ file, previewUrl, totalPages: totalPagesProp }: Docum
   return (
     <div className="flex-1 min-h-0 flex flex-col">
       {/* Toolbar */}
-      <div className="flex items-center justify-between pb-3 border-b border-border mb-3">
-        <div className="flex items-center gap-2">
+      <div className="pb-3 border-b border-border mb-3 space-y-2">
+        <div className="flex items-start gap-2">
           {isImage ? (
-            <Image className="w-4 h-4 text-primary" />
+            <Image className="w-4 h-4 text-primary shrink-0 mt-0.5" />
           ) : (
-            <FileText className="w-4 h-4 text-primary" />
+            <FileText className="w-4 h-4 text-primary shrink-0 mt-0.5" />
           )}
-          <span className="text-sm font-medium text-foreground truncate max-w-[180px]">
+          <span className="text-sm font-medium text-foreground break-all leading-snug">
             {file.name}
           </span>
         </div>
-        <div className="flex items-center gap-1">
+        <div className="flex items-center justify-end gap-1">
           <Button
             variant="ghost"
             size="icon"

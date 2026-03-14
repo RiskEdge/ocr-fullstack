@@ -17,6 +17,8 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 90
 class TokenData(BaseModel):
     username: str
     company: str
+    user_id: str
+    company_id: str
     
 def create_access_token(data: dict):
     to_encode = data.copy()
@@ -38,9 +40,10 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
         payload = jwt.decode(token, os.environ["SECRET_KEY"], algorithms=[os.environ["ALGORITHM"]])
         username: str = payload.get("sub")
         company: str = payload.get("company")
-        if username is None or company is None:
+        user_id: str = payload.get("user_id")
+        company_id: str = payload.get("company_id")
+        if not all([username, company, user_id, company_id]):
             raise credentials_expection
-        token_data = TokenData(username=username, company=company)
-        return token_data
+        return TokenData(username=username, company=company, user_id=user_id, company_id=company_id)
     except JWTError:
         raise credentials_expection

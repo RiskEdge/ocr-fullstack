@@ -4,15 +4,18 @@ from pydantic import BaseModel
 from fastapi import FastAPI, File, HTTPException, UploadFile, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from passlib.context import CryptContext
 
 import dotenv
 import os
-import json
 
 dotenv.load_dotenv()
 
 from app.ocr import OCRProcessor
 from app.auth_utils import create_access_token, get_current_user, TokenData
+from app.db import get_supabase
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 app = FastAPI()
 
@@ -34,17 +37,6 @@ class LoginRequest(BaseModel):
     company_name: str
     username: str
     password: str
-    
-def load_users():
-    raw_users = os.environ["MOCK_USERS"]
-    try:
-        users_list = json.loads(raw_users)
-        return {u["username"]: u for u in users_list}
-    except json.JSONDecodeError:
-        print("Error: MOCK_USERS in .env is not valid JSON")
-        return {}
-    
-MOCK_USERS = load_users()
 
 processor = OCRProcessor(api_key=os.environ["GEMINI_API_KEY"])
 
@@ -54,16 +46,41 @@ async def root():
 
 @app.post("/v1/login")
 async def login(req: LoginRequest):
-    user = MOCK_USERS.get(req.username)
-    
-    if not user or user["password"] != req.password or user["company"] != req.company_name:
+    db = get_supabase()
+    result = (
+        db.table("users")
+        .select("username, password, companies(name)")
+        .eq("username", req.username)
+        .execute()
+    )
+
+    user = result.data[0] if result.data else None
+    company_name = user["companies"]["name"] if user else None
+
+    if not user or company_name != req.company_name or not pwd_context.verify(req.password[:72], user["password"]):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect company name, username or password"
         )
-        
-    access_token = create_access_token(data={"sub": req.username, "company": req.company_name})
-    
+
+    # Fetch user_id and company_id to embed in JWT (avoids a DB lookup on every request)
+    ids_result = (
+        db.table("users")
+        .select("id, company_id")
+        .eq("username", req.username)
+        .single()
+        .execute()
+    )
+    user_id = ids_result.data["id"]
+    company_id = ids_result.data["company_id"]
+
+    access_token = create_access_token(data={
+        "sub": req.username,
+        "company": req.company_name,
+        "user_id": user_id,
+        "company_id": company_id,
+    })
+
     return {
         "access_token": access_token,
         "token_type": "bearer",
@@ -80,5 +97,12 @@ async def process_invoice_stream(
         raise HTTPException(status_code=400, detail="Maximum of 100 files allowed.")
     
     print(files)
-    return StreamingResponse(processor.stream_documents(files), media_type="application/x-ndjson")
+    return StreamingResponse(
+        processor.stream_documents(files, current_user.user_id, current_user.company_id),
+        media_type="application/x-ndjson",
+        headers={
+            "X-Accel-Buffering": "no",
+            "Cache-Control": "no-cache",
+        },
+    )
  

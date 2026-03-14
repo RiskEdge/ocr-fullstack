@@ -14,6 +14,7 @@ interface AuthContextType {
   user: User | null;
   token: string | null;
   isAuthenticated: boolean;
+  isLoading: boolean;
   login: (username: string, password: string, companyName: string) => Promise<{ success: boolean; error?: string }>;
   logout: () => void;
   companies: Company[];
@@ -30,6 +31,7 @@ export const useAuth = () => {
 export const AuthProvider = ({ children }: { children: ReactNode }) => {
   const [user, setUser] = useState<User | null>(null);
   const [token, setToken] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
     const savedToken = localStorage.getItem(TOKEN_KEY);
@@ -43,6 +45,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         localStorage.removeItem(USER_KEY);
       }
     }
+    setIsLoading(false);
   }, []);
 
   const login = useCallback(async (username: string, password: string, companyName: string) => {
@@ -73,6 +76,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         user,
         token,
         isAuthenticated: !!user,
+        isLoading,
         login,
         logout,
         companies: dummyCompanies,

@@ -158,7 +158,7 @@ const ProcessingHistory = ({
                   : "border-border hover:border-primary/50 hover:bg-muted/50"
               )}
             >
-              <div className="flex items-start gap-3">
+              <div className="flex items-start gap-3 min-w-0 w-full">
                 <div
                   className={cn(
                     "w-8 h-8 rounded-md flex items-center justify-center shrink-0",
