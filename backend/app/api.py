@@ -87,15 +87,46 @@ async def login(req: LoginRequest):
         "user": {"username": req.username, "company": req.company_name}
     }
 
+@app.get("/v1/credits")
+async def get_credits(current_user: TokenData = Depends(get_current_user)):
+    db = get_supabase()
+    result = (
+        db.table("companies")
+        .select("credits")
+        .eq("id", current_user.company_id)
+        .single()
+        .execute()
+    )
+    return {"credits": result.data["credits"]}
+
+
 @app.post("/v1/process-invoice")
 async def process_invoice_stream(
     files: List[UploadFile] = File(...),
     current_user: TokenData = Depends(get_current_user)):
     print(f"User {current_user.username} from {current_user.company} is processing {len(files)} files...")
-    
+
     if len(files) > 100:
         raise HTTPException(status_code=400, detail="Maximum of 100 files allowed.")
-    
+
+    # Check company has at least 1 credit before processing.
+    # Exact page count is unknown upfront — the final per-page deduction
+    # happens after processing completes in stream_documents().
+    db = get_supabase()
+    credits_result = (
+        db.table("companies")
+        .select("credits")
+        .eq("id", current_user.company_id)
+        .single()
+        .execute()
+    )
+    available_credits = credits_result.data["credits"]
+    if available_credits < 1:
+        raise HTTPException(
+            status_code=402,
+            detail="No credits remaining. Please contact support to top up your balance."
+        )
+
     print(files)
     return StreamingResponse(
         processor.stream_documents(files, current_user.user_id, current_user.company_id),

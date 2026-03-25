@@ -12,7 +12,7 @@ import OverallProgress from "@/components/OverallProgress";
 import { FileStatus } from "@/components/FileProcessingStatus";
 import { useAuth } from "@/contexts/AuthContext";
 import { Button } from "@/components/ui/button";
-import { Sparkles, RefreshCw, Table2, Eye, History, PanelLeftClose, PanelLeft, ChevronLeft, ChevronRight, LayoutGrid, FileText as FileTextIcon } from "lucide-react";
+import { Sparkles, RefreshCw, Table2, Eye, History, PanelLeftClose, PanelLeft, ChevronLeft, ChevronRight, LayoutGrid, FileText as FileTextIcon, Zap } from "lucide-react";
 import DocumentGridView from "@/components/DocumentGridView";
 
 // ---------------------------------------------------------------------------
@@ -135,7 +135,7 @@ function transformOCRResult(content: {
 // ---------------------------------------------------------------------------
 
 const Index = () => {
-  const { token } = useAuth();
+  const { token, credits, setCredits, refreshCredits } = useAuth();
 
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [previewUrls, setPreviewUrls] = useState<string[]>([]);
@@ -153,6 +153,7 @@ const Index = () => {
   const [processingMode, setProcessingMode] = useState<ProcessingMode>("batch");
   const [showHistory, setShowHistory] = useState(true);
   const [previewMode, setPreviewMode] = useState<"single" | "grid">("single");
+  const [lastRunCreditsUsed, setLastRunCreditsUsed] = useState<number | null>(null);
 
   // Ref that mirrors history in sessionStorage (serialisable format)
   const storedItemsRef = useRef<StoredHistoryItem[]>(loadHistoryFromStorage());
@@ -268,6 +269,12 @@ const Index = () => {
     const startIndex = processingMode === "single" ? activeFileIndex : 0;
     const filesToSend = selectedFiles.slice(startIndex, startIndex + filesToProcess);
 
+    // Block if company has zero credits (exact page cost is unknown upfront)
+    if (credits !== null && credits < 1) {
+      alert("No credits remaining. Please contact support to top up your balance.");
+      return;
+    }
+
     // Build FormData
     const formData = new FormData();
     filesToSend.forEach((file) => formData.append("files", file));
@@ -283,6 +290,7 @@ const Index = () => {
     setTotalToProcess(filesToProcess);
     setExtractedDataByFile({});
     setExtractedData([]);
+    setLastRunCreditsUsed(null);
     setActiveTab("data");
 
     const batchStart = Date.now();
@@ -298,8 +306,20 @@ const Index = () => {
         try {
           const result = JSON.parse(trimmed);
 
-          // Skip control messages — not file results
-          if (result.type === "ping" || result.type === "run_summary") return;
+          // Skip ping; handle run_summary for credit updates
+          if (result.type === "ping") return;
+          if (result.type === "run_summary") {
+            if (typeof result.credits_used === "number") {
+              setLastRunCreditsUsed(result.credits_used);
+            }
+            if (typeof result.remaining_credits === "number") {
+              setCredits(result.remaining_credits);
+            } else {
+              // fallback: fetch from API if backend didn't include it
+              refreshCredits();
+            }
+            return;
+          }
 
           const fileIndex = filesToSend.findIndex((f) => f.name === result.filename);
           const absoluteIndex = fileIndex === -1 ? startIndex + doneCount : startIndex + fileIndex;
@@ -406,7 +426,7 @@ const Index = () => {
       setFileStatuses(errorStatuses);
       setProcessingState("completed");
     }
-  }, [selectedFiles, previewUrls, token, processingMode, activeFileIndex, selectedHistoryId]);
+  }, [selectedFiles, previewUrls, token, credits, setCredits, refreshCredits, processingMode, activeFileIndex, selectedHistoryId]);
 
   // Update extracted data when switching files
   useEffect(() => {
@@ -518,6 +538,18 @@ const Index = () => {
                     isProcessing={processingState === "processing"}
                   />
                 )}
+                {/* Credits used summary */}
+                {processingState === "completed" && lastRunCreditsUsed !== null && lastRunCreditsUsed > 0 && (
+                  <div className="flex items-center gap-2 text-sm text-muted-foreground border-t border-border pt-3">
+                    <Zap className="w-3.5 h-3.5 text-yellow-500" />
+                    <span>
+                      <span className="font-medium text-foreground">{lastRunCreditsUsed}</span> credit{lastRunCreditsUsed !== 1 ? "s" : ""} used this run
+                      {credits !== null && (
+                        <span className="ml-2 text-muted-foreground">· {credits} remaining</span>
+                      )}
+                    </span>
+                  </div>
+                )}
                 <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
                   <div className="flex items-center gap-4">
                     {processingState === "idle" && (
@@ -551,7 +583,8 @@ const Index = () => {
                     )}
                     <Button
                       onClick={handleExtract}
-                      disabled={processingState === "processing"}
+                      disabled={processingState === "processing" || (credits !== null && credits < 1)}
+                      title={credits !== null && credits < 1 ? "No credits remaining" : undefined}
                       className="gap-2 flex-1 sm:flex-none"
                     >
                       <Sparkles className="w-4 h-4" />

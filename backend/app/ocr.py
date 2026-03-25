@@ -64,12 +64,6 @@ class OCRProcessor:
                     img
                 ]
             )
-            # response = await asyncio.to_thread(
-            #     self.client.models.generate_content,
-            #     [prompt, img]
-            # )
-            
-            # print(response)
             
             return {
                 "filename": filename,
@@ -239,6 +233,9 @@ class OCRProcessor:
         else:
             run_status = "partial"
 
+        # 1 credit per page processed (only successful files contribute pages)
+        credits_used = run_total_pages
+
         # Insert run log
         log_row = {
             "user_id": user_id,
@@ -257,6 +254,7 @@ class OCRProcessor:
             "started_at": started_at.isoformat(),
             "completed_at": completed_at.isoformat(),
             "environment": _ENVIRONMENT,
+            "credits_used": credits_used,
         }
         # print(f"[run_log] inserting: {log_row}")
         try:
@@ -269,8 +267,36 @@ class OCRProcessor:
             print(f"[run_log] FAILED: {e}")
             traceback.print_exc()
 
+        # Deduct 1 credit per page from the company balance
+        remaining_credits = None
+        if credits_used > 0:
+            try:
+                cid = company_id
+                to_deduct = credits_used
+
+                def _deduct_credits():
+                    db = get_supabase()
+                    row = db.table("companies").select("credits").eq("id", cid).single().execute()
+                    current_credits = row.data["credits"]
+                    new_credits = max(0, current_credits - to_deduct)
+                    update_result = db.table("companies").update({"credits": new_credits}).eq("id", cid).execute()
+                    print(f"[credits] update result: {update_result}")
+                    return new_credits
+
+                remaining_credits = await asyncio.to_thread(_deduct_credits)
+                print(f"[credits] deducted {credits_used} (pages), remaining: {remaining_credits}")
+            except Exception as e:
+                import traceback
+                print(f"[credits] FAILED to deduct credits: {e}")
+                traceback.print_exc()
+
         run_summary = {**run_cost, "documents_processed": len(tasks)}
-        yield json.dumps({"type": "run_summary", "token_usage": run_summary}) + "\n"
+        yield json.dumps({
+            "type": "run_summary",
+            "token_usage": run_summary,
+            "credits_used": credits_used,
+            "remaining_credits": remaining_credits,
+        }) + "\n"
             
     async def process_multiple_images(self, files: List[tuple]):
         """ 
