@@ -12,8 +12,11 @@ import OverallProgress from "@/components/OverallProgress";
 import { FileStatus } from "@/components/FileProcessingStatus";
 import { useAuth } from "@/contexts/AuthContext";
 import { Button } from "@/components/ui/button";
-import { Sparkles, RefreshCw, Table2, Eye, History, PanelLeftClose, PanelLeft, ChevronLeft, ChevronRight, LayoutGrid, FileText as FileTextIcon, Zap } from "lucide-react";
+import { Sparkles, RefreshCw, Table2, Eye, History, PanelLeftClose, PanelLeft, ChevronLeft, ChevronRight, LayoutGrid, FileText as FileTextIcon, Zap, ShieldCheck, Maximize2, Minimize2 } from "lucide-react";
 import DocumentGridView from "@/components/DocumentGridView";
+import ValidationResults from "@/components/ValidationResults";
+import { validateItems } from "@/lib/validateApi";
+import type { ValidatedItem } from "@/lib/validateApi";
 
 // ---------------------------------------------------------------------------
 // Session-storage persistence for processing history
@@ -131,6 +134,33 @@ function transformOCRResult(content: {
 }
 
 // ---------------------------------------------------------------------------
+// Raw OCR content types + line item extractor for validation
+// ---------------------------------------------------------------------------
+
+interface RawContent {
+  total_pages: number;
+  pages: Array<{ page_number: number; extracted_data: Record<string, unknown> }>;
+}
+
+function extractLineItems(content: RawContent): Record<string, unknown>[] {
+  const items: Record<string, unknown>[] = [];
+  for (const page of content.pages) {
+    for (const [key, val] of Object.entries(page.extracted_data)) {
+      if (key === "confidence_score") continue;
+      if (
+        Array.isArray(val) &&
+        val.length > 0 &&
+        typeof val[0] === "object" &&
+        val[0] !== null
+      ) {
+        items.push(...(val as Record<string, unknown>[]));
+      }
+    }
+  }
+  return items;
+}
+
+// ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
 
@@ -154,6 +184,11 @@ const Index = () => {
   const [showHistory, setShowHistory] = useState(true);
   const [previewMode, setPreviewMode] = useState<"single" | "grid">("single");
   const [lastRunCreditsUsed, setLastRunCreditsUsed] = useState<number | null>(null);
+  const [rawContentByFile, setRawContentByFile] = useState<Record<number, RawContent>>({});
+  const [dataTab, setDataTab] = useState<"extracted" | "validation">("extracted");
+  const [validationState, setValidationState] = useState<"idle" | "validating" | "done">("idle");
+  const [validationByFile, setValidationByFile] = useState<Record<number, ValidatedItem[]>>({});
+  const [dataPanelFullscreen, setDataPanelFullscreen] = useState(false);
 
   // Ref that mirrors history in sessionStorage (serialisable format)
   const storedItemsRef = useRef<StoredHistoryItem[]>(loadHistoryFromStorage());
@@ -224,6 +259,10 @@ const Index = () => {
     setExtractedDataByFile({});
     setPageCountByFile({});
     setSelectedHistoryId(null);
+    setRawContentByFile({});
+    setValidationByFile({});
+    setValidationState("idle");
+    setDataTab("extracted");
   };
 
   const handleHistorySelect = (item: HistoryItem) => {
@@ -239,6 +278,10 @@ const Index = () => {
     setPageCountByFile({ 0: item.totalPages });
     setSelectedHistoryId(item.id);
     setActiveTab("data");
+    setRawContentByFile({});
+    setValidationByFile({});
+    setValidationState("idle");
+    setDataTab("extracted");
   };
 
   const handleHistoryDelete = (id: string) => {
@@ -331,6 +374,7 @@ const Index = () => {
             setFileStatuses((prev) => ({ ...prev, [absoluteIndex]: "completed" }));
             setExtractedDataByFile((prev) => ({ ...prev, [absoluteIndex]: data }));
             setPageCountByFile((prev) => ({ ...prev, [absoluteIndex]: totalPages }));
+            setRawContentByFile((prev) => ({ ...prev, [absoluteIndex]: result.content as RawContent }));
           } else {
             dataByFile[absoluteIndex] = [];
             setFileStatuses((prev) => ({ ...prev, [absoluteIndex]: "error" }));
@@ -428,12 +472,48 @@ const Index = () => {
     }
   }, [selectedFiles, previewUrls, token, credits, setCredits, refreshCredits, processingMode, activeFileIndex, selectedHistoryId]);
 
+  const handleValidate = useCallback(async () => {
+    if (!token) return;
+    const content = rawContentByFile[activeFileIndex];
+    if (!content) return;
+    const items = extractLineItems(content);
+    if (items.length === 0) return;
+
+    setValidationState("validating");
+    setDataTab("validation");
+    try {
+      const results = await validateItems(items, token);
+      setValidationByFile((prev) => ({ ...prev, [activeFileIndex]: results }));
+      setValidationState("done");
+    } catch {
+      setValidationState("idle");
+      setDataTab("extracted");
+    }
+  }, [token, rawContentByFile, activeFileIndex]);
+
   // Update extracted data when switching files
   useEffect(() => {
     if (processingState === "completed" && extractedDataByFile[activeFileIndex]) {
       setExtractedData(extractedDataByFile[activeFileIndex]);
     }
   }, [activeFileIndex, processingState, extractedDataByFile]);
+
+  // Auto-switch away from validation tab if the new file has no results
+  useEffect(() => {
+    if (dataTab === "validation" && !validationByFile[activeFileIndex]) {
+      setDataTab("extracted");
+    }
+  }, [activeFileIndex]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Close fullscreen data panel on Escape
+  useEffect(() => {
+    if (!dataPanelFullscreen) return;
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setDataPanelFullscreen(false);
+    };
+    document.addEventListener("keydown", handler);
+    return () => document.removeEventListener("keydown", handler);
+  }, [dataPanelFullscreen]);
 
   // Cleanup preview URLs on unmount — use refs so the closure always sees
   // the latest values and doesn't fire on every state change.
@@ -574,11 +654,26 @@ const Index = () => {
                           setFileStatuses({});
                           setCompletedCount(0);
                           setTotalToProcess(0);
+                          setRawContentByFile({});
+                          setValidationByFile({});
+                          setValidationState("idle");
+                          setDataTab("extracted");
                         }}
                         className="gap-2 flex-1 sm:flex-none"
                       >
                         <RefreshCw className="w-4 h-4" />
                         Re-process
+                      </Button>
+                    )}
+                    {processingState === "completed" && rawContentByFile[activeFileIndex] && (
+                      <Button
+                        variant="outline"
+                        onClick={handleValidate}
+                        disabled={validationState === "validating"}
+                        className="gap-2 flex-1 sm:flex-none"
+                      >
+                        <ShieldCheck className="w-4 h-4" />
+                        {validationState === "validating" ? "Validating..." : "Validate"}
                       </Button>
                     )}
                     <Button
@@ -719,23 +814,92 @@ const Index = () => {
                   </div>
                 </div>
 
-                {/* Extracted Data Panel */}
+                {/* Data Panel (Extracted + Validation tabs) */}
                 <div
-                  className={`bg-card rounded-xl border border-border p-4 min-h-[500px] ${
-                    activeTab !== "data" ? "hidden lg:block" : ""
-                  }`}
+                  className={
+                    dataPanelFullscreen
+                      ? "fixed inset-0 z-50 bg-card flex flex-col p-6 overflow-hidden"
+                      : `bg-card rounded-xl border border-border p-4 min-h-[500px] ${
+                          activeTab !== "data" ? "hidden lg:flex lg:flex-col" : "flex flex-col"
+                        }`
+                  }
                 >
-                  <h2 className="text-lg font-semibold text-foreground mb-4 flex items-center gap-2">
-                    <Table2 className="w-5 h-5 text-primary" />
-                    Extracted Data
-                    {extractedData.some(r => r.kind === "data") && (
-                      <span className="ml-2 px-2 py-0.5 bg-primary/10 text-primary text-sm rounded-full">
-                        {extractedData.filter(r => r.kind === "data").length} fields
-                      </span>
+                  {/* Header: tab switcher + fullscreen toggle */}
+                  <div className="flex items-center justify-between mb-4 shrink-0">
+                    <div className="flex items-center gap-1 p-1 bg-muted rounded-lg">
+                      <button
+                        onClick={() => setDataTab("extracted")}
+                        className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${
+                          dataTab === "extracted"
+                            ? "bg-card text-foreground shadow-sm"
+                            : "text-muted-foreground hover:text-foreground"
+                        }`}
+                      >
+                        <Table2 className="w-4 h-4" />
+                        Extracted Data
+                        {extractedData.some((r) => r.kind === "data") && (
+                          <span className="ml-1 px-1.5 py-0.5 bg-primary/10 text-primary text-xs rounded-full">
+                            {extractedData.filter((r) => r.kind === "data").length}
+                          </span>
+                        )}
+                      </button>
+                      <button
+                        onClick={() => setDataTab("validation")}
+                        className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${
+                          dataTab === "validation"
+                            ? "bg-card text-foreground shadow-sm"
+                            : "text-muted-foreground hover:text-foreground"
+                        }`}
+                      >
+                        <ShieldCheck className="w-4 h-4" />
+                        Validation
+                        {(validationByFile[activeFileIndex]?.length ?? 0) > 0 && (
+                          <span className="ml-1 px-1.5 py-0.5 bg-primary/10 text-primary text-xs rounded-full">
+                            {validationByFile[activeFileIndex].length}
+                          </span>
+                        )}
+                      </button>
+                    </div>
+
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-8 w-8 shrink-0"
+                      onClick={() => setDataPanelFullscreen((f) => !f)}
+                      title={dataPanelFullscreen ? "Exit fullscreen (Esc)" : "Fullscreen"}
+                    >
+                      {dataPanelFullscreen ? (
+                        <Minimize2 className="w-4 h-4" />
+                      ) : (
+                        <Maximize2 className="w-4 h-4" />
+                      )}
+                    </Button>
+                  </div>
+
+                  {/* Tab content */}
+                  <div className={`overflow-auto ${dataPanelFullscreen ? "flex-1 min-h-0" : "max-h-[450px]"}`}>
+                    {dataTab === "extracted" ? (
+                      <DataTable data={extractedData} />
+                    ) : (
+                      <>
+                        {validationState === "validating" ? (
+                          <div className="flex items-center justify-center py-12 text-muted-foreground gap-2">
+                            <div className="w-4 h-4 border-2 border-primary border-t-transparent rounded-full animate-spin" />
+                            Validating items against master data...
+                          </div>
+                        ) : validationByFile[activeFileIndex] ? (
+                          <ValidationResults items={validationByFile[activeFileIndex]} />
+                        ) : (
+                          <div className="flex flex-col items-center justify-center py-12 text-muted-foreground">
+                            <ShieldCheck className="w-10 h-10 mb-3 opacity-30" />
+                            <p className="font-medium">Not validated yet</p>
+                            <p className="text-sm mt-1">
+                              Click "Validate" to check line items against master data.
+                            </p>
+                          </div>
+                        )}
+                      </>
                     )}
-                  </h2>
-                  <div className="overflow-auto max-h-[450px]">
-                    <DataTable data={extractedData} />
                   </div>
                 </div>
               </div>

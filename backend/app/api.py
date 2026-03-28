@@ -12,6 +12,7 @@ import os
 dotenv.load_dotenv()
 
 from app.ocr import OCRProcessor
+from app.validation import ValidationProcessor
 from app.auth_utils import create_access_token, get_current_user, TokenData
 from app.db import get_supabase
 
@@ -38,7 +39,8 @@ class LoginRequest(BaseModel):
     username: str
     password: str
 
-processor = OCRProcessor(api_key=os.environ["GEMINI_API_KEY"])
+processor  = OCRProcessor(api_key=os.environ["GEMINI_API_KEY"])
+validator  = ValidationProcessor(client=processor.client)
 
 @app.get("/")
 async def root():
@@ -136,4 +138,16 @@ async def process_invoice_stream(
             "Cache-Control": "no-cache",
         },
     )
- 
+
+
+class ValidateDataRequest(BaseModel):
+    items: list[dict]
+
+
+@app.post("/v1/validate-data")
+async def validate_data(
+    request: ValidateDataRequest,
+    current_user: TokenData = Depends(get_current_user),
+):
+    validated = await validator.validate_items(request.items)
+    return {"validated_items": validated}
