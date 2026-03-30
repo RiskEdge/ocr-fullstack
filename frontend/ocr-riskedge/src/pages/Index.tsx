@@ -160,6 +160,21 @@ function extractLineItems(content: RawContent): Record<string, unknown>[] {
   return items;
 }
 
+// Extract top-level scalar fields (strings/numbers) from the OCR output —
+// used to find the invoice grand total for calculation validation.
+function extractDocumentScalars(content: RawContent): Record<string, unknown> {
+  const scalars: Record<string, unknown> = {};
+  for (const page of content.pages) {
+    for (const [key, val] of Object.entries(page.extracted_data)) {
+      if (key === "confidence_score") continue;
+      if (!Array.isArray(val) && (typeof val === "number" || typeof val === "string")) {
+        scalars[key] = val;
+      }
+    }
+  }
+  return scalars;
+}
+
 // ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
@@ -188,6 +203,7 @@ const Index = () => {
   const [dataTab, setDataTab] = useState<"extracted" | "validation">("extracted");
   const [validationState, setValidationState] = useState<"idle" | "validating" | "done">("idle");
   const [validationByFile, setValidationByFile] = useState<Record<number, ValidatedItem[]>>({});
+  const [validationCreditsUsed, setValidationCreditsUsed] = useState<number>(0);
   const [dataPanelFullscreen, setDataPanelFullscreen] = useState(false);
 
   // Ref that mirrors history in sessionStorage (serialisable format)
@@ -262,6 +278,7 @@ const Index = () => {
     setRawContentByFile({});
     setValidationByFile({});
     setValidationState("idle");
+    setValidationCreditsUsed(0);
     setDataTab("extracted");
   };
 
@@ -281,6 +298,7 @@ const Index = () => {
     setRawContentByFile({});
     setValidationByFile({});
     setValidationState("idle");
+    setValidationCreditsUsed(0);
     setDataTab("extracted");
   };
 
@@ -482,14 +500,16 @@ const Index = () => {
     setValidationState("validating");
     setDataTab("validation");
     try {
-      const results = await validateItems(items, token);
-      setValidationByFile((prev) => ({ ...prev, [activeFileIndex]: results }));
+      const { validated_items, credits_used } = await validateItems(items, token, currentFile?.name);
+      setValidationByFile((prev) => ({ ...prev, [activeFileIndex]: validated_items }));
+      setValidationCreditsUsed(credits_used);
       setValidationState("done");
+      if (credits_used > 0) refreshCredits();
     } catch {
       setValidationState("idle");
       setDataTab("extracted");
     }
-  }, [token, rawContentByFile, activeFileIndex]);
+  }, [token, rawContentByFile, activeFileIndex, currentFile, refreshCredits]);
 
   // Update extracted data when switching files
   useEffect(() => {
@@ -888,7 +908,20 @@ const Index = () => {
                             Validating items against master data...
                           </div>
                         ) : validationByFile[activeFileIndex] ? (
-                          <ValidationResults items={validationByFile[activeFileIndex]} />
+                          <>
+                            {validationCreditsUsed > 0 && (
+                              <div className="mb-3 px-3 py-2 rounded-lg bg-amber-50 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-800 text-xs text-amber-700 dark:text-amber-400 flex items-center gap-2">
+                                <span className="font-semibold">{validationCreditsUsed} credit{validationCreditsUsed !== 1 ? "s" : ""}</span> used for AI-assisted matching
+                                {credits !== null && (
+                                  <span className="text-amber-600 dark:text-amber-500">· {credits} remaining</span>
+                                )}
+                              </div>
+                            )}
+                            <ValidationResults
+                              items={validationByFile[activeFileIndex]}
+                              documentScalars={rawContentByFile[activeFileIndex] ? extractDocumentScalars(rawContentByFile[activeFileIndex]) : undefined}
+                            />
+                          </>
                         ) : (
                           <div className="flex flex-col items-center justify-center py-12 text-muted-foreground">
                             <ShieldCheck className="w-10 h-10 mb-3 opacity-30" />

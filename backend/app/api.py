@@ -1,3 +1,4 @@
+import asyncio
 from typing import List
 from pydantic import BaseModel
 
@@ -142,6 +143,7 @@ async def process_invoice_stream(
 
 class ValidateDataRequest(BaseModel):
     items: list[dict]
+    source_filename: str | None = None
 
 
 @app.post("/v1/validate-data")
@@ -149,5 +151,69 @@ async def validate_data(
     request: ValidateDataRequest,
     current_user: TokenData = Depends(get_current_user),
 ):
-    validated = await validator.validate_items(request.items)
-    return {"validated_items": validated}
+    from datetime import datetime, timezone
+    started_at = datetime.now(timezone.utc)
+
+    try:
+        validated, stats = await validator.validate_items(request.items)
+        run_status = "completed"
+    except Exception as e:
+        print(f"[validate-data] validation failed: {e}")
+        raise HTTPException(status_code=500, detail="Validation failed.")
+
+    completed_at  = datetime.now(timezone.utc)
+    duration_ms   = int((completed_at - started_at).total_seconds() * 1000)
+    gemini_calls  = stats["gemini_calls"]
+    credits_used  = gemini_calls
+
+    # Deduct credits and log run in a single thread
+    remaining_credits = None
+    try:
+        user_id    = current_user.user_id
+        company_id = current_user.company_id
+        filename   = request.source_filename
+        env        = os.environ.get("ENVIRONMENT", "production")
+
+        def _deduct_and_log():
+            db = get_supabase()
+
+            # Credit deduction
+            new_credits = None
+            if credits_used > 0:
+                row = db.table("companies").select("credits").eq("id", company_id).single().execute()
+                new_credits = max(0, row.data["credits"] - credits_used)
+                db.table("companies").update({"credits": new_credits}).eq("id", company_id).execute()
+                print(f"[validate-data] deducted {credits_used} credit(s), remaining: {new_credits}")
+
+            # Log validation run
+            db.table("validation_runs").insert({
+                "user_id":           user_id,
+                "company_id":        company_id,
+                "source_filename":   filename,
+                "total_items":       len(request.items),
+                "matched_exact":     stats["matched_exact"],
+                "matched_fuzzy":     stats["matched_fuzzy"],
+                "matched_multi_plu": stats["matched_multi_plu"],
+                "no_match":          stats["no_match"],
+                "valid_items":       stats["valid_items"],
+                "items_with_issues": stats["items_with_issues"],
+                "gemini_calls":      gemini_calls,
+                "credits_used":      credits_used,
+                "status":            run_status,
+                "duration_ms":       duration_ms,
+                "started_at":        started_at.isoformat(),
+                "completed_at":      completed_at.isoformat(),
+                "environment":       env,
+            }).execute()
+
+            return new_credits
+
+        remaining_credits = await asyncio.to_thread(_deduct_and_log)
+    except Exception as e:
+        print(f"[validate-data] FAILED to deduct credits / log run: {e}")
+
+    return {
+        "validated_items":  validated,
+        "credits_used":     credits_used,
+        "remaining_credits": remaining_credits,
+    }

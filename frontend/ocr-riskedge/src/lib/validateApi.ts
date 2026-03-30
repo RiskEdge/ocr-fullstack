@@ -7,12 +7,22 @@ export interface Discrepancy {
   message: string;
 }
 
+export interface PluOption {
+  plu_code: string;
+  sku_desc: string | null;
+  cost_price: number | null;
+  mrp: number | null;
+  tax_pct: number | null;
+  priority: number | null;
+}
+
 export interface ValidationResult {
   matched_plu: string | null;
   is_valid: boolean;
-  match_type?: "fuzzy_name" | "no_match";
+  match_type?: "fuzzy_name" | "no_match" | "multi_plu";
   match_note?: string;
   confidence?: "high" | "medium" | "low";
+  plu_options?: PluOption[];
   discrepancies: Discrepancy[];
   suggested_corrections: Record<string, number | string>;
 }
@@ -26,14 +36,21 @@ export type ValidatedItem = {
   validation: ValidationResult;
 } & Record<string, unknown>;
 
+export interface ValidationRunResult {
+  validated_items: ValidatedItem[];
+  credits_used: number;
+  remaining_credits: number | null;
+}
+
 export async function validateItems(
   items: Record<string, unknown>[],
-  token: string
-): Promise<ValidatedItem[]> {
+  token: string,
+  sourceFilename?: string,
+): Promise<ValidationRunResult> {
   const response = await api.post(
     "/v1/validate-data",
-    { items },
+    { items, source_filename: sourceFilename ?? null },
     { headers: { Authorization: `Bearer ${token}` } }
   );
-  return response.data.validated_items as ValidatedItem[];
+  return response.data as ValidationRunResult;
 }

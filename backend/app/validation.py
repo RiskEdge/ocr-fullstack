@@ -347,7 +347,7 @@ Master records (JSON):
     # Public entry point
     # ------------------------------------------------------------------
 
-    async def validate_items(self, raw_items: list[dict]) -> list[dict]:
+    async def validate_items(self, raw_items: list[dict]) -> tuple[list[dict], int]:
         """
         Validate a list of raw OCR line items against master_items.
 
@@ -361,13 +361,20 @@ Master records (JSON):
 
         Decision tree per item
         ──────────────────────
-        EAN not in master, product name yields candidates  →  Gemini fuzzy match
+        EAN not in master, product name yields candidates  →  Gemini fuzzy match  (1 credit)
         EAN not in master, no name candidates              →  flag immediately, no Gemini
-        Single PLU, no discrepancy                         →  local compare, no Gemini
-        Single PLU, has discrepancy                        →  Gemini (explain + suggest)
-        Multiple PLUs                                      →  Gemini (pick best PLU + explain)
+        Single PLU                                         →  local compare, no Gemini
+        Multiple PLUs                                      →  return all options for user selection, no Gemini
+
+        Returns (validated_items, stats) where stats is a dict with match/outcome
+        breakdowns and gemini_calls count (each Gemini call costs 1 credit).
         """
         items = [normalize_item(raw) for raw in raw_items]
+        gemini_calls   = 0
+        matched_exact  = 0
+        matched_fuzzy  = 0   # incremented after Gemini resolves (not on exception)
+        matched_multi  = 0
+        no_match_count = 0
 
         # Collect unique EAN codes → single batch DB query
         ean_codes = list({
@@ -396,13 +403,15 @@ Master records (JSON):
                 results.append(None)
 
                 if candidates:
-                    # Fuzzy match via Gemini
+                    # Fuzzy match via Gemini — counts as 1 credit
+                    gemini_calls += 1
                     gemini_queue.append((
                         placeholder_idx,
                         self._gemini_fuzzy_match(item, candidates),
                     ))
                 else:
                     # No name candidates either — flag immediately
+                    no_match_count += 1
                     results[placeholder_idx] = {
                         **item,
                         "validation": {
@@ -421,17 +430,44 @@ Master records (JSON):
                 continue
 
             # ── Single PLU fast path ─────────────────────────────────────
-            # For a single PLU there is no ambiguity about which record to use,
-            # so local_compare is always sufficient — no need to involve Gemini.
             if len(master_rows) == 1:
                 local = local_compare(item, master_rows[0])
+                matched_exact += 1
                 results.append({**item, "validation": local})
                 continue
 
-            # ── Queue for Gemini (multiple PLUs or single-PLU discrepancy) ─
-            placeholder_idx = len(results)
-            results.append(None)
-            gemini_queue.append((placeholder_idx, self._gemini_analyze(item, master_rows)))
+            # ── Multiple PLUs ────────────────────────────────────────────
+            # Run local_compare against every PLU (rows already ordered by priority).
+            # If any PLU is a clean match (zero discrepancies) auto-select it —
+            # no need to bother the user. Only surface the selection UI when every
+            # PLU has at least one mismatch.
+            comparisons = [(r, local_compare(item, r)) for r in master_rows]
+            clean = next(
+                ((r, cmp) for r, cmp in comparisons if not cmp["discrepancies"]),
+                None,
+            )
+
+            if clean:
+                _, cmp = clean
+                matched_exact += 1
+                results.append({**item, "validation": cmp})
+            else:
+                matched_multi += 1
+                plu_options = [
+                    {k: r.get(k) for k in ("plu_code", "sku_desc", "cost_price", "mrp", "tax_pct", "priority")}
+                    for r in master_rows
+                ]
+                results.append({
+                    **item,
+                    "validation": {
+                        "matched_plu":           None,
+                        "match_type":            "multi_plu",
+                        "is_valid":              False,
+                        "plu_options":           plu_options,
+                        "discrepancies":         [],
+                        "suggested_corrections": {},
+                    },
+                })
 
         # ── Run all Gemini calls concurrently ────────────────────────────
         if gemini_queue:
@@ -465,6 +501,25 @@ Master records (JSON):
                             },
                         }
                 else:
+                    matched_fuzzy += 1
                     results[result_idx] = {**item, "validation": output}
 
-        return results  # type: ignore[return-value]
+        # Outcome breakdown (multi_plu and no_match are excluded — outcome unknown at run time)
+        valid_items       = sum(1 for r in results if r and r.get("validation", {}).get("is_valid"))
+        items_with_issues = sum(
+            1 for r in results
+            if r
+            and not r["validation"].get("is_valid")
+            and r["validation"].get("match_type") not in ("no_match", "multi_plu")
+        )
+
+        stats = {
+            "gemini_calls":      gemini_calls,
+            "matched_exact":     matched_exact,
+            "matched_fuzzy":     matched_fuzzy,
+            "matched_multi_plu": matched_multi,
+            "no_match":          no_match_count,
+            "valid_items":       valid_items,
+            "items_with_issues": items_with_issues,
+        }
+        return results, stats  # type: ignore[return-value]
