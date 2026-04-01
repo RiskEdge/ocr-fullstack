@@ -22,7 +22,7 @@ export default defineConfig({
 		hmr: {
 			overlay: false,
 		},
-		allowedHosts: ['docu-scan.riskedgesolutions.com'],
+		allowedHosts: ['docu-scan.riskedgesolutions.com', 'invoice-vision.riskedgesolutions.com'],
 	},
 	plugins: [react()],
 	resolve: {

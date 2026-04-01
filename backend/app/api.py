@@ -24,7 +24,8 @@ app = FastAPI()
 origins = [
     "http://localhost:3000",
     "http://localhost:3010",
-    "https://docu-scan.riskedgesolutions.com"
+    "https://docu-scan.riskedgesolutions.com",
+    "https://invoice-vision.riskedgesolutions.com"
 ]
 
 app.add_middleware(
