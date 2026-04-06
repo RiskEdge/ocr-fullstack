@@ -394,6 +394,9 @@ const Index = () => {
             setExtractedDataByFile((prev) => ({ ...prev, [absoluteIndex]: data }));
             setPageCountByFile((prev) => ({ ...prev, [absoluteIndex]: totalPages }));
             setRawContentByFile((prev) => ({ ...prev, [absoluteIndex]: result.content as RawContent }));
+            if (absoluteIndex === activeFileIndex) {
+              setExtractedData(data);
+            }
           } else {
             dataByFile[absoluteIndex] = [];
             setFileStatuses((prev) => ({ ...prev, [absoluteIndex]: "error" }));
