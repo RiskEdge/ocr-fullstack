@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
+import { flushSync } from "react-dom";
 import api from "@/lib/api";
 import Header from "@/components/Header";
 import FileUpload from "@/components/FileUpload";
@@ -429,7 +430,7 @@ const Index = () => {
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split('\n');
         buffer = lines.pop() ?? '';
-        lines.forEach((line) => processLine(line.trim()));
+        lines.forEach((line) => flushSync(() => processLine(line.trim())));
       }
 
       // Flush any remaining buffered line
@@ -513,10 +514,12 @@ const Index = () => {
 
   // Update extracted data when switching files
   useEffect(() => {
-    if (processingState === "completed" && extractedDataByFile[activeFileIndex]) {
+    if (extractedDataByFile[activeFileIndex]) {
       setExtractedData(extractedDataByFile[activeFileIndex]);
+    } else {
+      setExtractedData([]);
     }
-  }, [activeFileIndex, processingState, extractedDataByFile]);
+  }, [activeFileIndex, extractedDataByFile]);
 
   // Auto-switch away from validation tab if the new file has no results
   useEffect(() => {
@@ -899,7 +902,14 @@ const Index = () => {
                   {/* Tab content */}
                   <div className={`overflow-auto ${dataPanelFullscreen ? "flex-1 min-h-0" : "max-h-[450px]"}`}>
                     {dataTab === "extracted" ? (
-                      <DataTable data={extractedData} />
+                      fileStatuses[activeFileIndex] === "processing" && !extractedDataByFile[activeFileIndex] ? (
+                        <div className="flex items-center justify-center py-12 text-muted-foreground gap-2">
+                          <div className="w-4 h-4 border-2 border-primary border-t-transparent rounded-full animate-spin" />
+                          Extracting data...
+                        </div>
+                      ) : (
+                        <DataTable data={extractedData} />
+                      )
                     ) : (
                       <>
                         {validationState === "validating" ? (

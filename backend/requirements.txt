@@ -1,8 +1,9 @@
-fastapi[standard]
+fastapi[standard]==0.135.1
+starlette==0.52.1
 google-genai==1.64.0
 pillow==12.1.1
 passlib[bcrypt]==1.7.4
 bcrypt==3.2.2
 python-jose==3.5.0
-supabase
+supabase==2.28.2
 openpyxl

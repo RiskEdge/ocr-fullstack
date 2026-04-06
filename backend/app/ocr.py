@@ -166,34 +166,39 @@ class OCRProcessor:
     ) -> AsyncGenerator[str, None]:
         """Processes documents with bounded concurrency, retrying on rate-limit errors."""
         semaphore = asyncio.Semaphore(_CONCURRENCY)
+        queue: asyncio.Queue = asyncio.Queue()
+        total_files = len(files)
 
-        async def process_bounded(content: bytes, filename: str, mime_type: str) -> dict:
-            async with semaphore:
-                for attempt in range(_MAX_RETRIES + 1):
-                    result = await self.process_single_file(content, filename, mime_type)
-                    if result["status"] == "success":
-                        return result
-                    msg = result.get("message", "").lower()
-                    is_rate_limit = any(sig in msg for sig in _RATE_LIMIT_SIGNALS)
-                    if is_rate_limit and attempt < _MAX_RETRIES:
-                        wait = 2 ** attempt
-                        print(f"Rate limit hit for {filename}, retrying in {wait}s (attempt {attempt + 1})")
-                        await asyncio.sleep(wait)
-                        continue
-                    break
-                if any(sig in result.get("message", "").lower() for sig in _RATE_LIMIT_SIGNALS):
-                    result = {**result, "message": "Processing failed. Please try again later."}
-                return result
+        async def process_and_enqueue(content: bytes, filename: str, mime_type: str) -> None:
+            try:
+                async with semaphore:
+                    for attempt in range(_MAX_RETRIES + 1):
+                        result = await self.process_single_file(content, filename, mime_type)
+                        if result["status"] == "success":
+                            break
+                        msg = result.get("message", "").lower()
+                        is_rate_limit = any(sig in msg for sig in _RATE_LIMIT_SIGNALS)
+                        if is_rate_limit and attempt < _MAX_RETRIES:
+                            wait = 2 ** attempt
+                            print(f"Rate limit hit for {filename}, retrying in {wait}s (attempt {attempt + 1})")
+                            await asyncio.sleep(wait)
+                            continue
+                        break
+                    if any(sig in result.get("message", "").lower() for sig in _RATE_LIMIT_SIGNALS):
+                        result = {**result, "message": "Processing failed. Please try again later."}
+            except Exception as e:
+                result = {"filename": filename, "status": "error", "message": str(e)}
+            await queue.put(result)
 
         # Send a ping immediately to establish chunked transfer encoding.
         yield json.dumps({"type": "ping"}) + "\n"
 
-        tasks = []
         file_types: dict[str, int] = {}
+        tasks = []
         for content, filename, content_type in files:
             file_types[content_type] = file_types.get(content_type, 0) + 1
             tasks.append(asyncio.create_task(
-                process_bounded(content, filename, content_type)
+                process_and_enqueue(content, filename, content_type)
             ))
 
         # Run-level accumulators
@@ -205,8 +210,9 @@ class OCRProcessor:
         run_total_pages = 0
         run_total_fields = 0
 
-        for completed_task in asyncio.as_completed(tasks):
-            result = await completed_task
+        # Yield each result as soon as it arrives in the queue
+        for _ in range(total_files):
+            result = await queue.get()
             if result.get("status") == "success":
                 run_successful += 1
                 tu = result.get("token_usage", {})
@@ -219,7 +225,8 @@ class OCRProcessor:
             else:
                 run_failed += 1
             yield json.dumps(result) + "\n"
-            await asyncio.sleep(0)
+
+        await asyncio.gather(*tasks, return_exceptions=True)
 
         completed_at = datetime.now(timezone.utc)
         run_cost = self.calculate_cost(run_input_tokens, run_output_tokens, run_total_pages)
@@ -288,7 +295,7 @@ class OCRProcessor:
                 print(f"[credits] FAILED to deduct credits: {e}")
                 traceback.print_exc()
 
-        run_summary = {**run_cost, "documents_processed": len(tasks)}
+        run_summary = {**run_cost, "documents_processed": total_files}
         yield json.dumps({
             "type": "run_summary",
             "token_usage": run_summary,
