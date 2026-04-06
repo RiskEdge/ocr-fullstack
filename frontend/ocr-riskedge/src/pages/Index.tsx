@@ -436,7 +436,7 @@ const Index = () => {
           const trimmed = line.trim();
           if (trimmed) {
             processLine(trimmed);
-            await new Promise(r => setTimeout(r, 0));
+            await new Promise(r => requestAnimationFrame(r));
           }
         }
       }
