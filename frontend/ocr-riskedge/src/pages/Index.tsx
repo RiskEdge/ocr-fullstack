@@ -1,5 +1,4 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { flushSync } from "react-dom";
 import api from "@/lib/api";
 import Header from "@/components/Header";
 import FileUpload from "@/components/FileUpload";
@@ -433,7 +432,13 @@ const Index = () => {
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split('\n');
         buffer = lines.pop() ?? '';
-        lines.forEach((line) => flushSync(() => processLine(line.trim())));
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed) {
+            processLine(trimmed);
+            await new Promise(r => setTimeout(r, 0));
+          }
+        }
       }
 
       // Flush any remaining buffered line
