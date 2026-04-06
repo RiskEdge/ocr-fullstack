@@ -131,9 +131,16 @@ async def process_invoice_stream(
             detail="No credits remaining. Please contact support to top up your balance."
         )
 
-    print(files)
+    # Read all file bytes NOW, before returning StreamingResponse.
+    # UploadFile temp files are closed by Starlette once the response starts,
+    # so reading inside the async generator causes "I/O on closed file".
+    file_data = []
+    for file in files:
+        content = await file.read()
+        file_data.append((content, file.filename, file.content_type))
+
     return StreamingResponse(
-        processor.stream_documents(files, current_user.user_id, current_user.company_id),
+        processor.stream_documents(file_data, current_user.user_id, current_user.company_id),
         media_type="application/x-ndjson",
         headers={
             "X-Accel-Buffering": "no",

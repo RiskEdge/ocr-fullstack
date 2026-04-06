@@ -17,7 +17,6 @@ _RATE_LIMIT_SIGNALS = ("quota", "rate limit", "429", "resource exhausted", "too 
 _INPUT_PRICE_PER_M = 0.50
 _OUTPUT_PRICE_PER_M = 3.00
 
-from fastapi import UploadFile
 from google import genai
 from PIL import Image
 import io
@@ -161,7 +160,7 @@ class OCRProcessor:
     
     async def stream_documents(
         self,
-        files: List[UploadFile],
+        files: List[tuple],  # list of (bytes, filename, content_type)
         user_id: str,
         company_id: str,
     ) -> AsyncGenerator[str, None]:
@@ -191,11 +190,10 @@ class OCRProcessor:
 
         tasks = []
         file_types: dict[str, int] = {}
-        for file in files:
-            content = await file.read()
-            file_types[file.content_type] = file_types.get(file.content_type, 0) + 1
+        for content, filename, content_type in files:
+            file_types[content_type] = file_types.get(content_type, 0) + 1
             tasks.append(asyncio.create_task(
-                process_bounded(content, file.filename, file.content_type)
+                process_bounded(content, filename, content_type)
             ))
 
         # Run-level accumulators
