@@ -11,6 +11,7 @@ from typing import Optional
 from google import genai
 
 from app.db import get_supabase
+from app.context_builder import build_context_block, get_user_preferences
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +142,9 @@ class ValidationProcessor:
     # Gemini analysis
     # ------------------------------------------------------------------
 
-    async def _gemini_analyze(self, item: dict, master_rows: list[dict]) -> dict:
+    async def _gemini_analyze(
+        self, item: dict, master_rows: list[dict], context_block: str = ""
+    ) -> dict:
         """
         Ask Gemini to select the best-matching PLU and identify discrepancies.
 
@@ -169,7 +172,8 @@ class ValidationProcessor:
         def _fmt(v: object) -> str:
             return str(v) if v is not None else "not provided in invoice"
 
-        prompt = f"""You are a procurement data validator.
+        context_prefix = f"{context_block}\n\n" if context_block else ""
+        prompt = f"""{context_prefix}You are a procurement data validator.
 
 Invoice line item:
   EAN: {ean}
@@ -223,7 +227,9 @@ Master records (JSON):
     # Gemini fuzzy match (EAN not found — try by product name)
     # ------------------------------------------------------------------
 
-    async def _gemini_fuzzy_match(self, item: dict, candidates: list[dict]) -> dict:
+    async def _gemini_fuzzy_match(
+        self, item: dict, candidates: list[dict], context_block: str = ""
+    ) -> dict:
         """
         Called when the invoice EAN is not in master_items but a product-name
         keyword search returned candidate records.
@@ -247,7 +253,8 @@ Master records (JSON):
             for r in candidates
         ])
 
-        prompt = f"""You are a procurement data validator.
+        context_prefix = f"{context_block}\n\n" if context_block else ""
+        prompt = f"""{context_prefix}You are a procurement data validator.
 
 The invoice contains a line item whose EAN code ({ean}) was NOT found in master data.
 However, a keyword search on the product name returned possible matches below.
@@ -347,7 +354,12 @@ Master records (JSON):
     # Public entry point
     # ------------------------------------------------------------------
 
-    async def validate_items(self, raw_items: list[dict]) -> tuple[list[dict], int]:
+    async def validate_items(
+        self,
+        raw_items: list[dict],
+        user_id: str = "",
+        company_id: str = "",
+    ) -> tuple[list[dict], int]:
         """
         Validate a list of raw OCR line items against master_items.
 
@@ -361,20 +373,33 @@ Master records (JSON):
 
         Decision tree per item
         ──────────────────────
-        EAN not in master, product name yields candidates  →  Gemini fuzzy match  (1 credit)
+        EAN not in master, product name yields candidates  →  Gemini fuzzy match      (1 credit)
         EAN not in master, no name candidates              →  flag immediately, no Gemini
         Single PLU                                         →  local compare, no Gemini
-        Multiple PLUs                                      →  return all options for user selection, no Gemini
+        Multiple PLUs, clean match found locally           →  auto-select, no Gemini
+        Multiple PLUs, all mismatched, auto_select_plu ON  →  Gemini analyzes         (1 credit)
+        Multiple PLUs, all mismatched, auto_select_plu OFF →  return options for user selection
 
         Returns (validated_items, stats) where stats is a dict with match/outcome
         breakdowns and gemini_calls count (each Gemini call costs 1 credit).
         """
+        # Build context block and fetch preference flags concurrently.
+        context_block   = ""
+        auto_select_plu = False
+        if user_id:
+            context_block, prefs = await asyncio.gather(
+                build_context_block(user_id, company_id),
+                get_user_preferences(user_id),
+            )
+            auto_select_plu = prefs.get("auto_select_plu", False)
+
         items = [normalize_item(raw) for raw in raw_items]
-        gemini_calls   = 0
-        matched_exact  = 0
-        matched_fuzzy  = 0   # incremented after Gemini resolves (not on exception)
-        matched_multi  = 0
-        no_match_count = 0
+        gemini_calls        = 0
+        matched_exact       = 0
+        matched_fuzzy       = 0   # incremented after Gemini resolves (not on exception)
+        matched_auto        = 0   # multi-PLU items resolved via _gemini_analyze
+        matched_multi       = 0   # multi-PLU items left for manual user selection
+        no_match_count      = 0
 
         # Collect unique EAN codes → single batch DB query
         ean_codes = list({
@@ -386,7 +411,10 @@ Master records (JSON):
         master_lookup = await asyncio.to_thread(self._fetch_master_lookup, ean_codes)
 
         results: list[dict | None] = []
-        gemini_queue: list[tuple[int, object]] = []   # (result_index, coroutine)
+        # Queue entries: (result_index, coroutine, match_type_override | None)
+        # match_type_override is set for auto-selected items so the result handler
+        # can stamp the correct match_type onto the validation dict.
+        gemini_queue: list[tuple[int, object, str | None]] = []
 
         for item in items:
             ean = _ean_str(item.get("ean_code"))
@@ -407,7 +435,8 @@ Master records (JSON):
                     gemini_calls += 1
                     gemini_queue.append((
                         placeholder_idx,
-                        self._gemini_fuzzy_match(item, candidates),
+                        self._gemini_fuzzy_match(item, candidates, context_block),
+                        None,   # match_type comes from Gemini response ("fuzzy_name")
                     ))
                 else:
                     # No name candidates either — flag immediately
@@ -451,6 +480,16 @@ Master records (JSON):
                 _, cmp = clean
                 matched_exact += 1
                 results.append({**item, "validation": cmp})
+            elif auto_select_plu:
+                # User prefers Gemini to pick — queue _gemini_analyze (1 credit).
+                gemini_calls += 1
+                placeholder_idx = len(results)
+                results.append(None)
+                gemini_queue.append((
+                    placeholder_idx,
+                    self._gemini_analyze(item, master_rows, context_block),
+                    "auto_selected",   # stamp this onto the result
+                ))
             else:
                 matched_multi += 1
                 plu_options = [
@@ -471,18 +510,24 @@ Master records (JSON):
 
         # ── Run all Gemini calls concurrently ────────────────────────────
         if gemini_queue:
-            indices, coros = zip(*gemini_queue)
+            indices, coros, overrides = zip(*gemini_queue)
             outputs = await asyncio.gather(*coros, return_exceptions=True)
 
-            for result_idx, output in zip(indices, outputs):
+            for result_idx, output, match_type_override in zip(indices, outputs, overrides):
                 item = items[result_idx]
                 if isinstance(output, Exception):
                     print(f"[validate-data] Gemini failed for index {result_idx}: {output}")
                     ean = _ean_str(item.get("ean_code"))
-                    master_rows = master_lookup.get(ean or "", [])
-                    if master_rows:
-                        # Known EAN — fall back to local comparison
-                        results[result_idx] = {**item, "validation": local_compare(item, master_rows[0])}
+                    master_rows_fb = master_lookup.get(ean or "", [])
+                    if master_rows_fb:
+                        # Known EAN (auto-select path) — fall back to highest-priority PLU
+                        results[result_idx] = {
+                            **item,
+                            "validation": {
+                                **local_compare(item, master_rows_fb[0]),
+                                "match_type": "auto_selected",
+                            },
+                        }
                     else:
                         # Fuzzy path failed — fall back to no_match flag
                         results[result_idx] = {
@@ -501,25 +546,32 @@ Master records (JSON):
                             },
                         }
                 else:
-                    matched_fuzzy += 1
-                    results[result_idx] = {**item, "validation": output}
+                    validation = dict(output)
+                    if match_type_override:
+                        validation["match_type"] = match_type_override
+                        matched_auto += 1
+                    else:
+                        matched_fuzzy += 1
+                    results[result_idx] = {**item, "validation": validation}
 
-        # Outcome breakdown (multi_plu and no_match are excluded — outcome unknown at run time)
+        # Outcome breakdown (multi_plu and no_match excluded — outcome unknown at run time)
+        _unresolved = {"no_match", "multi_plu"}
         valid_items       = sum(1 for r in results if r and r.get("validation", {}).get("is_valid"))
         items_with_issues = sum(
             1 for r in results
             if r
             and not r["validation"].get("is_valid")
-            and r["validation"].get("match_type") not in ("no_match", "multi_plu")
+            and r["validation"].get("match_type") not in _unresolved
         )
 
         stats = {
-            "gemini_calls":      gemini_calls,
-            "matched_exact":     matched_exact,
-            "matched_fuzzy":     matched_fuzzy,
-            "matched_multi_plu": matched_multi,
-            "no_match":          no_match_count,
-            "valid_items":       valid_items,
-            "items_with_issues": items_with_issues,
+            "gemini_calls":         gemini_calls,
+            "matched_exact":        matched_exact,
+            "matched_fuzzy":        matched_fuzzy,
+            "matched_auto_selected": matched_auto,
+            "matched_multi_plu":    matched_multi,
+            "no_match":             no_match_count,
+            "valid_items":          valid_items,
+            "items_with_issues":    items_with_issues,
         }
         return results, stats  # type: ignore[return-value]

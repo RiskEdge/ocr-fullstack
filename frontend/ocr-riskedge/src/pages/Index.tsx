@@ -907,50 +907,53 @@ const Index = () => {
                     </Button>
                   </div>
 
-                  {/* Tab content */}
+                  {/* Tab content — both views stay mounted to preserve ValidationResults state */}
                   <div className={`overflow-auto ${dataPanelFullscreen ? "flex-1 min-h-0" : "max-h-[450px]"}`}>
-                    {dataTab === "extracted" ? (
-                      fileStatuses[activeFileIndex] === "processing" && !extractedDataByFile[activeFileIndex] ? (
+                    {/* Extracted view */}
+                    <div className={dataTab === "extracted" ? "" : "hidden"}>
+                      {fileStatuses[activeFileIndex] === "processing" && !extractedDataByFile[activeFileIndex] ? (
                         <div className="flex items-center justify-center py-12 text-muted-foreground gap-2">
                           <div className="w-4 h-4 border-2 border-primary border-t-transparent rounded-full animate-spin" />
                           Extracting data...
                         </div>
                       ) : (
                         <DataTable data={extractedData} />
-                      )
-                    ) : (
-                      <>
-                        {validationState === "validating" ? (
-                          <div className="flex items-center justify-center py-12 text-muted-foreground gap-2">
-                            <div className="w-4 h-4 border-2 border-primary border-t-transparent rounded-full animate-spin" />
-                            Validating items against master data...
-                          </div>
-                        ) : validationByFile[activeFileIndex] ? (
-                          <>
-                            {validationCreditsUsed > 0 && (
-                              <div className="mb-3 px-3 py-2 rounded-lg bg-amber-50 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-800 text-xs text-amber-700 dark:text-amber-400 flex items-center gap-2">
-                                <span className="font-semibold">{validationCreditsUsed} credit{validationCreditsUsed !== 1 ? "s" : ""}</span> used for AI-assisted matching
-                                {credits !== null && (
-                                  <span className="text-amber-600 dark:text-amber-500">· {credits} remaining</span>
-                                )}
-                              </div>
-                            )}
-                            <ValidationResults
-                              items={validationByFile[activeFileIndex]}
-                              documentScalars={rawContentByFile[activeFileIndex] ? extractDocumentScalars(rawContentByFile[activeFileIndex]) : undefined}
-                            />
-                          </>
-                        ) : (
-                          <div className="flex flex-col items-center justify-center py-12 text-muted-foreground">
-                            <ShieldCheck className="w-10 h-10 mb-3 opacity-30" />
-                            <p className="font-medium">Not validated yet</p>
-                            <p className="text-sm mt-1">
-                              Click "Validate" to check line items against master data.
-                            </p>
-                          </div>
-                        )}
-                      </>
-                    )}
+                      )}
+                    </div>
+
+                    {/* Validation view */}
+                    <div className={dataTab === "validation" ? "" : "hidden"}>
+                      {validationState === "validating" ? (
+                        <div className="flex items-center justify-center py-12 text-muted-foreground gap-2">
+                          <div className="w-4 h-4 border-2 border-primary border-t-transparent rounded-full animate-spin" />
+                          Validating items against master data...
+                        </div>
+                      ) : validationByFile[activeFileIndex] ? (
+                        <>
+                          {validationCreditsUsed > 0 && (
+                            <div className="mb-3 px-3 py-2 rounded-lg bg-amber-50 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-800 text-xs text-amber-700 dark:text-amber-400 flex items-center gap-2">
+                              <span className="font-semibold">{validationCreditsUsed} credit{validationCreditsUsed !== 1 ? "s" : ""}</span> used for AI-assisted matching
+                              {credits !== null && (
+                                <span className="text-amber-600 dark:text-amber-500">· {credits} remaining</span>
+                              )}
+                            </div>
+                          )}
+                          <ValidationResults
+                            items={validationByFile[activeFileIndex]}
+                            documentScalars={rawContentByFile[activeFileIndex] ? extractDocumentScalars(rawContentByFile[activeFileIndex]) : undefined}
+                            sourceFilename={selectedFiles[activeFileIndex]?.name}
+                          />
+                        </>
+                      ) : (
+                        <div className="flex flex-col items-center justify-center py-12 text-muted-foreground">
+                          <ShieldCheck className="w-10 h-10 mb-3 opacity-30" />
+                          <p className="font-medium">Not validated yet</p>
+                          <p className="text-sm mt-1">
+                            Click "Validate" to check line items against master data.
+                          </p>
+                        </div>
+                      )}
+                    </div>
                   </div>
                 </div>
               </div>

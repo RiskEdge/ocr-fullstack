@@ -1,8 +1,9 @@
 import asyncio
-from typing import List
+import re
+from typing import List, Any
 from pydantic import BaseModel
 
-from fastapi import FastAPI, File, HTTPException, UploadFile, Depends, status
+from fastapi import FastAPI, File, HTTPException, UploadFile, Depends, status, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from passlib.context import CryptContext
@@ -16,6 +17,8 @@ from app.ocr import OCRProcessor
 from app.validation import ValidationProcessor
 from app.auth_utils import create_access_token, get_current_user, TokenData
 from app.db import get_supabase
+from app.behavior import router as behavior_router
+from app.profiles import router as profiles_router
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
@@ -35,6 +38,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(behavior_router)
+app.include_router(profiles_router)
 
 class LoginRequest(BaseModel):
     company_name: str
@@ -163,7 +169,11 @@ async def validate_data(
     started_at = datetime.now(timezone.utc)
 
     try:
-        validated, stats = await validator.validate_items(request.items)
+        validated, stats = await validator.validate_items(
+            request.items,
+            user_id=current_user.user_id,
+            company_id=current_user.company_id,
+        )
         run_status = "completed"
     except Exception as e:
         print(f"[validate-data] validation failed: {e}")

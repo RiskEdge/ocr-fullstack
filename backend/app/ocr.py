@@ -22,6 +22,7 @@ from PIL import Image
 import io
 
 from app.db import get_supabase
+from app.context_builder import build_context_block
 
 
 class OCRProcessor:
@@ -74,7 +75,13 @@ class OCRProcessor:
                 "error": str(e)
             }
             
-    async def process_single_file(self, file_bytes: bytes, filename: str, mime_type: str) -> dict:
+    async def process_single_file(
+        self,
+        file_bytes: bytes,
+        filename: str,
+        mime_type: str,
+        context_block: str = "",
+    ) -> dict:
         """Uploads a file via File API, waits for it to process and extracts data."""
         
         temp_file_path = None
@@ -95,26 +102,26 @@ class OCRProcessor:
             
             # print(self.client.files.get(name=uploaded_file.name))
             
-            prompt = """
-            Extract all data from this document. If it spans multiple pages, 
+            context_prefix = f"{context_block}\n\n" if context_block else ""
+            prompt = f"""{context_prefix}Extract all data from this document. If it spans multiple pages,
             consolidate all line items, totals, and relevant metadata into a single flat JSON object.
             Ensure dynamic keys are descriptive strings (e.g., 'vendor_name', 'invoice_date').
             Return ONLY the raw JSON without any markdown formatting or code blocks.
             You MUST return the data in a strict JSON format with the following structure:
-            {
+            {{
               "total_pages": <number of pages in the document>,
               "pages": [
-                {
+                {{
                   "page_number": <the specific page number starting at 1>,
-                  "extracted_data": { 
-                      {
+                  "extracted_data": {{
+                      {{
                           <dynamic keys and values found ONLY on this specific page>,
                           "confidence_score": <a number between 0 and 1 representing the confidence in the data>,
-                      }
-                  }
-                }
+                      }}
+                  }}
+                }}
               ]
-            }
+            }}
             Do not consolidate items across pages. Keep the extracted_data specific to its page_number.
             """
             
@@ -173,7 +180,9 @@ class OCRProcessor:
             try:
                 async with semaphore:
                     for attempt in range(_MAX_RETRIES + 1):
-                        result = await self.process_single_file(content, filename, mime_type)
+                        result = await self.process_single_file(
+                            content, filename, mime_type, context_block
+                        )
                         if result["status"] == "success":
                             break
                         msg = result.get("message", "").lower()
@@ -192,6 +201,9 @@ class OCRProcessor:
 
         # Send a ping immediately to establish chunked transfer encoding.
         yield json.dumps({"type": "ping"}) + "\n"
+
+        # Build personalised context block once for the entire run.
+        context_block = await build_context_block(user_id, company_id)
 
         file_types: dict[str, int] = {}
         tasks = []
