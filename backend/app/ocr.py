@@ -22,7 +22,6 @@ from PIL import Image
 import io
 
 from app.db import get_supabase
-from app.context_builder import build_context_block
 
 
 class OCRProcessor:
@@ -80,7 +79,6 @@ class OCRProcessor:
         file_bytes: bytes,
         filename: str,
         mime_type: str,
-        context_block: str = "",
     ) -> dict:
         """Uploads a file via File API, waits for it to process and extracts data."""
         
@@ -102,8 +100,7 @@ class OCRProcessor:
             
             # print(self.client.files.get(name=uploaded_file.name))
             
-            context_prefix = f"{context_block}\n\n" if context_block else ""
-            prompt = f"""{context_prefix}Extract all data from this document. If it spans multiple pages,
+            prompt = f"""Extract all data from this document. If it spans multiple pages,
             consolidate all line items, totals, and relevant metadata into a single flat JSON object.
             Ensure dynamic keys are descriptive strings (e.g., 'vendor_name', 'invoice_date').
             Return ONLY the raw JSON without any markdown formatting or code blocks.
@@ -181,7 +178,7 @@ class OCRProcessor:
                 async with semaphore:
                     for attempt in range(_MAX_RETRIES + 1):
                         result = await self.process_single_file(
-                            content, filename, mime_type, context_block
+                            content, filename, mime_type
                         )
                         if result["status"] == "success":
                             break
@@ -201,9 +198,6 @@ class OCRProcessor:
 
         # Send a ping immediately to establish chunked transfer encoding.
         yield json.dumps({"type": "ping"}) + "\n"
-
-        # Build personalised context block once for the entire run.
-        context_block = await build_context_block(user_id, company_id)
 
         file_types: dict[str, int] = {}
         tasks = []

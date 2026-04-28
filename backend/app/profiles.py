@@ -71,6 +71,9 @@ AUTO_SUPPRESS_THRESHOLD = 3
 # Valid outcomes for the investigations table.
 VALID_OUTCOMES = {"Fraud", "VendorError", "FalsePositive"}
 
+# Fields eligible for correction hint tracking.
+HINT_FIELDS = {"mrp", "cost_price", "tax_pct", "sku_desc"}
+
 
 # ── Signal map processor ──────────────────────────────────────────────────────
 
@@ -386,6 +389,115 @@ async def record_investigation(
         print(f"[profiles] investigation insert failed: {exc}")
 
     return Response(status_code=204)
+
+
+# ── POST /v1/memory/field-correction ─────────────────────────────────────────
+
+class FieldCorrectionRequest(BaseModel):
+    plu_code:        Optional[str] = None
+    ean_code:        Optional[str] = None
+    field:           str
+    corrected_value: str
+    source_filename: Optional[str] = None
+
+
+@router.post("/v1/memory/field-correction", status_code=204)
+async def record_field_correction(
+    request: FieldCorrectionRequest,
+    current_user: TokenData = Depends(get_current_user),
+):
+    if request.field not in HINT_FIELDS:
+        return Response(status_code=204)
+    if not request.plu_code and not request.ean_code:
+        return Response(status_code=204)
+
+    def _upsert():
+        db  = get_supabase()
+        now = datetime.now(timezone.utc).isoformat()
+        key_field = "plu_code" if request.plu_code else "ean_code"
+        key_value = request.plu_code or request.ean_code
+
+        existing = (
+            db.table("field_correction_hints")
+            .select("id, count")
+            .eq("user_id", current_user.user_id)
+            .eq(key_field, key_value)
+            .eq("field", request.field)
+            .execute()
+        )
+        if existing.data:
+            row = existing.data[0]
+            db.table("field_correction_hints").update({
+                "count":             row["count"] + 1,
+                "corrected_value":   request.corrected_value,
+                "last_corrected_at": now,
+                "source_filename":   request.source_filename,
+            }).eq("id", row["id"]).execute()
+        else:
+            db.table("field_correction_hints").insert({
+                "user_id":         current_user.user_id,
+                "company_id":      current_user.company_id,
+                "plu_code":        request.plu_code,
+                "ean_code":        request.ean_code,
+                "field":           request.field,
+                "corrected_value": request.corrected_value,
+                "source_filename": request.source_filename,
+            }).execute()
+
+    try:
+        await asyncio.to_thread(_upsert)
+    except Exception as exc:
+        print(f"[profiles] field-correction upsert failed: {exc}")
+
+    return Response(status_code=204)
+
+
+# ── GET /v1/memory/field-hints ────────────────────────────────────────────────
+
+HINT_THRESHOLD = 2  # show hint from the 3rd occurrence onward (count >= 2)
+
+
+@router.get("/v1/memory/field-hints")
+async def get_field_hints(
+    plu_codes: str = "",
+    ean_codes: str = "",
+    current_user: TokenData = Depends(get_current_user),
+):
+    plu_list = [p.strip() for p in plu_codes.split(",") if p.strip()]
+    ean_list = [e.strip() for e in ean_codes.split(",") if e.strip()]
+    if not plu_list and not ean_list:
+        return []
+
+    def _fetch():
+        db = get_supabase()
+        results = []
+        if plu_list:
+            rows = (
+                db.table("field_correction_hints")
+                .select("plu_code, ean_code, field, corrected_value, count, last_corrected_at")
+                .eq("user_id", current_user.user_id)
+                .in_("plu_code", plu_list)
+                .gte("count", HINT_THRESHOLD)
+                .execute()
+            )
+            results.extend(rows.data)
+        if ean_list:
+            rows = (
+                db.table("field_correction_hints")
+                .select("plu_code, ean_code, field, corrected_value, count, last_corrected_at")
+                .eq("user_id", current_user.user_id)
+                .in_("ean_code", ean_list)
+                .gte("count", HINT_THRESHOLD)
+                .execute()
+            )
+            results.extend(rows.data)
+        return results
+
+    try:
+        return await asyncio.to_thread(_fetch)
+    except Exception as exc:
+        print(f"[profiles] get-field-hints failed: {exc}")
+        return []
 
 
 # ── POST /v1/internal/aggregate-profiles ─────────────────────────────────────

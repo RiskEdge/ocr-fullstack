@@ -111,8 +111,10 @@ def _build_sync(user_id: str, vendor_id: Optional[str]) -> str:
         f"Response depth: {_depth_instruction(depth)}",
         f"Technical level: {_tech_instruction(tech)}",
         (
-            f"Risk threshold: {threshold:.2f} — "
-            "only surface issues with risk above this threshold."
+            f"Risk threshold: {threshold:.2f} — assign a risk_score (0.0–1.0) to each "
+            f"discrepancy based on severity and only include discrepancies where "
+            f"risk_score >= {threshold:.2f}. "
+            "A score of 1.0 is a clear pricing or identity error; 0.1 is a trivial formatting difference."
         ),
     ]
 
@@ -181,7 +183,7 @@ async def get_user_preferences(user_id: str) -> dict:
         result = (
             get_supabase()
             .table("user_profiles")
-            .select("auto_select_plu")
+            .select("auto_select_plu, effective_risk_threshold")
             .eq("user_id", user_id)
             .execute()
         )
@@ -189,7 +191,10 @@ async def get_user_preferences(user_id: str) -> dict:
 
     try:
         data = await asyncio.to_thread(_fetch)
-        return {"auto_select_plu": bool(data.get("auto_select_plu", False))}
+        return {
+            "auto_select_plu":          bool(data.get("auto_select_plu", False)),
+            "effective_risk_threshold": float(data.get("effective_risk_threshold") or 0.5),
+        }
     except Exception as exc:
         print(f"[context_builder] get_user_preferences failed for {user_id}: {exc}")
-        return {"auto_select_plu": False}
+        return {"auto_select_plu": False, "effective_risk_threshold": 0.5}

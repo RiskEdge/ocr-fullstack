@@ -49,6 +49,12 @@ export function recordDismissal(flagType: string, riskScore?: number): void {
   });
 }
 
+const OUTCOME_RISK_SCORES: Record<string, number> = {
+  Fraud: 0.9,
+  VendorError: 0.5,
+  FalsePositive: 0.1,
+};
+
 /**
  * Record the outcome of a flag investigation.
  * outcome must be one of: 'Fraud' | 'VendorError' | 'FalsePositive'
@@ -59,9 +65,11 @@ export function recordInvestigation(
   sourceFilename?: string,
   vendorId?: string,
 ): void {
+  const riskScore = OUTCOME_RISK_SCORES[outcome];
   post("/v1/memory/investigation", {
     flag_type: flagType,
     outcome,
+    ...(riskScore !== undefined ? { risk_score: riskScore } : {}),
     ...(sourceFilename ? { source_filename: sourceFilename } : {}),
     ...(vendorId ? { vendor_id: vendorId } : {}),
   });
@@ -97,6 +105,56 @@ export function updateUserPreferences(patch: UserProfilePatch): void {
     body: JSON.stringify(patch),
     keepalive: true,
   }).catch(() => {});
+}
+
+/**
+ * Record a field correction so the system can learn repeated patterns.
+ * Fire-and-forget — errors are swallowed.
+ */
+export function recordFieldCorrection(
+  pluCode: string | null,
+  eanCode: string | null,
+  field: string,
+  correctedValue: string,
+  sourceFilename?: string,
+): void {
+  if (!pluCode && !eanCode) return;
+  post("/v1/memory/field-correction", {
+    plu_code: pluCode,
+    ean_code: eanCode,
+    field,
+    corrected_value: correctedValue,
+    ...(sourceFilename ? { source_filename: sourceFilename } : {}),
+  });
+}
+
+export interface FieldHint {
+  plu_code: string | null;
+  ean_code: string | null;
+  field: string;
+  corrected_value: string;
+  count: number;
+  last_corrected_at: string;
+}
+
+export async function getFieldHints(
+  pluCodes: string[],
+  eanCodes: string[] = [],
+): Promise<FieldHint[]> {
+  const token = getToken();
+  if (!token) return [];
+  const params = new URLSearchParams();
+  if (pluCodes.length) params.set("plu_codes", pluCodes.join(","));
+  if (eanCodes.length) params.set("ean_codes", eanCodes.join(","));
+  try {
+    const res = await fetch(`/v1/memory/field-hints?${params}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return [];
+    return (await res.json()) as FieldHint[];
+  } catch {
+    return [];
+  }
 }
 
 /**

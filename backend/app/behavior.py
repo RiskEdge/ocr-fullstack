@@ -79,6 +79,9 @@ ALLOWED_EVENT_TYPES = {
     "feedback_incorrect",
     # PLU auto-select preference toggle
     "plu_auto_select_toggled",
+    # Field correction hint interactions
+    "field_correction_accepted",    # user clicked "Apply hint" — used remembered value
+    "field_correction_overridden",  # user typed a different custom value instead
 }
 
 

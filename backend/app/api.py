@@ -1,5 +1,7 @@
 import asyncio
 import re
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from typing import List, Any
 from pydantic import BaseModel
 
@@ -18,11 +20,34 @@ from app.validation import ValidationProcessor
 from app.auth_utils import create_access_token, get_current_user, TokenData
 from app.db import get_supabase
 from app.behavior import router as behavior_router
-from app.profiles import router as profiles_router
+from app.profiles import router as profiles_router, _aggregate_all
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-app = FastAPI()
+
+async def _nightly_aggregator():
+    """Runs _aggregate_all once per day at midnight UTC."""
+    while True:
+        now = datetime.now(timezone.utc)
+        next_midnight = (now + timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        await asyncio.sleep((next_midnight - now).total_seconds())
+        try:
+            results = await asyncio.to_thread(_aggregate_all)
+            print(f"[scheduler] nightly aggregator complete — {len(results)} users updated")
+        except Exception as exc:
+            print(f"[scheduler] nightly aggregator failed: {exc}")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(_nightly_aggregator())
+    yield
+    task.cancel()
+
+
+app = FastAPI(lifespan=lifespan)
 
 origins = [
     "http://localhost:3000",

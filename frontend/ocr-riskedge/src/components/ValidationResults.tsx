@@ -4,9 +4,12 @@ import {
   recordFlagExposure,
   recordDismissal,
   recordInvestigation,
+  recordFieldCorrection,
+  getFieldHints,
   getUserProfile,
   updateUserPreferences,
 } from "@/lib/profilesApi";
+import type { FieldHint } from "@/lib/profilesApi";
 import {
   Table,
   TableBody,
@@ -314,6 +317,8 @@ const ValidationResults = ({
   const [feedbackFlash, setFeedbackFlash] = useState<Record<number, string>>({});
   // Tracks which (itemIdx:flagType) combos have had flag-exposure fired this session.
   const exposedRef = useRef<Set<string>>(new Set());
+  // hint map: key is `${plu_code}:${field}` or `${ean_code}:${field}`
+  const [hintMap, setHintMap] = useState<Map<string, FieldHint>>(new Map());
   // Ref for the copy event listener (copied_summary signal)
   const containerRef = useRef<HTMLDivElement>(null);
 
@@ -366,6 +371,27 @@ const ValidationResults = ({
     el.addEventListener("copy", handler);
     return () => el.removeEventListener("copy", handler);
   }, [track]);
+
+  // Fetch field correction hints for all matched PLUs/EANs once items arrive.
+  useEffect(() => {
+    const pluCodes = items
+      .map((item) => item.validation?.matched_plu)
+      .filter((p): p is string => Boolean(p));
+    const eanCodes = items
+      .map((item) => item.ean_code)
+      .filter((e): e is string => Boolean(e));
+    if (!pluCodes.length && !eanCodes.length) return;
+    getFieldHints(pluCodes, eanCodes).then((hints) => {
+      const map = new Map<string, FieldHint>();
+      for (const h of hints) {
+        const key = h.plu_code
+          ? `${h.plu_code}:${h.field}`
+          : `${h.ean_code}:${h.field}`;
+        map.set(key, h);
+      }
+      setHintMap(map);
+    });
+  }, [items]);
 
   // Collect all unique field keys across all items (preserve insertion order, skip 'validation')
   const fieldKeys = useMemo(() => {
@@ -635,6 +661,16 @@ const ValidationResults = ({
       match_type: items[itemIdx]?.validation?.match_type ?? "exact",
       bulk: true,
     });
+
+    for (const [field, val] of Object.entries(corrections)) {
+      recordFieldCorrection(
+        items[itemIdx]?.validation?.matched_plu ?? null,
+        items[itemIdx]?.ean_code ?? null,
+        field,
+        String(val),
+        sourceFilename,
+      );
+    }
   }
 
   function acceptField(itemIdx: number, field: string, value: string) {
@@ -657,11 +693,27 @@ const ValidationResults = ({
       items[itemIdx]?.validation?.suggested_corrections?.[field] ?? "",
     );
     const isSuggestion = value === suggestedValue && suggestedValue !== "";
-    track(isSuggestion ? "suggestion_accepted" : "field_edit", {
+    const existingHint = getHint(items[itemIdx], field);
+    const isOverride = Boolean(existingHint) && existingHint!.corrected_value !== value;
+    const trackEvent = isOverride
+      ? "field_correction_overridden"
+      : isSuggestion
+        ? "suggestion_accepted"
+        : "field_edit";
+    track(trackEvent, {
       field_id: field,
       item_index: itemIdx,
       match_type: items[itemIdx]?.validation?.match_type ?? "exact",
+      had_hint: Boolean(existingHint),
     });
+
+    recordFieldCorrection(
+      items[itemIdx]?.validation?.matched_plu ?? null,
+      items[itemIdx]?.ean_code ?? null,
+      field,
+      value,
+      sourceFilename,
+    );
   }
 
   function openFieldEdit(itemIdx: number, field: string) {
@@ -758,6 +810,42 @@ const ValidationResults = ({
         return next;
       });
     }, 1500);
+  }
+
+  function getHint(item: ValidatedItem, field: string): FieldHint | undefined {
+    const plu = item.validation?.matched_plu;
+    if (plu) return hintMap.get(`${plu}:${field}`);
+    const ean = item.ean_code;
+    if (ean) return hintMap.get(`${ean}:${field}`);
+    return undefined;
+  }
+
+  function applyHint(itemIdx: number, field: string, hintValue: string) {
+    setEdits((prev) => ({
+      ...prev,
+      [itemIdx]: { ...(prev[itemIdx] ?? {}), [field]: hintValue },
+    }));
+    setAcceptedFields((prev) => ({
+      ...prev,
+      [itemIdx]: new Set([...(prev[itemIdx] ?? []), field]),
+    }));
+    setEditingDiscrepancy((prev) => {
+      const set = new Set(prev[itemIdx] ?? []);
+      set.delete(field);
+      return { ...prev, [itemIdx]: set };
+    });
+    track("field_correction_accepted", {
+      field,
+      plu_code: items[itemIdx]?.validation?.matched_plu,
+      hint_count: getHint(items[itemIdx], field)?.count,
+    });
+    recordFieldCorrection(
+      items[itemIdx]?.validation?.matched_plu ?? null,
+      items[itemIdx]?.ean_code ?? null,
+      field,
+      hintValue,
+      sourceFilename,
+    );
   }
 
   function toggleAutoSelectPlu() {
@@ -1886,8 +1974,8 @@ const ValidationResults = ({
                                                     )
                                                   : null;
                                               return (
+                                                <Fragment key={di}>
                                                 <UITableRow
-                                                  key={di}
                                                   className={`hover:bg-muted/30 transition-opacity ${
                                                     resolved ||
                                                     isDismissed ||
@@ -2057,6 +2145,37 @@ const ValidationResults = ({
                                                     )}
                                                   </TableCell>
                                                 </UITableRow>
+                                                {!resolved && !isDismissed && !isSuppressed && (() => {
+                                                  const hint = getHint(item, d.field);
+                                                  if (!hint) return null;
+                                                  const displayValue = isNaN(Number(hint.corrected_value))
+                                                    ? hint.corrected_value
+                                                    : Number(hint.corrected_value);
+                                                  return (
+                                                    <tr>
+                                                      <td colSpan={5} className="px-0 pb-2 pt-0 border-0">
+                                                        <div className="mx-4 flex items-center gap-2 rounded-md bg-amber-50 border border-amber-200 px-3 py-1.5 text-sm dark:bg-amber-950/20 dark:border-amber-800">
+                                                          <span className="text-amber-700 dark:text-amber-400">
+                                                            You've corrected this {hint.count} time{hint.count > 1 ? "s" : ""} before
+                                                            {" → "}<strong>{String(displayValue)}</strong>
+                                                          </span>
+                                                          <Button
+                                                            size="sm"
+                                                            variant="outline"
+                                                            className="ml-auto h-6 border-amber-400 text-amber-800 hover:bg-amber-100 dark:border-amber-600 dark:text-amber-300 dark:hover:bg-amber-900/30"
+                                                            onClick={(e) => {
+                                                              e.stopPropagation();
+                                                              applyHint(idx, d.field, hint.corrected_value);
+                                                            }}
+                                                          >
+                                                            Apply
+                                                          </Button>
+                                                        </div>
+                                                      </td>
+                                                    </tr>
+                                                  );
+                                                })()}
+                                                </Fragment>
                                               );
                                             },
                                           )}

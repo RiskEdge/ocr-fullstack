@@ -143,7 +143,7 @@ class ValidationProcessor:
     # ------------------------------------------------------------------
 
     async def _gemini_analyze(
-        self, item: dict, master_rows: list[dict], context_block: str = ""
+        self, item: dict, master_rows: list[dict], context_block: str = "", threshold: float = 0.5
     ) -> dict:
         """
         Ask Gemini to select the best-matching PLU and identify discrepancies.
@@ -191,21 +191,23 @@ Task:
 2. Compare cost_price, mrp, tax_pct, AND sku_desc between the invoice and the chosen record.
    IMPORTANT: If an invoice field says "not provided in invoice", that data was absent
    from the document. Do NOT flag it as a discrepancy — skip it entirely.
-3. For numeric fields (cost_price, mrp, tax_pct): flag a discrepancy if values differ.
-   For sku_desc: flag a discrepancy if the invoice product description does not match
-   the master description (case-insensitive comparison).
-4. Suggest corrections using the master record values.
+3. For numeric fields (cost_price, mrp, tax_pct): identify any value differences.
+   For sku_desc: identify any mismatch between invoice and master description (case-insensitive).
+4. Assign a risk_score (0.0–1.0) to each discrepancy: 1.0 = clear pricing or identity error,
+   0.1 = trivial formatting difference. Only include discrepancies with risk_score >= {threshold:.2f}.
+5. Suggest corrections using the master record values.
 
 Return ONLY the following JSON — no markdown, no extra text:
 {{
   "matched_plu": "<plu_code of chosen master record>",
-  "is_valid": <true if zero discrepancies, else false>,
+  "is_valid": <true if zero discrepancies survive the threshold, else false>,
   "discrepancies": [
     {{
-      "field":    "<cost_price | mrp | tax_pct | sku_desc>",
-      "expected": <master value — number for numeric fields, string for sku_desc>,
-      "actual":   <invoice value — number for numeric fields, string for sku_desc>,
-      "message":  "<one-sentence explanation>"
+      "field":      "<cost_price | mrp | tax_pct | sku_desc>",
+      "expected":   <master value — number for numeric fields, string for sku_desc>,
+      "actual":     <invoice value — number for numeric fields, string for sku_desc>,
+      "message":    "<one-sentence explanation>",
+      "risk_score": <0.0–1.0>
     }}
   ],
   "suggested_corrections": {{ "<field>": <corrected value> }}
@@ -228,7 +230,7 @@ Master records (JSON):
     # ------------------------------------------------------------------
 
     async def _gemini_fuzzy_match(
-        self, item: dict, candidates: list[dict], context_block: str = ""
+        self, item: dict, candidates: list[dict], context_block: str = "", threshold: float = 0.5
     ) -> dict:
         """
         Called when the invoice EAN is not in master_items but a product-name
@@ -274,10 +276,11 @@ Task:
    (use product name similarity, then MRP, then Tax% as tiebreakers).
 2. If no record is a reasonable match, set "matched_plu" to null.
 3. Compare cost_price, mrp, tax_pct, AND sku_desc between the invoice and the chosen record.
-   For sku_desc: flag a discrepancy if the invoice product description does not match
-   the master description (case-insensitive).
-4. Suggest corrections using the master record values.
-5. Write a short note explaining why you chose (or could not choose) a match.
+   For sku_desc: identify any mismatch between invoice and master description (case-insensitive).
+4. Assign a risk_score (0.0–1.0) to each discrepancy: 1.0 = clear pricing or identity error,
+   0.1 = trivial formatting difference. Only include discrepancies with risk_score >= {threshold:.2f}.
+5. Suggest corrections using the master record values.
+6. Write a short note explaining why you chose (or could not choose) a match.
 
 Return ONLY the following JSON — no markdown, no extra text:
 {{
@@ -288,10 +291,11 @@ Return ONLY the following JSON — no markdown, no extra text:
   "is_valid":    false,
   "discrepancies": [
     {{
-      "field":    "<ean_code | cost_price | mrp | tax_pct | sku_desc>",
-      "expected": <master value or null — number for numeric fields, string for sku_desc>,
-      "actual":   <invoice value — number for numeric fields, string for sku_desc>,
-      "message":  "<one-sentence explanation>"
+      "field":      "<ean_code | cost_price | mrp | tax_pct | sku_desc>",
+      "expected":   <master value or null — number for numeric fields, string for sku_desc>,
+      "actual":     <invoice value — number for numeric fields, string for sku_desc>,
+      "message":    "<one-sentence explanation>",
+      "risk_score": <0.0–1.0>
     }}
   ],
   "suggested_corrections": {{ "<field>": <corrected value> }}
@@ -386,12 +390,14 @@ Master records (JSON):
         # Build context block and fetch preference flags concurrently.
         context_block   = ""
         auto_select_plu = False
+        threshold       = 0.5
         if user_id:
             context_block, prefs = await asyncio.gather(
                 build_context_block(user_id, company_id),
                 get_user_preferences(user_id),
             )
             auto_select_plu = prefs.get("auto_select_plu", False)
+            threshold       = float(prefs.get("effective_risk_threshold", 0.5))
 
         items = [normalize_item(raw) for raw in raw_items]
         gemini_calls        = 0
@@ -435,7 +441,7 @@ Master records (JSON):
                     gemini_calls += 1
                     gemini_queue.append((
                         placeholder_idx,
-                        self._gemini_fuzzy_match(item, candidates, context_block),
+                        self._gemini_fuzzy_match(item, candidates, context_block, threshold),
                         None,   # match_type comes from Gemini response ("fuzzy_name")
                     ))
                 else:
@@ -487,7 +493,7 @@ Master records (JSON):
                 results.append(None)
                 gemini_queue.append((
                     placeholder_idx,
-                    self._gemini_analyze(item, master_rows, context_block),
+                    self._gemini_analyze(item, master_rows, context_block, threshold),
                     "auto_selected",   # stamp this onto the result
                 ))
             else:
@@ -547,6 +553,13 @@ Master records (JSON):
                         }
                 else:
                     validation = dict(output)
+                    # Filter out any discrepancies below the user's risk threshold.
+                    # Gemini should already respect it, but this enforces it in code.
+                    validation["discrepancies"] = [
+                        d for d in validation.get("discrepancies", [])
+                        if float(d.get("risk_score", 1.0)) >= threshold
+                    ]
+                    validation["is_valid"] = len(validation["discrepancies"]) == 0
                     if match_type_override:
                         validation["match_type"] = match_type_override
                         matched_auto += 1
