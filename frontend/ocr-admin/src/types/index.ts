@@ -1,0 +1,124 @@
+export interface OcrStats {
+  runs: number
+  files: number
+  pages: number
+  credits: number
+  cost_usd: number
+  last_at: string | null
+}
+
+export interface ValStats {
+  runs: number
+  items: number
+  credits: number
+  gemini_calls: number
+  last_at: string | null
+}
+
+export interface OverviewData {
+  company_name: string
+  credits_remaining: number
+  total_users: number
+  total_credits_consumed: number
+  total_cost_usd: number
+  ocr: { all_time: OcrStats; last_30d: OcrStats }
+  validation: { all_time: ValStats; last_30d: ValStats }
+}
+
+export interface GlobalOverviewData {
+  total_partners: number
+  total_companies: number
+  total_users: number
+  total_credits_in_system: number
+  ocr: { all_time: OcrStats; last_30d: OcrStats }
+  validation: { all_time: ValStats; last_30d: ValStats }
+}
+
+export interface ClientSummary {
+  id: string
+  name: string
+  credits: number
+  user_count: number
+  ocr_runs_30d: number
+  ocr_credits_30d: number
+  val_runs_30d: number
+  val_credits_30d: number
+  partner_name?: string
+}
+
+export interface Partner {
+  id: string
+  name: string
+  contact_email: string | null
+  is_active: boolean
+  company_count: number
+  created_at: string
+}
+
+export interface Company {
+  id: string
+  name: string
+  credits: number
+  partner_id: string | null
+  partner_name: string | null
+  user_count: number
+}
+
+export interface AdminUser {
+  id: string
+  username: string
+  role: string
+  company_id: string | null
+  company_name: string
+}
+
+export interface ProcessingRun {
+  id: string
+  username: string
+  company_name: string
+  total_files: number
+  successful_files: number
+  failed_files: number
+  total_pages: number
+  total_fields_extracted: number
+  credits_used: number
+  total_duration_ms: number
+  status: string
+  started_at: string
+  completed_at: string | null
+  environment: string
+}
+
+export interface ValidationRun {
+  id: string
+  username: string
+  company_name: string
+  source_filename: string | null
+  total_items: number
+  matched_exact: number
+  matched_fuzzy: number
+  matched_multi_plu: number
+  no_match: number
+  valid_items: number
+  items_with_issues: number
+  gemini_calls: number
+  credits_used: number
+  status: string
+  duration_ms: number
+  started_at: string
+  completed_at: string | null
+  environment: string
+}
+
+export interface RunFilters {
+  from_date?: string
+  to_date?: string
+  username?: string
+}
+
+export interface UserInfo {
+  username: string
+  role: string
+  company?: string
+  partner?: string
+}

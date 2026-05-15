@@ -1,9 +1,10 @@
 import { createContext, useContext, useState, useCallback, useEffect, type ReactNode } from "react";
-import { Company, dummyCompanies } from "@/data/dummyCredentials";
 import api from "@/lib/api";
 
-const TOKEN_KEY = 'ocr_access_token';
-const USER_KEY = 'ocr_user';
+export interface Company {
+  id: string;
+  name: string;
+}
 
 interface User {
   username: string;
@@ -16,12 +17,15 @@ interface AuthContextType {
   isAuthenticated: boolean;
   isLoading: boolean;
   credits: number | null;
+  companies: Company[];
   login: (username: string, password: string, companyName: string) => Promise<{ success: boolean; error?: string }>;
   logout: () => void;
   refreshCredits: () => Promise<void>;
   setCredits: (value: number) => void;
-  companies: Company[];
 }
+
+const TOKEN_KEY = 'ocr_access_token';
+const USER_KEY  = 'ocr_user';
 
 const AuthContext = createContext<AuthContextType | null>(null);
 
@@ -32,10 +36,18 @@ export const useAuth = () => {
 };
 
 export const AuthProvider = ({ children }: { children: ReactNode }) => {
-  const [user, setUser] = useState<User | null>(null);
-  const [token, setToken] = useState<string | null>(null);
+  const [user,      setUser]      = useState<User | null>(null);
+  const [token,     setToken]     = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
-  const [credits, setCredits] = useState<number | null>(null);
+  const [credits,   setCredits]   = useState<number | null>(null);
+  const [companies, setCompanies] = useState<Company[]>([]);
+
+  // Fetch company list from the public endpoint on mount
+  useEffect(() => {
+    api.get('/v1/companies')
+      .then(res => setCompanies(res.data))
+      .catch(() => {});
+  }, []);
 
   const fetchCredits = useCallback(async (authToken: string) => {
     try {
@@ -50,7 +62,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
 
   useEffect(() => {
     const savedToken = localStorage.getItem(TOKEN_KEY);
-    const savedUser = localStorage.getItem(USER_KEY);
+    const savedUser  = localStorage.getItem(USER_KEY);
     if (savedToken && savedUser) {
       try {
         setToken(savedToken);
@@ -101,11 +113,11 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         isAuthenticated: !!user,
         isLoading,
         credits,
+        companies,
         login,
         logout,
         refreshCredits,
         setCredits,
-        companies: dummyCompanies,
       }}
     >
       {children}

@@ -1,0 +1,578 @@
+"""
+admin.py — Multi-level admin dashboard endpoints.
+
+Three admin roles:
+  superadmin    — Risk Edge global admin, sees everything
+  partner_admin — partner org admin, sees only their client companies
+  client_admin  — client company admin, sees only their own company
+"""
+
+import asyncio
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from passlib.context import CryptContext
+from pydantic import BaseModel
+
+from app.auth_utils import get_current_user, TokenData
+from app.db import get_supabase
+
+router = APIRouter()
+_pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+# ---------------------------------------------------------------------------
+# Role guards
+# ---------------------------------------------------------------------------
+
+def require_superadmin(current_user: TokenData = Depends(get_current_user)) -> TokenData:
+    if current_user.role != "superadmin":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Superadmin access required.")
+    return current_user
+
+
+def require_partner_or_above(current_user: TokenData = Depends(get_current_user)) -> TokenData:
+    if current_user.role not in ("superadmin", "partner_admin"):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Partner admin or above required.")
+    return current_user
+
+
+def require_admin(current_user: TokenData = Depends(get_current_user)) -> TokenData:
+    if current_user.role == "user":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Admin access required.")
+    return current_user
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _sum_ocr(rows: list) -> dict:
+    return {
+        "runs":     len(rows),
+        "files":    sum(r.get("total_files", 0) for r in rows),
+        "pages":    sum(r.get("total_pages", 0) for r in rows),
+        "credits":  sum(r.get("credits_used", 0) for r in rows),
+        "cost_usd": round(sum(r.get("total_cost_usd") or 0 for r in rows), 4),
+        "last_at":  max((r["started_at"] for r in rows if r.get("started_at")), default=None),
+    }
+
+
+def _sum_val(rows: list) -> dict:
+    return {
+        "runs":         len(rows),
+        "items":        sum(r.get("total_items", 0) for r in rows),
+        "credits":      sum(r.get("credits_used", 0) for r in rows),
+        "gemini_calls": sum(r.get("gemini_calls", 0) for r in rows),
+        "last_at":      max((r["started_at"] for r in rows if r.get("started_at")), default=None),
+    }
+
+
+def _company_ids_for_user(db, current_user: TokenData) -> Optional[list]:
+    """Returns list of company_ids in scope. None means all (superadmin)."""
+    if current_user.role == "superadmin":
+        return None
+    if current_user.role == "partner_admin":
+        res = db.table("companies").select("id").eq("partner_id", current_user.partner_id).execute()
+        return [r["id"] for r in res.data] if res.data else []
+    return [current_user.company_id]
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/admin/overview  —  any admin role, scoped by role
+# ---------------------------------------------------------------------------
+
+@router.get("/v1/admin/overview")
+async def admin_overview(current_user: TokenData = Depends(require_admin)):
+    """Company stats scoped to the caller's role (single company, partner, or global)."""
+
+    def _fetch():
+        db = get_supabase()
+        since_30d = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        company_ids = _company_ids_for_user(db, current_user)
+
+        if company_ids is not None and not company_ids:
+            empty = _sum_ocr([])
+            return {
+                "company_name": "No companies", "credits_remaining": 0,
+                "total_users": 0, "total_credits_consumed": 0, "total_cost_usd": 0,
+                "ocr": {"all_time": empty, "last_30d": empty},
+                "validation": {"all_time": _sum_val([]), "last_30d": _sum_val([])},
+            }
+
+        if company_ids is not None and len(company_ids) == 1:
+            c = db.table("companies").select("name, credits").eq("id", company_ids[0]).single().execute().data
+            company_name = c["name"]
+            credits_remaining = c["credits"]
+        elif company_ids is not None:
+            cs = db.table("companies").select("name, credits").in_("id", company_ids).execute().data or []
+            company_name = f"{len(cs)} companies"
+            credits_remaining = sum(c["credits"] for c in cs)
+        else:
+            cs = db.table("companies").select("credits").execute().data or []
+            company_name = "All Companies"
+            credits_remaining = sum(c["credits"] for c in cs)
+
+        user_q = db.table("users").select("id", count="exact").eq("role", "user")
+        if company_ids is not None:
+            user_q = user_q.in_("company_id", company_ids)
+        user_count = user_q.execute().count or 0
+
+        ocr_q = db.table("processing_runs").select("total_files, total_pages, credits_used, total_cost_usd, started_at")
+        val_q = db.table("validation_runs").select("total_items, credits_used, gemini_calls, started_at")
+        if company_ids is not None:
+            ocr_q = ocr_q.in_("company_id", company_ids)
+            val_q = val_q.in_("company_id", company_ids)
+        ocr_rows = ocr_q.execute().data or []
+        val_rows = val_q.execute().data or []
+
+        return {
+            "company_name":           company_name,
+            "credits_remaining":      credits_remaining,
+            "total_users":            user_count,
+            "total_credits_consumed": _sum_ocr(ocr_rows)["credits"] + _sum_val(val_rows)["credits"],
+            "total_cost_usd":         _sum_ocr(ocr_rows)["cost_usd"],
+            "ocr": {
+                "all_time": _sum_ocr(ocr_rows),
+                "last_30d": _sum_ocr([r for r in ocr_rows if (r.get("started_at") or "") >= since_30d]),
+            },
+            "validation": {
+                "all_time": _sum_val(val_rows),
+                "last_30d": _sum_val([r for r in val_rows if (r.get("started_at") or "") >= since_30d]),
+            },
+        }
+
+    return await asyncio.to_thread(_fetch)
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/admin/global-overview  —  superadmin only
+# ---------------------------------------------------------------------------
+
+@router.get("/v1/admin/global-overview")
+async def global_overview(current_user: TokenData = Depends(require_superadmin)):
+    """Platform-wide aggregate stats across all partners, companies and users."""
+
+    def _fetch():
+        db = get_supabase()
+        since_30d = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+
+        n_partners  = db.table("partners").select("id", count="exact").execute().count or 0
+        n_companies = db.table("companies").select("id", count="exact").execute().count or 0
+        n_users     = db.table("users").select("id", count="exact").eq("role", "user").execute().count or 0
+        total_credits = sum(
+            c["credits"] for c in (db.table("companies").select("credits").execute().data or [])
+        )
+
+        ocr_rows = db.table("processing_runs").select(
+            "total_files, total_pages, credits_used, total_cost_usd, started_at"
+        ).execute().data or []
+        val_rows = db.table("validation_runs").select(
+            "total_items, credits_used, gemini_calls, started_at"
+        ).execute().data or []
+
+        return {
+            "total_partners":          n_partners,
+            "total_companies":         n_companies,
+            "total_users":             n_users,
+            "total_credits_in_system": total_credits,
+            "ocr": {
+                "all_time": _sum_ocr(ocr_rows),
+                "last_30d": _sum_ocr([r for r in ocr_rows if (r.get("started_at") or "") >= since_30d]),
+            },
+            "validation": {
+                "all_time": _sum_val(val_rows),
+                "last_30d": _sum_val([r for r in val_rows if (r.get("started_at") or "") >= since_30d]),
+            },
+        }
+
+    return await asyncio.to_thread(_fetch)
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/admin/my-clients  —  partner_admin+
+# ---------------------------------------------------------------------------
+
+@router.get("/v1/admin/my-clients")
+async def my_clients(current_user: TokenData = Depends(require_partner_or_above)):
+    """Client companies under this partner, each with 30-day usage summary."""
+
+    def _fetch():
+        db = get_supabase()
+        since_30d = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+
+        if current_user.role == "partner_admin":
+            companies = (
+                db.table("companies")
+                .select("id, name, credits")
+                .eq("partner_id", current_user.partner_id)
+                .order("name")
+                .execute().data or []
+            )
+            show_partner = False
+        else:
+            companies = (
+                db.table("companies")
+                .select("id, name, credits, partners(name)")
+                .order("name")
+                .execute().data or []
+            )
+            show_partner = True
+
+        result = []
+        for c in companies:
+            cid = c["id"]
+            user_count = (
+                db.table("users").select("id", count="exact")
+                .eq("company_id", cid).eq("role", "user").execute().count or 0
+            )
+            ocr_rows = (
+                db.table("processing_runs").select("credits_used")
+                .eq("company_id", cid).gte("started_at", since_30d).execute().data or []
+            )
+            val_rows = (
+                db.table("validation_runs").select("credits_used")
+                .eq("company_id", cid).gte("started_at", since_30d).execute().data or []
+            )
+            entry = {
+                "id":              cid,
+                "name":            c["name"],
+                "credits":         c["credits"],
+                "user_count":      user_count,
+                "ocr_runs_30d":    len(ocr_rows),
+                "ocr_credits_30d": sum(r.get("credits_used", 0) for r in ocr_rows),
+                "val_runs_30d":    len(val_rows),
+                "val_credits_30d": sum(r.get("credits_used", 0) for r in val_rows),
+            }
+            if show_partner:
+                entry["partner_name"] = (c.get("partners") or {}).get("name")
+            result.append(entry)
+
+        return result
+
+    return await asyncio.to_thread(_fetch)
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/admin/users  —  any admin, scoped by role
+# ---------------------------------------------------------------------------
+
+@router.get("/v1/admin/users")
+async def admin_users(current_user: TokenData = Depends(require_admin)):
+    """Users in scope: role-based — client_admin sees their company, partner sees their clients, superadmin sees all."""
+
+    def _fetch():
+        db = get_supabase()
+        company_ids = _company_ids_for_user(db, current_user)
+
+        q = db.table("users").select("id, username, role, company_id, companies(name)")
+
+        if company_ids is None:
+            q = q.neq("role", "superadmin")
+        elif not company_ids:
+            return []
+        else:
+            q = q.in_("company_id", company_ids)
+            if current_user.role == "client_admin":
+                q = q.eq("role", "user")
+
+        rows = q.execute().data or []
+        for row in rows:
+            row["company_name"] = (row.pop("companies", None) or {}).get("name", "—")
+        return rows
+
+    return await asyncio.to_thread(_fetch)
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/admin/company-users  —  client_admin+ creates a user
+# ---------------------------------------------------------------------------
+
+class CreateUserRequest(BaseModel):
+    username: str
+    password: str
+    company_id: Optional[str] = None
+    role: str = "user"
+
+
+@router.post("/v1/admin/company-users", status_code=201)
+async def create_company_user(req: CreateUserRequest, current_user: TokenData = Depends(require_admin)):
+    if req.role not in ("user", "client_admin"):
+        raise HTTPException(400, "role must be 'user' or 'client_admin'.")
+
+    target_cid = req.company_id if current_user.role == "superadmin" else current_user.company_id
+    if not target_cid:
+        raise HTTPException(400, "company_id is required.")
+
+    def _create():
+        db = get_supabase()
+        try:
+            result = db.table("users").insert({
+                "username":   req.username,
+                "password":   _pwd.hash(req.password[:72]),
+                "company_id": target_cid,
+                "role":       req.role,
+            }).execute()
+            return result.data[0] if result.data else {"username": req.username}
+        except Exception as e:
+            if "duplicate" in str(e).lower() or "unique" in str(e).lower():
+                raise HTTPException(409, f"Username '{req.username}' already exists in this company.")
+            raise
+
+    return await asyncio.to_thread(_create)
+
+
+# ---------------------------------------------------------------------------
+# DELETE /v1/admin/company-users/{user_id}  —  client_admin+
+# ---------------------------------------------------------------------------
+
+@router.delete("/v1/admin/company-users/{user_id}", status_code=204)
+async def delete_company_user(user_id: str, current_user: TokenData = Depends(require_admin)):
+    def _delete():
+        db = get_supabase()
+        res = db.table("users").select("id, role, company_id").eq("id", user_id).execute()
+        if not res.data:
+            raise HTTPException(404, "User not found.")
+        target = res.data[0]
+
+        if target["role"] in ("superadmin", "partner_admin"):
+            raise HTTPException(403, "Cannot delete superadmin or partner_admin users via this endpoint.")
+        if current_user.role == "client_admin" and target["company_id"] != current_user.company_id:
+            raise HTTPException(403, "Cannot delete users from other companies.")
+
+        db.table("users").delete().eq("id", user_id).execute()
+
+    await asyncio.to_thread(_delete)
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/admin/processing-runs  —  any admin, scoped by role
+# ---------------------------------------------------------------------------
+
+@router.get("/v1/admin/processing-runs")
+async def admin_processing_runs(
+    from_date: str | None = Query(None),
+    to_date:   str | None = Query(None),
+    username:  str | None = Query(None),
+    limit:     int        = Query(100, le=500),
+    current_user: TokenData = Depends(require_admin),
+):
+    def _fetch():
+        db = get_supabase()
+        company_ids = _company_ids_for_user(db, current_user)
+
+        if company_ids is not None and not company_ids:
+            return []
+
+        user_ids = None
+        if username:
+            u_q = db.table("users").select("id").eq("username", username)
+            if company_ids is not None:
+                u_q = u_q.in_("company_id", company_ids)
+            u_rows = u_q.execute().data or []
+            if not u_rows:
+                return []
+            user_ids = [r["id"] for r in u_rows]
+
+        q = (
+            db.table("processing_runs")
+            .select(
+                "id, total_files, successful_files, failed_files, "
+                "total_pages, total_fields_extracted, credits_used, "
+                "total_duration_ms, status, started_at, completed_at, environment, "
+                "users!user_id(username), companies!company_id(name)"
+            )
+            .order("started_at", desc=True)
+            .limit(limit)
+        )
+        if company_ids is not None:
+            q = q.in_("company_id", company_ids)
+        if user_ids:
+            q = q.in_("user_id", user_ids)
+        if from_date:
+            q = q.gte("started_at", from_date)
+        if to_date:
+            q = q.lte("started_at", to_date)
+
+        rows = q.execute().data or []
+        for row in rows:
+            row["username"]     = (row.pop("users", None) or {}).get("username", "—")
+            row["company_name"] = (row.pop("companies", None) or {}).get("name", "—")
+        return rows
+
+    return await asyncio.to_thread(_fetch)
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/admin/validation-runs  —  any admin, scoped by role
+# ---------------------------------------------------------------------------
+
+@router.get("/v1/admin/validation-runs")
+async def admin_validation_runs(
+    from_date: str | None = Query(None),
+    to_date:   str | None = Query(None),
+    username:  str | None = Query(None),
+    limit:     int        = Query(100, le=500),
+    current_user: TokenData = Depends(require_admin),
+):
+    def _fetch():
+        db = get_supabase()
+        company_ids = _company_ids_for_user(db, current_user)
+
+        if company_ids is not None and not company_ids:
+            return []
+
+        user_ids = None
+        if username:
+            u_q = db.table("users").select("id").eq("username", username)
+            if company_ids is not None:
+                u_q = u_q.in_("company_id", company_ids)
+            u_rows = u_q.execute().data or []
+            if not u_rows:
+                return []
+            user_ids = [r["id"] for r in u_rows]
+
+        q = (
+            db.table("validation_runs")
+            .select(
+                "id, source_filename, total_items, "
+                "matched_exact, matched_fuzzy, matched_multi_plu, no_match, "
+                "valid_items, items_with_issues, gemini_calls, credits_used, "
+                "status, duration_ms, started_at, completed_at, environment, "
+                "users!user_id(username), companies!company_id(name)"
+            )
+            .order("started_at", desc=True)
+            .limit(limit)
+        )
+        if company_ids is not None:
+            q = q.in_("company_id", company_ids)
+        if user_ids:
+            q = q.in_("user_id", user_ids)
+        if from_date:
+            q = q.gte("started_at", from_date)
+        if to_date:
+            q = q.lte("started_at", to_date)
+
+        rows = q.execute().data or []
+        for row in rows:
+            row["username"]     = (row.pop("users", None) or {}).get("username", "—")
+            row["company_name"] = (row.pop("companies", None) or {}).get("name", "—")
+        return rows
+
+    return await asyncio.to_thread(_fetch)
+
+
+# ---------------------------------------------------------------------------
+# Partners  —  superadmin only
+# ---------------------------------------------------------------------------
+
+@router.get("/v1/admin/partners")
+async def list_partners(current_user: TokenData = Depends(require_superadmin)):
+    def _fetch():
+        db = get_supabase()
+        partners = (
+            db.table("partners")
+            .select("id, name, contact_email, is_active, created_at")
+            .order("name")
+            .execute().data or []
+        )
+        for p in partners:
+            p["company_count"] = (
+                db.table("companies").select("id", count="exact").eq("partner_id", p["id"]).execute().count or 0
+            )
+        return partners
+
+    return await asyncio.to_thread(_fetch)
+
+
+class CreatePartnerRequest(BaseModel):
+    name: str
+    contact_email: Optional[str] = None
+
+
+@router.post("/v1/admin/partners", status_code=201)
+async def create_partner(req: CreatePartnerRequest, current_user: TokenData = Depends(require_superadmin)):
+    def _create():
+        db = get_supabase()
+        try:
+            result = db.table("partners").insert(
+                {"name": req.name, "contact_email": req.contact_email}
+            ).execute()
+            return result.data[0]
+        except Exception as e:
+            if "duplicate" in str(e).lower() or "unique" in str(e).lower():
+                raise HTTPException(409, f"Partner '{req.name}' already exists.")
+            raise
+
+    return await asyncio.to_thread(_create)
+
+
+# ---------------------------------------------------------------------------
+# All Companies  —  superadmin only
+# ---------------------------------------------------------------------------
+
+@router.get("/v1/admin/all-companies")
+async def list_all_companies(current_user: TokenData = Depends(require_superadmin)):
+    def _fetch():
+        db = get_supabase()
+        companies = (
+            db.table("companies")
+            .select("id, name, credits, partner_id, partners(name)")
+            .order("name")
+            .execute().data or []
+        )
+        for c in companies:
+            c["user_count"]   = (
+                db.table("users").select("id", count="exact")
+                .eq("company_id", c["id"]).eq("role", "user").execute().count or 0
+            )
+            c["partner_name"] = (c.pop("partners", None) or {}).get("name")
+        return companies
+
+    return await asyncio.to_thread(_fetch)
+
+
+class CreateCompanyRequest(BaseModel):
+    name: str
+    partner_id: Optional[str] = None
+    initial_credits: int = 100
+
+
+@router.post("/v1/admin/companies", status_code=201)
+async def create_company(req: CreateCompanyRequest, current_user: TokenData = Depends(require_superadmin)):
+    def _create():
+        db = get_supabase()
+        try:
+            result = db.table("companies").insert({
+                "name":       req.name,
+                "partner_id": req.partner_id,
+                "credits":    req.initial_credits,
+            }).execute()
+            return result.data[0]
+        except Exception as e:
+            if "duplicate" in str(e).lower() or "unique" in str(e).lower():
+                raise HTTPException(409, f"Company '{req.name}' already exists.")
+            raise
+
+    return await asyncio.to_thread(_create)
+
+
+class UpdateCreditsRequest(BaseModel):
+    credits: int
+
+
+@router.patch("/v1/admin/companies/{company_id}/credits")
+async def update_company_credits(
+    company_id: str,
+    req: UpdateCreditsRequest,
+    current_user: TokenData = Depends(require_superadmin),
+):
+    def _update():
+        db = get_supabase()
+        result = db.table("companies").update({"credits": req.credits}).eq("id", company_id).execute()
+        if not result.data:
+            raise HTTPException(404, "Company not found.")
+        return {"id": company_id, "credits": req.credits}
+
+    return await asyncio.to_thread(_update)

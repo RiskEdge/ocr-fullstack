@@ -1,6 +1,13 @@
 """
 Seed the Supabase `users` table from the MOCK_USERS env variable.
-Companies must already exist in the `companies` table.
+Companies and partners must already exist in their respective tables.
+
+Supported fields per user:
+  username     — required
+  password     — required
+  role         — 'superadmin' | 'partner_admin' | 'client_admin' | 'user' (default: 'user')
+  company      — required for client_admin / user
+  partner      — required for partner_admin (name of the partner)
 
 Run once (or whenever credentials change):
     python seed_users.py
@@ -32,27 +39,38 @@ def seed():
 
     db = get_supabase()
 
-    # Fetch company name → id map from existing companies
-    result = db.table("companies").select("id, name").execute()
-    company_id_map = {row["name"]: row["id"] for row in result.data}
+    company_map = {row["name"]: row["id"] for row in db.table("companies").select("id, name").execute().data}
+    partner_map = {row["name"]: row["id"] for row in db.table("partners").select("id, name").execute().data}
 
     for u in users:
-        company_id = company_id_map.get(u["company"])
-        if not company_id:
-            print(f"  SKIP: company '{u['company']}' not found in companies table")
-            continue
+        role = u.get("role", "user")
+        is_superadmin = role == "superadmin"
 
-        db.table("users").upsert(
-            {
-                "username": u["username"],
-                "password": hash_password(u["password"]),
-                "company_id": company_id,
-            },
-            on_conflict="username",
-        ).execute()
-        print(f"  seeded: {u['username']} ({u['company']})")
+        record: dict = {
+            "username":     u["username"],
+            "password":     hash_password(u["password"]),
+            "role":         role,
+            "is_superadmin": is_superadmin,
+        }
 
-    print(f"\nDone.")
+        if role in ("client_admin", "user"):
+            company_id = company_map.get(u.get("company", ""))
+            if not company_id:
+                print(f"  SKIP: company '{u.get('company')}' not found")
+                continue
+            record["company_id"] = company_id
+
+        elif role == "partner_admin":
+            partner_id = partner_map.get(u.get("partner", ""))
+            if not partner_id:
+                print(f"  SKIP: partner '{u.get('partner')}' not found")
+                continue
+            record["partner_id"] = partner_id
+
+        db.table("users").upsert(record, on_conflict="username").execute()
+        print(f"  seeded: {u['username']} [{role}]")
+
+    print("\nDone.")
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@ import asyncio
 import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import List, Any
+from typing import List, Any, Optional
 from pydantic import BaseModel
 
 from fastapi import FastAPI, File, HTTPException, UploadFile, Depends, status, Response
@@ -21,6 +21,7 @@ from app.auth_utils import create_access_token, get_current_user, TokenData
 from app.db import get_supabase
 from app.behavior import router as behavior_router
 from app.profiles import router as profiles_router, _aggregate_all
+from app.admin import router as admin_router
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
@@ -50,7 +51,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 origins = [
-    "http://localhost:3000",
+    "http://localhost:3020",
     "http://localhost:3010",
     "https://docu-scan.riskedgesolutions.com",
     "https://invoice-vision.riskedgesolutions.com"
@@ -66,11 +67,16 @@ app.add_middleware(
 
 app.include_router(behavior_router)
 app.include_router(profiles_router)
+app.include_router(admin_router)
 
 class LoginRequest(BaseModel):
-    company_name: str
+    company_name: Optional[str] = None
     username: str
     password: str
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
 
 processor  = OCRProcessor(api_key=os.environ["GEMINI_API_KEY"])
 validator  = ValidationProcessor(client=processor.client)
@@ -82,45 +88,110 @@ async def root():
 @app.post("/v1/login")
 async def login(req: LoginRequest):
     db = get_supabase()
-    result = (
-        db.table("users")
-        .select("username, password, companies(name)")
-        .eq("username", req.username)
-        .execute()
-    )
+    _bad_creds = HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Incorrect credentials")
 
-    user = result.data[0] if result.data else None
-    company_name = user["companies"]["name"] if user else None
+    if req.company_name:
+        # --- Company-scoped login (client_admin / user) ---
+        company_res = db.table("companies").select("id").eq("name", req.company_name).execute()
+        if not company_res.data:
+            raise _bad_creds
+        company_id = company_res.data[0]["id"]
 
-    if not user or company_name != req.company_name or not pwd_context.verify(req.password[:72], user["password"]):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect company name, username or password"
+        user_res = (
+            db.table("users")
+            .select("id, password, role")
+            .eq("username", req.username)
+            .eq("company_id", company_id)
+            .execute()
         )
+        user = user_res.data[0] if user_res.data else None
+        if not user or not pwd_context.verify(req.password[:72], user["password"]):
+            raise _bad_creds
 
-    # Fetch user_id and company_id to embed in JWT (avoids a DB lookup on every request)
-    ids_result = (
-        db.table("users")
-        .select("id, company_id")
-        .eq("username", req.username)
-        .single()
-        .execute()
-    )
-    user_id = ids_result.data["id"]
-    company_id = ids_result.data["company_id"]
+        role = user.get("role", "user")
+        if role not in ("client_admin", "user"):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Use global login for admin accounts.")
 
-    access_token = create_access_token(data={
-        "sub": req.username,
-        "company": req.company_name,
-        "user_id": user_id,
-        "company_id": company_id,
-    })
+        access_token = create_access_token(data={
+            "sub": req.username,
+            "role": role,
+            "user_id": user["id"],
+            "company_id": company_id,
+            "company": req.company_name,
+            "is_superadmin": False,
+        })
+        return {
+            "access_token": access_token,
+            "token_type": "bearer",
+            "user": {"username": req.username, "company": req.company_name, "role": role},
+        }
 
-    return {
-        "access_token": access_token,
-        "token_type": "bearer",
-        "user": {"username": req.username, "company": req.company_name}
-    }
+    else:
+        # --- Global login (superadmin / partner_admin) ---
+        user_res = (
+            db.table("users")
+            .select("id, password, role, partner_id, partners(name)")
+            .eq("username", req.username)
+            .execute()
+        )
+        user = next((u for u in user_res.data if u.get("role") in ("superadmin", "partner_admin")), None)
+        if not user or not pwd_context.verify(req.password[:72], user["password"]):
+            raise _bad_creds
+
+        role = user["role"]
+        partner_id = user.get("partner_id")
+        partner_name = (user.get("partners") or {}).get("name") if partner_id else None
+
+        token_data: dict = {
+            "sub": req.username,
+            "role": role,
+            "user_id": user["id"],
+            "is_superadmin": role == "superadmin",
+        }
+        if partner_id:
+            token_data["partner_id"] = partner_id
+            token_data["partner"] = partner_name
+
+        access_token = create_access_token(data=token_data)
+        return {
+            "access_token": access_token,
+            "token_type": "bearer",
+            "user": {"username": req.username, "role": role, "partner": partner_name},
+        }
+
+
+@app.get("/v1/companies")
+async def list_companies():
+    """Public endpoint — returns all client companies for the login dropdown."""
+    db = get_supabase()
+    result = db.table("companies").select("id, name").order("name").execute()
+    return result.data or []
+
+@app.patch("/v1/user/change-password")
+async def change_password(
+    req: ChangePasswordRequest,
+    current_user: TokenData = Depends(get_current_user),
+):
+    if len(req.new_password) < 8:
+        raise HTTPException(status_code=400, detail="New password must be at least 8 characters.")
+
+    db = get_supabase()
+    user_res = db.table("users").select("password").eq("id", current_user.user_id).single().execute()
+    if not user_res.data:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    stored_hash = user_res.data["password"]
+    if not pwd_context.verify(req.current_password[:72], stored_hash):
+        raise HTTPException(status_code=401, detail="Current password is incorrect.")
+
+    if pwd_context.verify(req.new_password[:72], stored_hash):
+        raise HTTPException(status_code=400, detail="New password must differ from the current one.")
+
+    new_hash = pwd_context.hash(req.new_password[:72])
+    db.table("users").update({"password": new_hash}).eq("id", current_user.user_id).execute()
+
+    return {"message": "Password updated successfully."}
+
 
 @app.get("/v1/credits")
 async def get_credits(current_user: TokenData = Depends(get_current_user)):
