@@ -53,8 +53,8 @@ app = FastAPI(lifespan=lifespan)
 origins = [
     "http://localhost:3020",
     "http://localhost:3010",
-    "https://docu-scan.riskedgesolutions.com",
-    "https://invoice-vision.riskedgesolutions.com"
+    "https://invoice-vision.riskedgesolutions.com",
+    "https://invoice-vision-admin.riskedgesolutions.com"
 ]
 
 app.add_middleware(
