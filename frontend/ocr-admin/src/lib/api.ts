@@ -8,6 +8,8 @@ import type {
 const TOKEN_KEY = 'admin_access_token'
 const USER_KEY  = 'admin_user'
 
+const API_BASE = (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? ''
+
 const _cache = new Map<string, unknown>()
 
 export function setSession(token: string, user: UserInfo): void {
@@ -39,7 +41,7 @@ function getToken(): string {
 }
 
 async function adminFetch<T>(path: string, options?: RequestInit): Promise<T> {
-  const res = await fetch(path, {
+  const res = await fetch(`${API_BASE}${path}`, {
     ...options,
     headers: {
       'Content-Type': 'application/json',
@@ -69,7 +71,7 @@ export async function login(username: string, password: string, companyName?: st
   const body: Record<string, string> = { username, password }
   if (companyName) body.company_name = companyName
 
-  const res = await fetch('/v1/login', {
+  const res = await fetch(`${API_BASE}/v1/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
