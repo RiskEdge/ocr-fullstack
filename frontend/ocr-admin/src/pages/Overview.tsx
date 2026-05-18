@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { CreditCard, Users, Zap } from 'lucide-react'
 import { api, getUserInfo } from '@/lib/api'
-import type { OverviewData, OcrStats, ValStats } from '@/types'
+import type { OverviewData } from '@/types'
 import StatCard from '@/components/StatCard'
 
 interface StatDef { key: string; label: string }

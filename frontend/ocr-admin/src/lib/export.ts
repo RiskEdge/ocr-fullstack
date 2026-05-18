@@ -56,5 +56,6 @@ export async function exportToExcel(
       return { value: String(v) }
     }),
   )
-  await writeXlsxFile([header, ...rows], { fileName: `${filename}.xlsx` })
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  await (writeXlsxFile as (data: any, opts: any) => Promise<void>)([header, ...rows], { fileName: `${filename}.xlsx` })
 }

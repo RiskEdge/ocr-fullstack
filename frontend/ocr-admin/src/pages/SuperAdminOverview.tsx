@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
-import { Globe, Building2, Users, CreditCard, Zap } from 'lucide-react'
+import { Globe, Building2, Users, CreditCard } from 'lucide-react'
 import { api } from '@/lib/api'
-import type { GlobalOverviewData, OcrStats, ValStats } from '@/types'
+import type { GlobalOverviewData } from '@/types'
 import StatCard from '@/components/StatCard'
 
 interface StatDef { key: string; label: string }
