@@ -1,25 +1,36 @@
-import { useState, useEffect } from 'react'
-import { Trash2, Plus } from 'lucide-react'
+import { useState, useEffect, useMemo } from 'react'
+import { Trash2, Plus, SlidersHorizontal, X } from 'lucide-react'
 import { api, getUserInfo } from '@/lib/api'
 import type { AdminUser } from '@/types'
 import DataTable, { type Column } from '@/components/DataTable'
 
 const inputCls = 'w-full px-3 py-2 rounded-lg border border-gray-200 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-indigo-400 focus:border-transparent transition-colors'
+const filterCls = 'px-3 py-2 rounded-lg border border-gray-200 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-indigo-400 focus:border-transparent transition-colors'
+const labelCls  = 'text-xs text-gray-400 font-medium whitespace-nowrap'
+
+const ROLE_LABELS: Record<string, string> = {
+  user:          'User',
+  client_admin:  'Company Admin',
+  partner_admin: 'Partner Admin',
+}
 
 export default function Users() {
-  const [data,     setData]     = useState<AdminUser[]>([])
-  const [loading,  setLoading]  = useState(true)
-  const [error,    setError]    = useState('')
-  const [showForm, setShowForm] = useState(false)
-  const [uname,    setUname]    = useState('')
-  const [pass,     setPass]     = useState('')
-  const [role,     setRole]     = useState<'user' | 'client_admin'>('user')
-  const [saving,   setSaving]   = useState(false)
-  const [formErr,  setFormErr]  = useState('')
+  const [data,          setData]          = useState<AdminUser[]>([])
+  const [roleFilter,    setRoleFilter]    = useState('')
+  const [companyFilter, setCompanyFilter] = useState('')
+  const [loading,       setLoading]       = useState(true)
+  const [error,         setError]         = useState('')
+  const [showForm,      setShowForm]      = useState(false)
+  const [uname,         setUname]         = useState('')
+  const [pass,          setPass]          = useState('')
+  const [role,          setRole]          = useState<'user' | 'client_admin'>('user')
+  const [saving,        setSaving]        = useState(false)
+  const [formErr,       setFormErr]       = useState('')
 
   const currentUser = getUserInfo()
   const canManage   = currentUser?.role === 'client_admin' || currentUser?.role === 'superadmin'
   const showCompany = currentUser?.role !== 'client_admin'
+  const showFilters = showCompany
 
   function loadData() {
     setLoading(true)
@@ -30,6 +41,26 @@ export default function Users() {
   }
 
   useEffect(loadData, [])
+
+  const roleOptions = useMemo(
+    () => [...new Set(data.map(u => u.role))].sort(),
+    [data],
+  )
+
+  const companyOptions = useMemo(
+    () => [...new Set(data.map(u => u.company_name).filter(n => n && n !== '—'))].sort(),
+    [data],
+  )
+
+  const filteredData = useMemo(
+    () => data.filter(u =>
+      (!roleFilter    || u.role         === roleFilter) &&
+      (!companyFilter || u.company_name === companyFilter)
+    ),
+    [data, roleFilter, companyFilter],
+  )
+
+  const hasFilters = !!(roleFilter || companyFilter)
 
   async function handleDelete(userId: string) {
     if (!confirm('Delete this user?')) return
@@ -57,17 +88,20 @@ export default function Users() {
   }
 
   const baseColumns: Column<AdminUser>[] = [
-    { key: 'username',    header: 'Username', sortable: true },
-    { key: 'role',        header: 'Role',     sortable: true },
+    { key: 'username', header: 'Username', sortable: true },
+    {
+      key: 'role', header: 'Role', sortable: true,
+      render: row => ROLE_LABELS[row.role] ?? row.role,
+    },
     ...(showCompany ? [{ key: 'company_name', header: 'Company', sortable: true } as Column<AdminUser>] : []),
-    { key: 'id',          header: 'User ID',  sortable: false },
+    { key: 'id', header: 'User ID', sortable: false },
   ]
 
   const columns: Column<AdminUser>[] = canManage
     ? [
         ...baseColumns,
         {
-          key: '_delete',
+          key: '_delete' as keyof AdminUser,
           header: '',
           sortable: false,
           render: row => (
@@ -102,6 +136,54 @@ export default function Users() {
           </button>
         )}
       </div>
+
+      {/* Filters — shown for superadmin / partner_admin */}
+      {showFilters && (
+        <div className="bg-white rounded-lg border border-gray-100 shadow-sm px-5 py-4">
+          <div className="flex flex-wrap items-center gap-3">
+            <div className="flex items-center gap-2 text-sm text-gray-400 font-medium">
+              <SlidersHorizontal className="h-4 w-4" />
+              Filters
+            </div>
+
+            <div className="flex items-center gap-1.5">
+              <span className={labelCls}>Role</span>
+              <select
+                value={roleFilter}
+                onChange={e => setRoleFilter(e.target.value)}
+                className={filterCls}
+              >
+                <option value="">All</option>
+                {roleOptions.map(r => (
+                  <option key={r} value={r}>{ROLE_LABELS[r] ?? r}</option>
+                ))}
+              </select>
+            </div>
+
+            <div className="flex items-center gap-1.5">
+              <span className={labelCls}>Company</span>
+              <select
+                value={companyFilter}
+                onChange={e => setCompanyFilter(e.target.value)}
+                className={filterCls}
+              >
+                <option value="">All</option>
+                {companyOptions.map(c => <option key={c} value={c}>{c}</option>)}
+              </select>
+            </div>
+
+            {hasFilters && (
+              <button
+                onClick={() => { setRoleFilter(''); setCompanyFilter('') }}
+                className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold text-gray-500 hover:text-red-500 hover:bg-red-50 border border-gray-200 transition-colors"
+              >
+                <X className="h-3.5 w-3.5" />
+                Clear
+              </button>
+            )}
+          </div>
+        </div>
+      )}
 
       {showForm && (
         <div className="bg-white rounded-lg border border-gray-200 shadow-sm p-6">
@@ -138,7 +220,7 @@ export default function Users() {
       )}
 
       {error && <p className="text-sm text-red-500">{error}</p>}
-      <DataTable columns={columns} data={data} filename="users" isLoading={loading} headerGradient="from-emerald-500 to-teal-600" />
+      <DataTable columns={columns} data={filteredData} filename="users" isLoading={loading} headerGradient="from-emerald-500 to-teal-600" />
     </div>
   )
 }

@@ -10,6 +10,7 @@ import ProcessingRuns from '@/pages/ProcessingRuns'
 import ValidationRuns from '@/pages/ValidationRuns'
 import Partners from '@/pages/Partners'
 import AllCompanies from '@/pages/AllCompanies'
+import UsageOverview from '@/pages/UsageOverview'
 
 function defaultRoute(role?: string): string {
   if (role === 'superadmin')    return '/superadmin/overview'
@@ -33,11 +34,13 @@ function ProtectedLayout() {
           <Route path="/superadmin/partners"         element={<Partners />} />
           <Route path="/superadmin/companies"        element={<AllCompanies />} />
           <Route path="/superadmin/users"            element={<Users />} />
+          <Route path="/superadmin/usage-overview"   element={<UsageOverview />} />
           <Route path="/superadmin/processing-runs"  element={<ProcessingRuns />} />
           <Route path="/superadmin/validation-runs"  element={<ValidationRuns />} />
 
           {/* Partner admin */}
           <Route path="/partner/overview"            element={<PartnerOverview />} />
+          <Route path="/partner/usage-overview"      element={<UsageOverview />} />
           <Route path="/partner/processing-runs"     element={<ProcessingRuns />} />
           <Route path="/partner/validation-runs"     element={<ValidationRuns />} />
 

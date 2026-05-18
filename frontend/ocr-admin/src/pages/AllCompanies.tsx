@@ -1,10 +1,11 @@
-import { useState, useEffect } from 'react'
-import { Plus, Pencil, Check, X } from 'lucide-react'
+import { useState, useEffect, useMemo } from 'react'
+import { Plus, Pencil, Check, X, SlidersHorizontal } from 'lucide-react'
 import { api } from '@/lib/api'
 import type { Company, Partner } from '@/types'
 import DataTable, { type Column } from '@/components/DataTable'
 
 const inputCls = 'px-3 py-2 rounded-lg border border-gray-200 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-indigo-400 focus:border-transparent transition-colors'
+const labelCls = 'text-xs text-gray-400 font-medium whitespace-nowrap'
 
 function CreditsCell({ company, onSaved }: { company: Company; onSaved: () => void }) {
   const [editing, setEditing] = useState(false)
@@ -45,16 +46,17 @@ function CreditsCell({ company, onSaved }: { company: Company; onSaved: () => vo
 }
 
 export default function AllCompanies() {
-  const [data,     setData]     = useState<Company[]>([])
-  const [partners, setPartners] = useState<Partner[]>([])
-  const [loading,  setLoading]  = useState(true)
-  const [error,    setError]    = useState('')
-  const [showForm, setShowForm] = useState(false)
-  const [name,     setName]     = useState('')
-  const [partnerId, setPartnerId] = useState('')
-  const [initCredits, setInitCredits] = useState('100')
-  const [saving,   setSaving]   = useState(false)
-  const [formErr,  setFormErr]  = useState('')
+  const [data,         setData]         = useState<Company[]>([])
+  const [partners,     setPartners]     = useState<Partner[]>([])
+  const [partnerFilter, setPartnerFilter] = useState('')
+  const [loading,      setLoading]      = useState(true)
+  const [error,        setError]        = useState('')
+  const [showForm,     setShowForm]     = useState(false)
+  const [name,         setName]         = useState('')
+  const [partnerId,    setPartnerId]    = useState('')
+  const [initCredits,  setInitCredits]  = useState('100')
+  const [saving,       setSaving]       = useState(false)
+  const [formErr,      setFormErr]      = useState('')
 
   function loadData() {
     setLoading(true)
@@ -66,10 +68,20 @@ export default function AllCompanies() {
 
   useEffect(loadData, [])
 
+  const partnerOptions = useMemo(
+    () => [...new Set(data.map(c => c.partner_name).filter((p): p is string => !!p))].sort(),
+    [data],
+  )
+
+  const filteredData = useMemo(
+    () => partnerFilter ? data.filter(c => c.partner_name === partnerFilter) : data,
+    [data, partnerFilter],
+  )
+
   const columns: Column<Company>[] = [
-    { key: 'name',        header: 'Company',    sortable: true },
-    { key: 'partner_name', header: 'Partner',   sortable: true, render: r => r.partner_name ?? '—' },
-    { key: 'user_count',  header: 'Users',      sortable: true },
+    { key: 'name',        header: 'Company',  sortable: true },
+    { key: 'partner_name', header: 'Partner', sortable: true, render: r => r.partner_name ?? '—' },
+    { key: 'user_count',  header: 'Users',    sortable: true },
     {
       key: 'credits', header: 'Credits', sortable: true,
       render: row => <CreditsCell company={row} onSaved={loadData} />,
@@ -111,6 +123,36 @@ export default function AllCompanies() {
         </button>
       </div>
 
+      {/* Filter bar */}
+      <div className="bg-white rounded-lg border border-gray-100 shadow-sm px-5 py-4">
+        <div className="flex flex-wrap items-center gap-3">
+          <div className="flex items-center gap-2 text-sm text-gray-400 font-medium">
+            <SlidersHorizontal className="h-4 w-4" />
+            Filters
+          </div>
+          <div className="flex items-center gap-1.5">
+            <span className={labelCls}>Partner</span>
+            <select
+              value={partnerFilter}
+              onChange={e => setPartnerFilter(e.target.value)}
+              className={inputCls}
+            >
+              <option value="">All partners</option>
+              {partnerOptions.map(p => <option key={p} value={p}>{p}</option>)}
+            </select>
+          </div>
+          {partnerFilter && (
+            <button
+              onClick={() => setPartnerFilter('')}
+              className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold text-gray-500 hover:text-red-500 hover:bg-red-50 border border-gray-200 transition-colors"
+            >
+              <X className="h-3.5 w-3.5" />
+              Clear
+            </button>
+          )}
+        </div>
+      </div>
+
       {showForm && (
         <div className="bg-white rounded-lg border border-gray-200 shadow-sm p-6">
           <h2 className="text-sm font-semibold text-gray-700 mb-4">Create Company</h2>
@@ -146,7 +188,7 @@ export default function AllCompanies() {
       )}
 
       {error && <p className="text-sm text-red-500">{error}</p>}
-      <DataTable columns={columns} data={data} filename="companies" isLoading={loading} headerGradient="from-sky-500 to-indigo-600" />
+      <DataTable columns={columns} data={filteredData} filename="companies" isLoading={loading} headerGradient="from-sky-500 to-indigo-600" />
     </div>
   )
 }

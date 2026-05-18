@@ -196,7 +196,7 @@ async def global_overview(current_user: TokenData = Depends(require_superadmin))
 
 @router.get("/v1/admin/my-clients")
 async def my_clients(current_user: TokenData = Depends(require_partner_or_above)):
-    """Client companies under this partner, each with 30-day usage summary."""
+    """Client companies under this partner with all-time and 30-day usage summary."""
 
     def _fetch():
         db = get_supabase()
@@ -228,28 +228,193 @@ async def my_clients(current_user: TokenData = Depends(require_partner_or_above)
                 .eq("company_id", cid).eq("role", "user").execute().count or 0
             )
             ocr_rows = (
-                db.table("processing_runs").select("credits_used")
-                .eq("company_id", cid).gte("started_at", since_30d).execute().data or []
+                db.table("processing_runs").select("credits_used, started_at")
+                .eq("company_id", cid).execute().data or []
             )
             val_rows = (
-                db.table("validation_runs").select("credits_used")
-                .eq("company_id", cid).gte("started_at", since_30d).execute().data or []
+                db.table("validation_runs").select("credits_used, started_at")
+                .eq("company_id", cid).execute().data or []
             )
+            ocr_30d = [r for r in ocr_rows if (r.get("started_at") or "") >= since_30d]
+            val_30d = [r for r in val_rows if (r.get("started_at") or "") >= since_30d]
+
             entry = {
                 "id":              cid,
                 "name":            c["name"],
                 "credits":         c["credits"],
                 "user_count":      user_count,
-                "ocr_runs_30d":    len(ocr_rows),
-                "ocr_credits_30d": sum(r.get("credits_used", 0) for r in ocr_rows),
-                "val_runs_30d":    len(val_rows),
-                "val_credits_30d": sum(r.get("credits_used", 0) for r in val_rows),
+                # All-time
+                "ocr_runs":        len(ocr_rows),
+                "ocr_credits":     sum(r.get("credits_used", 0) for r in ocr_rows),
+                "val_runs":        len(val_rows),
+                "val_credits":     sum(r.get("credits_used", 0) for r in val_rows),
+                # 30-day
+                "ocr_runs_30d":    len(ocr_30d),
+                "ocr_credits_30d": sum(r.get("credits_used", 0) for r in ocr_30d),
+                "val_runs_30d":    len(val_30d),
+                "val_credits_30d": sum(r.get("credits_used", 0) for r in val_30d),
             }
             if show_partner:
                 entry["partner_name"] = (c.get("partners") or {}).get("name")
             result.append(entry)
 
         return result
+
+    return await asyncio.to_thread(_fetch)
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/admin/usage-overview  —  partner_admin+
+# ---------------------------------------------------------------------------
+
+@router.get("/v1/admin/usage-overview")
+async def usage_overview(
+    from_date: str | None = Query(None),
+    to_date:   str | None = Query(None),
+    current_user: TokenData = Depends(require_partner_or_above),
+):
+    """Aggregated usage per partner, company and user, optionally filtered by date range."""
+
+    def _fetch():
+        db = get_supabase()
+        company_ids = _company_ids_for_user(db, current_user)
+
+        if company_ids is not None and not company_ids:
+            return {"by_company": [], "by_user": [], "by_partner": []}
+
+        # Build company→partner name mapping
+        if company_ids is not None:
+            cos_meta = (db.table("companies").select("id, partners(name)")
+                          .in_("id", company_ids).execute().data or [])
+        else:
+            cos_meta = db.table("companies").select("id, partners(name)").execute().data or []
+        co_to_partner: dict[str, str] = {
+            c["id"]: (c.get("partners") or {}).get("name") or "No Partner"
+            for c in cos_meta
+        }
+
+        def _query(table: str, extra_fields: str):
+            q = (
+                db.table(table)
+                .select(
+                    f"company_id, user_id, {extra_fields}, "
+                    "users!user_id(username), companies!company_id(name)"
+                )
+                .limit(10000)
+            )
+            if company_ids is not None:
+                q = q.in_("company_id", company_ids)
+            if from_date:
+                q = q.gte("started_at", from_date)
+            if to_date:
+                q = q.lte("started_at", to_date)
+            return q.execute().data or []
+
+        ocr_rows = _query("processing_runs", "total_pages, credits_used")
+        val_rows = _query("validation_runs", "total_items, credits_used")
+
+        # All companies in scope, seeded with zeros (shows inactive companies too)
+        if company_ids is not None:
+            scope_cos = (
+                db.table("companies").select("id, name")
+                .in_("id", company_ids).order("name").execute().data or []
+            )
+        else:
+            scope_cos = db.table("companies").select("id, name").order("name").execute().data or []
+
+        co_stats: dict = {
+            c["id"]: {
+                "company_id":   c["id"],
+                "company_name": c["name"],
+                "partner_name": co_to_partner.get(c["id"], "No Partner"),
+                "ocr_runs": 0, "ocr_pages": 0, "ocr_credits": 0,
+                "val_runs": 0, "val_items": 0, "val_credits": 0,
+            }
+            for c in scope_cos
+        }
+        for r in ocr_rows:
+            cid = r.get("company_id")
+            if cid and cid in co_stats:
+                co_stats[cid]["ocr_runs"]    += 1
+                co_stats[cid]["ocr_pages"]   += r.get("total_pages") or 0
+                co_stats[cid]["ocr_credits"] += r.get("credits_used") or 0
+        for r in val_rows:
+            cid = r.get("company_id")
+            if cid and cid in co_stats:
+                co_stats[cid]["val_runs"]    += 1
+                co_stats[cid]["val_items"]   += r.get("total_items") or 0
+                co_stats[cid]["val_credits"] += r.get("credits_used") or 0
+
+        by_company = sorted(co_stats.values(), key=lambda x: x["company_name"])
+        for entry in by_company:
+            entry["total_credits"] = entry["ocr_credits"] + entry["val_credits"]
+
+        # Per-user stats (only users with activity)
+        user_stats: dict = {}
+        for r in ocr_rows:
+            uid = r.get("user_id")
+            if not uid:
+                continue
+            cid = r.get("company_id") or ""
+            if uid not in user_stats:
+                user_stats[uid] = {
+                    "user_id":      uid,
+                    "username":     (r.get("users")     or {}).get("username", "—"),
+                    "company_name": (r.get("companies") or {}).get("name", "—"),
+                    "partner_name": co_to_partner.get(cid, "No Partner"),
+                    "ocr_runs": 0, "ocr_pages": 0, "ocr_credits": 0,
+                    "val_runs": 0, "val_items": 0, "val_credits": 0,
+                }
+            user_stats[uid]["ocr_runs"]    += 1
+            user_stats[uid]["ocr_pages"]   += r.get("total_pages") or 0
+            user_stats[uid]["ocr_credits"] += r.get("credits_used") or 0
+        for r in val_rows:
+            uid = r.get("user_id")
+            if not uid:
+                continue
+            cid = r.get("company_id") or ""
+            if uid not in user_stats:
+                user_stats[uid] = {
+                    "user_id":      uid,
+                    "username":     (r.get("users")     or {}).get("username", "—"),
+                    "company_name": (r.get("companies") or {}).get("name", "—"),
+                    "partner_name": co_to_partner.get(cid, "No Partner"),
+                    "ocr_runs": 0, "ocr_pages": 0, "ocr_credits": 0,
+                    "val_runs": 0, "val_items": 0, "val_credits": 0,
+                }
+            user_stats[uid]["val_runs"]    += 1
+            user_stats[uid]["val_items"]   += r.get("total_items") or 0
+            user_stats[uid]["val_credits"] += r.get("credits_used") or 0
+
+        by_user = sorted(user_stats.values(), key=lambda x: x["username"])
+        for entry in by_user:
+            entry["total_credits"] = entry["ocr_credits"] + entry["val_credits"]
+
+        # Per-partner aggregation (rolled up from by_company)
+        p_stats: dict = {}
+        for co in by_company:
+            pn = co.get("partner_name") or "No Partner"
+            if pn not in p_stats:
+                p_stats[pn] = {
+                    "partner_name":  pn,
+                    "company_count": 0,
+                    "ocr_runs":  0, "ocr_pages":  0, "ocr_credits":  0,
+                    "val_runs":  0, "val_items":  0, "val_credits":  0,
+                    "total_credits": 0,
+                }
+            s = p_stats[pn]
+            s["company_count"] += 1
+            s["ocr_runs"]      += co["ocr_runs"]
+            s["ocr_pages"]     += co["ocr_pages"]
+            s["ocr_credits"]   += co["ocr_credits"]
+            s["val_runs"]      += co["val_runs"]
+            s["val_items"]     += co["val_items"]
+            s["val_credits"]   += co["val_credits"]
+            s["total_credits"] += co["total_credits"]
+
+        by_partner = sorted(p_stats.values(), key=lambda x: x["partner_name"])
+
+        return {"by_company": by_company, "by_user": by_user, "by_partner": by_partner}
 
     return await asyncio.to_thread(_fetch)
 

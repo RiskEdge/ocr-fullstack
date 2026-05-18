@@ -2,7 +2,7 @@ import type {
   OverviewData, GlobalOverviewData, ClientSummary,
   Partner, Company, AdminUser,
   ProcessingRun, ValidationRun,
-  RunFilters, UserInfo,
+  RunFilters, UserInfo, UsageOverviewData,
 } from '@/types'
 
 const TOKEN_KEY = 'admin_access_token'
@@ -151,6 +151,13 @@ export const api = {
       `/v1/admin/companies/${companyId}/credits`,
       { method: 'PATCH', body: JSON.stringify({ credits }) }
     ),
+
+  usageOverview: (filters: Pick<RunFilters, 'from_date' | 'to_date'> = {}) => {
+    const p = new URLSearchParams()
+    if (filters.from_date) p.set('from_date', filters.from_date)
+    if (filters.to_date)   p.set('to_date', filters.to_date)
+    return adminFetch<UsageOverviewData>(`/v1/admin/usage-overview?${p}`)
+  },
 
   changePassword: (currentPassword: string, newPassword: string) =>
     adminFetch<{ message: string }>('/v1/user/change-password', {

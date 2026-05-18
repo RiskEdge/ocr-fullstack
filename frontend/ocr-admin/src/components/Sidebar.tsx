@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { NavLink, useNavigate } from 'react-router-dom'
 import {
   Globe, Building2, Briefcase, Users, FileText, ShieldCheck,
-  LayoutDashboard, LogOut, KeyRound,
+  LayoutDashboard, LogOut, KeyRound, BarChart3,
 } from 'lucide-react'
 import { clearSession, getUserInfo } from '@/lib/api'
 import { cn } from '@/lib/utils'
@@ -15,12 +15,14 @@ const SUPERADMIN_NAV: NavItem[] = [
   { to: '/superadmin/partners',        label: 'Partners',          Icon: Building2 },
   { to: '/superadmin/companies',       label: 'Companies',         Icon: Briefcase },
   { to: '/superadmin/users',           label: 'All Users',         Icon: Users },
+  { to: '/superadmin/usage-overview',  label: 'Usage Overview',    Icon: BarChart3 },
   { to: '/superadmin/processing-runs', label: 'OCR Runs',          Icon: FileText },
   { to: '/superadmin/validation-runs', label: 'Validation Runs',   Icon: ShieldCheck },
 ]
 
 const PARTNER_NAV: NavItem[] = [
   { to: '/partner/overview',           label: 'My Clients',        Icon: Building2 },
+  { to: '/partner/usage-overview',     label: 'Usage Overview',    Icon: BarChart3 },
   { to: '/partner/processing-runs',    label: 'OCR Runs',          Icon: FileText },
   { to: '/partner/validation-runs',    label: 'Validation Runs',   Icon: ShieldCheck },
 ]

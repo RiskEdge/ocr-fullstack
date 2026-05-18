@@ -39,6 +39,12 @@ export interface ClientSummary {
   name: string
   credits: number
   user_count: number
+  // All-time
+  ocr_runs: number
+  ocr_credits: number
+  val_runs: number
+  val_credits: number
+  // 30-day
   ocr_runs_30d: number
   ocr_credits_30d: number
   val_runs_30d: number
@@ -121,4 +127,49 @@ export interface UserInfo {
   role: string
   company?: string
   partner?: string
+}
+
+export interface PartnerUsage {
+  partner_name: string
+  company_count: number
+  ocr_runs: number
+  ocr_pages: number
+  ocr_credits: number
+  val_runs: number
+  val_items: number
+  val_credits: number
+  total_credits: number
+}
+
+export interface CompanyUsage {
+  company_id: string
+  company_name: string
+  partner_name: string
+  ocr_runs: number
+  ocr_pages: number
+  ocr_credits: number
+  val_runs: number
+  val_items: number
+  val_credits: number
+  total_credits: number
+}
+
+export interface UserUsage {
+  user_id: string
+  username: string
+  company_name: string
+  partner_name: string
+  ocr_runs: number
+  ocr_pages: number
+  ocr_credits: number
+  val_runs: number
+  val_items: number
+  val_credits: number
+  total_credits: number
+}
+
+export interface UsageOverviewData {
+  by_company: CompanyUsage[]
+  by_user: UserUsage[]
+  by_partner: PartnerUsage[]
 }
