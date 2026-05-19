@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Eye, EyeOff } from 'lucide-react'
-import { login } from '@/lib/api'
+import { login, API_BASE } from '@/lib/api'
 
 interface PublicCompany { id: string; name: string }
 
@@ -23,7 +23,7 @@ export default function Login() {
   const navigate = useNavigate()
 
   useEffect(() => {
-    fetch('/v1/companies')
+    fetch(`${API_BASE}/v1/companies`)
       .then(r => r.json())
       .then(setCompanies)
       .catch(() => {})

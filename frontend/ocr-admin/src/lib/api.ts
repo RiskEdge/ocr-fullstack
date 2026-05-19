@@ -8,7 +8,7 @@ import type {
 const TOKEN_KEY = 'admin_access_token'
 const USER_KEY  = 'admin_user'
 
-const API_BASE = (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? ''
+export const API_BASE = (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? ''
 
 const _cache = new Map<string, unknown>()
 
