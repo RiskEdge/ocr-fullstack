@@ -1,15 +1,17 @@
 import { useState } from 'react'
 import { X, Eye, EyeOff } from 'lucide-react'
 import { api } from '@/lib/api'
+import { useTheme } from '@/contexts/ThemeContext'
 
 interface Props {
   open: boolean;
   onClose: () => void;
 }
 
-const inputCls = 'w-full px-3 py-2 rounded-lg border border-gray-200 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-indigo-400 focus:border-transparent transition-colors pr-9'
-
 export default function ChangePasswordDialog({ open, onClose }: Props) {
+  const theme = useTheme()
+  const inputCls = `w-full px-3 py-2 rounded-lg border border-gray-200 text-sm bg-white focus:outline-none focus:ring-2 ${theme.focusRing} focus:border-transparent transition-colors pr-9`
+
   const [current,  setCurrent]  = useState('')
   const [next,     setNext]     = useState('')
   const [confirm,  setConfirm]  = useState('')
@@ -125,7 +127,7 @@ export default function ChangePasswordDialog({ open, onClose }: Props) {
               <button
                 type="submit"
                 disabled={saving || !current || !next || !confirm}
-                className="flex-1 px-4 py-2 rounded-lg bg-indigo-600 text-white text-sm font-semibold hover:bg-indigo-700 disabled:opacity-50 transition-colors"
+                className={`flex-1 px-4 py-2 rounded-lg text-sm font-semibold disabled:opacity-50 transition-colors ${theme.primaryBtn}`}
               >
                 {saving ? 'Updating…' : 'Update password'}
               </button>

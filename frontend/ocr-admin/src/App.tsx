@@ -1,5 +1,6 @@
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { hasToken, getUserInfo } from '@/lib/api'
+import { ThemeProvider } from '@/contexts/ThemeContext'
 import Sidebar from '@/components/Sidebar'
 import Login from '@/pages/Login'
 import Overview from '@/pages/Overview'
@@ -23,6 +24,7 @@ function ProtectedLayout() {
   const user = getUserInfo()
 
   return (
+    <ThemeProvider>
     <div className="flex h-screen bg-gray-50">
       <Sidebar />
       <main className="flex-1 overflow-auto">
@@ -58,6 +60,7 @@ function ProtectedLayout() {
         </Routes>
       </main>
     </div>
+    </ThemeProvider>
   )
 }
 

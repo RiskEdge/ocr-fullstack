@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { Plus } from 'lucide-react'
 import { api } from '@/lib/api'
+import { useTheme } from '@/contexts/ThemeContext'
 import type { Partner } from '@/types'
 import DataTable, { type Column } from '@/components/DataTable'
 
@@ -24,9 +25,9 @@ const columns: Column<Partner>[] = [
   },
 ]
 
-const inputCls = 'w-full px-3 py-2 rounded-lg border border-gray-200 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-indigo-400 focus:border-transparent transition-colors'
-
 export default function Partners() {
+  const theme = useTheme()
+  const inputCls = `w-full px-3 py-2 rounded-lg border border-gray-200 text-sm bg-white focus:outline-none focus:ring-2 ${theme.focusRing} focus:border-transparent transition-colors`
   const [data,    setData]    = useState<Partner[]>([])
   const [loading, setLoading] = useState(true)
   const [error,   setError]   = useState('')
@@ -70,7 +71,7 @@ export default function Partners() {
         </div>
         <button
           onClick={() => setShowForm(f => !f)}
-          className="flex items-center gap-2 px-4 py-2 rounded-lg bg-indigo-600 text-white text-sm font-semibold hover:bg-indigo-700 transition-colors"
+          className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold transition-colors ${theme.primaryBtn}`}
         >
           <Plus className="h-4 w-4" />
           New Partner
@@ -91,7 +92,7 @@ export default function Partners() {
             </div>
             <div className="flex gap-2">
               <button type="submit" disabled={saving || !name.trim()}
-                className="px-4 py-2 rounded-lg bg-indigo-600 text-white text-sm font-semibold hover:bg-indigo-700 disabled:opacity-50 transition-colors">
+                className={`px-4 py-2 rounded-lg text-sm font-semibold disabled:opacity-50 transition-colors ${theme.primaryBtn}`}>
                 {saving ? 'Saving…' : 'Create'}
               </button>
               <button type="button" onClick={() => setShowForm(false)}
@@ -105,7 +106,7 @@ export default function Partners() {
       )}
 
       {error && <p className="text-sm text-red-500">{error}</p>}
-      <DataTable columns={columns} data={data} filename="partners" isLoading={loading} headerGradient="from-violet-500 to-indigo-600" />
+      <DataTable columns={columns} data={data} filename="partners" isLoading={loading} headerGradient={theme.tableHeaderGradient} />
     </div>
   )
 }

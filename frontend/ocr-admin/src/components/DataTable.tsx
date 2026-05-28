@@ -2,6 +2,7 @@ import { useState, useMemo } from 'react'
 import { ChevronUp, ChevronDown, ChevronsUpDown, Download, FileSpreadsheet } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { exportToCsv, exportToExcel, type ExportColumn } from '@/lib/export'
+import { useTheme } from '@/contexts/ThemeContext'
 
 export interface Column<T> {
   key: string
@@ -18,6 +19,7 @@ interface DataTableProps<T> {
   isLoading?: boolean
   pageSize?: number
   headerGradient?: string
+  showTotals?: boolean
 }
 
 const DEFAULT_PAGE_SIZE = 25
@@ -28,8 +30,10 @@ export default function DataTable<T>({
   filename = 'export',
   isLoading = false,
   pageSize = DEFAULT_PAGE_SIZE,
-  headerGradient = 'from-indigo-600 to-violet-600',
+  headerGradient = 'from-gray-700 to-gray-900',
+  showTotals = false,
 }: DataTableProps<T>) {
+  const theme = useTheme()
   const [sortKey, setSortKey] = useState<string | null>(null)
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc')
   const [page, setPage]       = useState(0)
@@ -57,6 +61,25 @@ export default function DataTable<T>({
   const totalPages = Math.ceil(sorted.length / pageSize)
   const paginated  = sorted.slice(page * pageSize, (page + 1) * pageSize)
 
+  const totalsRow = useMemo(() => {
+    if (!showTotals || data.length === 0) return null
+    const result: Record<string, unknown> = {}
+    let firstLabelDone = false
+    for (const col of columns) {
+      const vals = data.map((row) => (row as Record<string, unknown>)[col.key])
+      const allNumeric = vals.every((v) => v == null || typeof v === 'number')
+      if (allNumeric) {
+        result[col.key] = vals.reduce((sum, v) => (sum as number) + (Number(v) || 0), 0)
+      } else if (!firstLabelDone) {
+        result[col.key] = 'Total'
+        firstLabelDone = true
+      } else {
+        result[col.key] = ''
+      }
+    }
+    return result
+  }, [showTotals, data, columns])
+
   const exportCols: ExportColumn[] = columns.map(c => ({ key: c.key, header: c.header }))
   const exportData = data as unknown as Record<string, unknown>[]
 
@@ -64,7 +87,7 @@ export default function DataTable<T>({
     return (
       <div className="bg-white rounded-lg border border-gray-100 shadow-sm flex items-center justify-center h-48">
         <div className="flex flex-col items-center gap-3">
-          <div className="w-8 h-8 border-2 border-indigo-600 border-t-transparent rounded-full animate-spin" />
+          <div className={cn('w-8 h-8 border-2 border-t-transparent rounded-full animate-spin', theme.spinner)} />
           <p className="text-sm text-gray-400">Loading…</p>
         </div>
       </div>
@@ -139,7 +162,7 @@ export default function DataTable<T>({
                 <tr
                   key={i}
                   className={cn(
-                    'transition-colors hover:bg-indigo-50/40',
+                    'transition-colors', theme.rowHover,
                     i % 2 !== 0 && 'bg-gray-50/50',
                   )}
                 >
@@ -155,6 +178,28 @@ export default function DataTable<T>({
                   ))}
                 </tr>
               ))
+            )}
+            {totalsRow && (
+              <tr className="bg-gray-100 border-t-2 border-gray-300">
+                {columns.map((col) => {
+                  const val = totalsRow[col.key]
+                  const isLabel = val === 'Total'
+                  return (
+                    <td
+                      key={col.key}
+                      className={cn(
+                        'px-4 py-3 whitespace-nowrap font-bold',
+                        isLabel ? 'text-gray-500 uppercase tracking-wide text-xs' : 'text-gray-900',
+                        col.className,
+                      )}
+                    >
+                      {typeof val === 'number'
+                        ? val.toLocaleString()
+                        : String(val ?? '')}
+                    </td>
+                  )
+                })}
+              </tr>
             )}
           </tbody>
         </table>
@@ -176,7 +221,7 @@ export default function DataTable<T>({
             >
               ← Prev
             </button>
-            <span className="px-3 py-1.5 text-xs font-semibold bg-gradient-to-r from-indigo-600 to-violet-600 text-white rounded-lg">
+            <span className={cn('px-3 py-1.5 text-xs font-semibold bg-gradient-to-r text-white rounded-lg', theme.paginationGradient)}>
               {page + 1} / {totalPages}
             </span>
             <button

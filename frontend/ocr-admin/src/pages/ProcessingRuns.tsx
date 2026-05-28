@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo } from 'react'
 import { SlidersHorizontal, X } from 'lucide-react'
 import { api, getUserInfo } from '@/lib/api'
+import { useTheme } from '@/contexts/ThemeContext'
 import type { ProcessingRun, RunFilters, ClientSummary } from '@/types'
 import DataTable, { type Column } from '@/components/DataTable'
 import { formatDate, formatDuration, cn } from '@/lib/utils'
@@ -18,10 +19,11 @@ function StatusBadge({ status }: { status: string }) {
   )
 }
 
-const inputCls = 'px-3 py-2 rounded-lg border border-gray-200 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-sky-400 focus:border-transparent transition-colors'
 const labelCls = 'text-xs text-gray-400 font-medium whitespace-nowrap'
 
 export default function ProcessingRuns() {
+  const theme = useTheme()
+  const inputCls = `px-3 py-2 rounded-lg border border-gray-200 text-sm bg-white focus:outline-none focus:ring-2 ${theme.focusRing} focus:border-transparent transition-colors`
   const [data,            setData]            = useState<ProcessingRun[]>([])
   const [clientSummaries, setClientSummaries] = useState<ClientSummary[]>([])
   const [dateFilters,     setDateFilters]     = useState<Pick<RunFilters, 'from_date' | 'to_date'>>({})
@@ -219,7 +221,7 @@ export default function ProcessingRuns() {
       </div>
 
       {error && <p className="text-sm text-red-500">{error}</p>}
-      <DataTable columns={columns} data={filteredData} filename="ocr-runs" isLoading={loading} headerGradient="from-sky-500 to-indigo-600" />
+      <DataTable columns={columns} data={filteredData} filename="ocr-runs" isLoading={loading} headerGradient={theme.tableHeaderGradient} />
     </div>
   )
 }

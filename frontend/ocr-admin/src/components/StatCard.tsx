@@ -1,33 +1,25 @@
 import { type LucideIcon } from 'lucide-react'
-
-export type CardColor = 'indigo' | 'emerald' | 'amber' | 'sky' | 'violet'
+import { useTheme } from '@/contexts/ThemeContext'
 
 interface StatCardProps {
   label: string
   value: string | number
   icon: LucideIcon
-  color: CardColor
+  variant?: 1 | 2 | 3 | 4
 }
 
-const gradients: Record<CardColor, string> = {
-  indigo:  'from-indigo-500 to-indigo-700',
-  emerald: 'from-emerald-500 to-teal-600',
-  amber:   'from-amber-400 to-orange-600',
-  sky:     'from-sky-500 to-indigo-600',
-  violet:  'from-violet-500 to-purple-700',
-}
+export default function StatCard({ label, value, icon: Icon, variant = 1 }: StatCardProps) {
+  const theme = useTheme()
+  const gradient = theme.statCards[variant - 1]
 
-export default function StatCard({ label, value, icon: Icon, color }: StatCardProps) {
   return (
-    <div className="bg-white rounded-lg shadow-sm overflow-hidden border border-gray-100">
-      <div className={`bg-gradient-to-br ${gradients[color]} px-5 py-4 flex items-center justify-between`}>
-        <span className="text-white/90 text-xs font-semibold uppercase tracking-wider">{label}</span>
-        <div className="bg-white/20 rounded-md p-2">
-          <Icon className="w-5 h-5 text-white" />
-        </div>
+    <div className="bg-white rounded-lg shadow-sm border border-gray-100 p-5 flex items-center gap-4">
+      <div className={`bg-gradient-to-br ${gradient} rounded-xl p-3 flex-shrink-0 shadow-sm`}>
+        <Icon className="w-5 h-5 text-white" />
       </div>
-      <div className="px-5 py-4">
-        <p className="text-3xl font-bold text-gray-900">{value}</p>
+      <div className="min-w-0">
+        <p className="text-2xl font-bold text-gray-900">{value}</p>
+        <p className="text-xs text-gray-500 mt-0.5 truncate">{label}</p>
       </div>
     </div>
   )

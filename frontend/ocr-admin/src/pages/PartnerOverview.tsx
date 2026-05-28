@@ -3,6 +3,7 @@ import { ChevronDown, ChevronRight, Users } from 'lucide-react'
 import { api, getUserInfo } from '@/lib/api'
 import type { ClientSummary, AdminUser } from '@/types'
 import { cn } from '@/lib/utils'
+import { useTheme } from '@/contexts/ThemeContext'
 
 type Period = 'all' | '30d'
 
@@ -13,6 +14,7 @@ export default function PartnerOverview() {
   const [period,   setPeriod]   = useState<Period>('all')
   const [loading,  setLoading]  = useState(true)
   const [error,    setError]    = useState('')
+  const theme = useTheme()
   const role = getUserInfo()?.role
 
   useEffect(() => {
@@ -77,7 +79,7 @@ export default function PartnerOverview() {
             onClick={() => setPeriod('all')}
             className={cn(
               'px-3 py-1.5 rounded-md text-xs font-semibold transition-all',
-              period === 'all' ? 'bg-white text-indigo-700 shadow-sm' : 'text-gray-500 hover:text-gray-700',
+              period === 'all' ? theme.activeTabClass : 'text-gray-500 hover:text-gray-700',
             )}
           >
             All time
@@ -86,7 +88,7 @@ export default function PartnerOverview() {
             onClick={() => setPeriod('30d')}
             className={cn(
               'px-3 py-1.5 rounded-md text-xs font-semibold transition-all',
-              period === '30d' ? 'bg-white text-indigo-700 shadow-sm' : 'text-gray-500 hover:text-gray-700',
+              period === '30d' ? theme.activeTabClass : 'text-gray-500 hover:text-gray-700',
             )}
           >
             Last 30 days
@@ -102,7 +104,7 @@ export default function PartnerOverview() {
         <div className="rounded-xl border border-gray-100 shadow-sm overflow-hidden">
           <table className="w-full text-sm">
             <thead>
-              <tr className="bg-gradient-to-r from-violet-500 to-indigo-600 text-white">
+              <tr className={cn('bg-gradient-to-r text-white', theme.tableHeaderGradient)}>
                 <th className="w-10 px-3 py-3" />
                 {colHeaders.map(h => (
                   <th key={h} className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide whitespace-nowrap">
@@ -133,12 +135,12 @@ export default function PartnerOverview() {
                     <td colSpan={colHeaders.length + 1} className="p-0">
                       {/* Company summary row */}
                       <div
-                        className="flex items-center cursor-pointer hover:bg-violet-50/50 transition-colors"
+                        className={cn('flex items-center cursor-pointer transition-colors', theme.rowHover)}
                         onClick={() => toggle(company.id)}
                       >
                         <div className="w-10 flex-shrink-0 flex items-center justify-center py-3 text-gray-400">
                           {isOpen
-                            ? <ChevronDown className="h-4 w-4 text-violet-500" />
+                            ? <ChevronDown className={cn('h-4 w-4', theme.accentText)} />
                             : <ChevronRight className="h-4 w-4" />}
                         </div>
                         {showPartner && (
@@ -157,11 +159,11 @@ export default function PartnerOverview() {
 
                       {/* Accordion — users */}
                       {isOpen && (
-                        <div className="border-t-2 border-violet-200 bg-indigo-50/60">
+                        <div className={cn('border-t-2', theme.accentBorder, theme.accentBg)}>
                           <div className="pl-10 pr-6 py-3">
                             <div className="flex items-center gap-2 mb-2.5">
-                              <Users className="h-3.5 w-3.5 text-violet-500 flex-shrink-0" />
-                              <span className="text-xs font-bold text-violet-700">
+                              <Users className={cn('h-3.5 w-3.5 flex-shrink-0', theme.accentText)} />
+                              <span className={cn('text-xs font-bold', theme.accentTextStrong)}>
                                 Users in {company.name}
                               </span>
                               <span className="text-xs text-gray-400">
@@ -175,12 +177,12 @@ export default function PartnerOverview() {
                                 {companyUsers.map(u => (
                                   <span
                                     key={u.id}
-                                    className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs bg-white border border-violet-200 text-gray-700 shadow-sm"
+                                    className={cn('inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs bg-white border text-gray-700 shadow-sm', theme.accentBorder)}
                                   >
                                     <span className="font-medium">{u.username}</span>
                                     <span className={cn(
                                       'font-semibold',
-                                      u.role === 'client_admin' ? 'text-violet-600' : 'text-gray-400',
+                                      u.role === 'client_admin' ? theme.accentText : 'text-gray-400',
                                     )}>
                                       · {u.role === 'client_admin' ? 'Admin' : 'User'}
                                     </span>

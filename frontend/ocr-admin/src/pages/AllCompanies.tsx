@@ -1,13 +1,14 @@
 import { useState, useEffect, useMemo } from 'react'
 import { Plus, Pencil, Check, X, SlidersHorizontal } from 'lucide-react'
 import { api } from '@/lib/api'
+import { useTheme } from '@/contexts/ThemeContext'
 import type { Company, Partner } from '@/types'
 import DataTable, { type Column } from '@/components/DataTable'
 
-const inputCls = 'px-3 py-2 rounded-lg border border-gray-200 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-indigo-400 focus:border-transparent transition-colors'
 const labelCls = 'text-xs text-gray-400 font-medium whitespace-nowrap'
 
 function CreditsCell({ company, onSaved }: { company: Company; onSaved: () => void }) {
+  const theme = useTheme()
   const [editing, setEditing] = useState(false)
   const [val,     setVal]     = useState(String(company.credits))
   const [saving,  setSaving]  = useState(false)
@@ -30,7 +31,7 @@ function CreditsCell({ company, onSaved }: { company: Company; onSaved: () => vo
       <input
         type="number" min={0} value={val}
         onChange={e => setVal(e.target.value)}
-        className="w-20 px-2 py-1 border border-gray-200 rounded text-sm focus:outline-none focus:ring-1 focus:ring-indigo-400"
+        className={`w-20 px-2 py-1 border border-gray-200 rounded text-sm focus:outline-none focus:ring-1 ${theme.focusRing}`}
       />
       <button onClick={save} disabled={saving} className="text-emerald-600 hover:text-emerald-700"><Check className="h-4 w-4" /></button>
       <button onClick={() => { setEditing(false); setVal(String(company.credits)) }} className="text-gray-400 hover:text-gray-600"><X className="h-4 w-4" /></button>
@@ -40,12 +41,14 @@ function CreditsCell({ company, onSaved }: { company: Company; onSaved: () => vo
   return (
     <div className="flex items-center gap-2">
       <span>{company.credits.toLocaleString()}</span>
-      <button onClick={() => setEditing(true)} className="text-gray-300 hover:text-indigo-500 transition-colors"><Pencil className="h-3.5 w-3.5" /></button>
+      <button onClick={() => setEditing(true)} className={`text-gray-300 transition-colors ${theme.hoverAccentText}`}><Pencil className="h-3.5 w-3.5" /></button>
     </div>
   )
 }
 
 export default function AllCompanies() {
+  const theme = useTheme()
+  const inputCls = `px-3 py-2 rounded-lg border border-gray-200 text-sm bg-white focus:outline-none focus:ring-2 ${theme.focusRing} focus:border-transparent transition-colors`
   const [data,         setData]         = useState<Company[]>([])
   const [partners,     setPartners]     = useState<Partner[]>([])
   const [partnerFilter, setPartnerFilter] = useState('')
@@ -116,7 +119,7 @@ export default function AllCompanies() {
         </div>
         <button
           onClick={() => setShowForm(f => !f)}
-          className="flex items-center gap-2 px-4 py-2 rounded-lg bg-indigo-600 text-white text-sm font-semibold hover:bg-indigo-700 transition-colors"
+          className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold transition-colors ${theme.primaryBtn}`}
         >
           <Plus className="h-4 w-4" />
           New Company
@@ -174,7 +177,7 @@ export default function AllCompanies() {
             </div>
             <div className="flex gap-2">
               <button type="submit" disabled={saving || !name.trim()}
-                className="px-4 py-2 rounded-lg bg-indigo-600 text-white text-sm font-semibold hover:bg-indigo-700 disabled:opacity-50 transition-colors">
+                className={`px-4 py-2 rounded-lg text-sm font-semibold disabled:opacity-50 transition-colors ${theme.primaryBtn}`}>
                 {saving ? 'Saving…' : 'Create'}
               </button>
               <button type="button" onClick={() => setShowForm(false)}
@@ -188,7 +191,7 @@ export default function AllCompanies() {
       )}
 
       {error && <p className="text-sm text-red-500">{error}</p>}
-      <DataTable columns={columns} data={filteredData} filename="companies" isLoading={loading} headerGradient="from-sky-500 to-indigo-600" />
+      <DataTable columns={columns} data={filteredData} filename="companies" isLoading={loading} headerGradient={theme.tableHeaderGradient} />
     </div>
   )
 }
