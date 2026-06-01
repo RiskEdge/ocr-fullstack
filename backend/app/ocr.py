@@ -267,7 +267,6 @@ class OCRProcessor:
             "environment": _ENVIRONMENT,
             "credits_used": credits_used,
         }
-        # print(f"[run_log] inserting: {log_row}")
         try:
             def _insert():
                 return get_supabase().table("processing_runs").insert(log_row).execute()
