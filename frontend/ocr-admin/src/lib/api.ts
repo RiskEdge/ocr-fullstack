@@ -3,6 +3,7 @@ import type {
   Partner, Company, AdminUser,
   ProcessingRun, ValidationRun,
   RunFilters, UserInfo, UsageOverviewData,
+  SyncStatus, ProductCatalogData, CreditSetting,
 } from '@/types'
 
 const TOKEN_KEY = 'admin_access_token'
@@ -21,6 +22,11 @@ export function clearSession(): void {
   sessionStorage.removeItem(TOKEN_KEY)
   sessionStorage.removeItem(USER_KEY)
   _cache.clear()
+}
+
+export function clearCache(key?: string): void {
+  if (key) _cache.delete(key)
+  else _cache.clear()
 }
 
 export function hasToken(): boolean {
@@ -145,7 +151,7 @@ export const api = {
   allCompanies: () =>
     cachedFetch<Company[]>('all-companies', '/v1/admin/all-companies'),
 
-  createCompany: (body: { name: string; partner_id?: string; initial_credits?: number }) =>
+  createCompany: (body: { name: string; partner_id?: string; initial_credits?: number; client_code?: string }) =>
     adminFetch<Company>('/v1/admin/companies', { method: 'POST', body: JSON.stringify(body) }),
 
   updateCredits: (companyId: string, credits: number) =>
@@ -154,6 +160,24 @@ export const api = {
       { method: 'PATCH', body: JSON.stringify({ credits }) }
     ),
 
+  updateClientCode: (companyId: string, clientCode: string) =>
+    adminFetch<{ id: string; client_code: string }>(
+      `/v1/admin/companies/${companyId}/client-code`,
+      { method: 'PATCH', body: JSON.stringify({ client_code: clientCode }) }
+    ),
+
+  syncStatus: (companyId: string) =>
+    adminFetch<SyncStatus>(`/v1/admin/companies/${companyId}/sync-status`),
+
+  generateSyncKey: (companyId: string) =>
+    adminFetch<{ company_id: string; sync_secret: string; note: string }>(
+      `/v1/admin/companies/${companyId}/sync-key`,
+      { method: 'POST' }
+    ),
+
+  revokeSyncKey: (companyId: string) =>
+    adminFetch<void>(`/v1/admin/companies/${companyId}/sync-key`, { method: 'DELETE' }),
+
   usageOverview: (filters: Pick<RunFilters, 'from_date' | 'to_date'> = {}) => {
     const p = new URLSearchParams()
     if (filters.from_date) p.set('from_date', filters.from_date)
@@ -161,9 +185,38 @@ export const api = {
     return adminFetch<UsageOverviewData>(`/v1/admin/usage-overview?${p}`)
   },
 
+  creditSettings: () =>
+    adminFetch<CreditSetting[]>('/v1/admin/credit-settings'),
+
+  updatePricePerPage: (companyId: string, pricePerPage: number) =>
+    adminFetch<{ company_id: string; price_per_page: number }>(
+      `/v1/admin/companies/${companyId}/price-per-page`,
+      { method: 'PATCH', body: JSON.stringify({ price_per_page: pricePerPage }) },
+    ),
+
+  productCatalog: (params: { search?: string; limit?: number; offset?: number } = {}) => {
+    const p = new URLSearchParams()
+    if (params.search)             p.set('search', params.search)
+    if (params.limit !== undefined) p.set('limit',  String(params.limit))
+    if (params.offset !== undefined) p.set('offset', String(params.offset))
+    return adminFetch<ProductCatalogData>(`/v1/admin/product-catalog?${p}`)
+  },
+
   changePassword: (currentPassword: string, newPassword: string) =>
     adminFetch<{ message: string }>('/v1/user/change-password', {
       method: 'PATCH',
       body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }),
     }),
+
+  toggleCompanyActive: (companyId: string, isActive: boolean) =>
+    adminFetch<{ id: string; is_active: boolean }>(
+      `/v1/admin/companies/${companyId}/active`,
+      { method: 'PATCH', body: JSON.stringify({ is_active: isActive }) }
+    ),
+
+  toggleUserActive: (userId: string, isActive: boolean) =>
+    adminFetch<{ id: string; is_active: boolean }>(
+      `/v1/admin/users/${userId}/active`,
+      { method: 'PATCH', body: JSON.stringify({ is_active: isActive }) }
+    ),
 }

@@ -12,6 +12,8 @@ import ValidationRuns from '@/pages/ValidationRuns'
 import Partners from '@/pages/Partners'
 import AllCompanies from '@/pages/AllCompanies'
 import UsageOverview from '@/pages/UsageOverview'
+import ProductCatalog from '@/pages/ProductCatalog'
+import CreditSettings from '@/pages/CreditSettings'
 
 function defaultRoute(role?: string): string {
   if (role === 'superadmin')    return '/superadmin/overview'
@@ -39,9 +41,11 @@ function ProtectedLayout() {
           <Route path="/superadmin/usage-overview"   element={<UsageOverview />} />
           <Route path="/superadmin/processing-runs"  element={<ProcessingRuns />} />
           <Route path="/superadmin/validation-runs"  element={<ValidationRuns />} />
+          <Route path="/superadmin/credit-settings"  element={<CreditSettings />} />
 
           {/* Partner admin */}
           <Route path="/partner/overview"            element={<PartnerOverview />} />
+          <Route path="/partner/credit-settings"     element={<CreditSettings />} />
           <Route path="/partner/usage-overview"      element={<UsageOverview />} />
           <Route path="/partner/processing-runs"     element={<ProcessingRuns />} />
           <Route path="/partner/validation-runs"     element={<ValidationRuns />} />
@@ -49,6 +53,8 @@ function ProtectedLayout() {
           {/* Client admin */}
           <Route path="/client/overview"             element={<Overview />} />
           <Route path="/client/users"                element={<Users />} />
+          <Route path="/client/credit-settings"      element={<CreditSettings />} />
+          <Route path="/client/catalog"              element={<ProductCatalog />} />
           <Route path="/client/processing-runs"      element={<ProcessingRuns />} />
           <Route path="/client/validation-runs"      element={<ValidationRuns />} />
 

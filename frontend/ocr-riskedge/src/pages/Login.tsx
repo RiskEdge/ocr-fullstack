@@ -5,7 +5,22 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Eye, EyeOff, AlertCircle } from "lucide-react";
+import { Eye, EyeOff, AlertCircle, UserX, Building2 } from "lucide-react";
+
+type DeactivatedKind = 'account' | 'company' | null;
+
+const DEACTIVATED_COPY: Record<NonNullable<DeactivatedKind>, { icon: React.ReactNode; title: string; body: string }> = {
+  account: {
+    icon: <UserX className="h-8 w-8 text-red-500" />,
+    title: "Account Deactivated",
+    body: "Your account has been deactivated. Please contact your company administrator to regain access.",
+  },
+  company: {
+    icon: <Building2 className="h-8 w-8 text-amber-500" />,
+    title: "Company Account Disabled",
+    body: "Your company's account has been disabled. Please contact your partner admin to restore access.",
+  },
+};
 
 const Login = () => {
   const { login, companies } = useAuth();
@@ -17,6 +32,7 @@ const Login = () => {
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState("");
   const [isLoading, setIsLoading] = useState(false);
+  const [deactivated, setDeactivated] = useState<DeactivatedKind>(null);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -35,6 +51,10 @@ const Login = () => {
     setIsLoading(false);
     if (result.success) {
       navigate("/");
+    } else if (result.error === "account_deactivated") {
+      setDeactivated("account");
+    } else if (result.error === "company_deactivated") {
+      setDeactivated("company");
     } else {
       setError(result.error || "Login failed");
     }
@@ -42,6 +62,25 @@ const Login = () => {
 
   return (
     <div className="min-h-screen bg-background flex items-center justify-center p-4">
+      {/* Deactivation modal */}
+      {deactivated && (() => {
+        const copy = DEACTIVATED_COPY[deactivated];
+        return (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+            <div className="bg-card border border-border rounded-2xl shadow-xl p-8 max-w-sm w-full text-center space-y-4">
+              <div className="flex justify-center">{copy.icon}</div>
+              <h2 className="text-lg font-semibold text-foreground">{copy.title}</h2>
+              <p className="text-sm text-muted-foreground">{copy.body}</p>
+              <Button
+                className="w-full"
+                onClick={() => { setDeactivated(null); setPassword(""); }}
+              >
+                OK
+              </Button>
+            </div>
+          </div>
+        );
+      })()}
       <div className="w-full max-w-sm">
         {/* Logo */}
         <div className="flex justify-center mb-8">

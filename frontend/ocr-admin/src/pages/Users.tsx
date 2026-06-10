@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo } from 'react'
-import { Trash2, Plus, SlidersHorizontal, X } from 'lucide-react'
+import { Trash2, Plus, SlidersHorizontal, X, PowerOff, Power } from 'lucide-react'
 import { api, getUserInfo } from '@/lib/api'
 import { useTheme } from '@/contexts/ThemeContext'
 import type { AdminUser } from '@/types'
@@ -74,6 +74,16 @@ export default function Users() {
     }
   }
 
+  async function handleToggleActive(user: AdminUser) {
+    const next = !user.is_active
+    try {
+      await api.toggleUserActive(user.id, next)
+      setData(d => d.map(u => u.id === user.id ? { ...u, is_active: next } : u))
+    } catch (err) {
+      alert(err instanceof Error ? err.message : 'Failed to update user status.')
+    }
+  }
+
   async function handleCreate(e: React.FormEvent) {
     e.preventDefault()
     setFormErr('')
@@ -96,6 +106,21 @@ export default function Users() {
       render: row => ROLE_LABELS[row.role] ?? row.role,
     },
     ...(showCompany ? [{ key: 'company_name', header: 'Company', sortable: true } as Column<AdminUser>] : []),
+    {
+      key: 'is_active', header: 'Status', sortable: true,
+      render: row => row.is_active
+        ? (
+          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-emerald-50 text-emerald-700">
+            <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
+            Active
+          </span>
+        ) : (
+          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-red-50 text-red-600">
+            <span className="h-1.5 w-1.5 rounded-full bg-red-400" />
+            Inactive
+          </span>
+        ),
+    },
     { key: 'id', header: 'User ID', sortable: false },
   ]
 
@@ -103,17 +128,28 @@ export default function Users() {
     ? [
         ...baseColumns,
         {
-          key: '_delete' as keyof AdminUser,
+          key: '_actions' as keyof AdminUser,
           header: '',
           sortable: false,
           render: row => (
-            <button
-              onClick={() => handleDelete(row.id)}
-              className="text-gray-300 hover:text-red-500 transition-colors"
-              title="Delete user"
-            >
-              <Trash2 className="h-4 w-4" />
-            </button>
+            <div className="flex items-center gap-4">
+              <button
+                onClick={() => handleToggleActive(row)}
+                title={row.is_active ? 'Deactivate user' : 'Activate user'}
+                className={`transition-colors ${row.is_active ? 'text-gray-300 hover:text-amber-500' : 'text-gray-300 hover:text-emerald-600'}`}
+              >
+                {row.is_active
+                  ? <PowerOff className="h-4 w-4" />
+                  : <Power className="h-4 w-4" />}
+              </button>
+              <button
+                onClick={() => handleDelete(row.id)}
+                className="text-gray-300 hover:text-red-500 transition-colors"
+                title="Delete user"
+              >
+                <Trash2 className="h-4 w-4" />
+              </button>
+            </div>
           ),
         },
       ]

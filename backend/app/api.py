@@ -21,6 +21,7 @@ from app.db import get_supabase
 from app.behavior import router as behavior_router
 from app.profiles import router as profiles_router, _aggregate_all
 from app.admin import router as admin_router
+from app.sync import router as sync_router
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
@@ -67,6 +68,7 @@ app.add_middleware(
 app.include_router(behavior_router)
 app.include_router(profiles_router)
 app.include_router(admin_router)
+app.include_router(sync_router)
 
 class LoginRequest(BaseModel):
     company_name: Optional[str] = None
@@ -91,14 +93,18 @@ async def login(req: LoginRequest):
 
     if req.company_name:
         # --- Company-scoped login (client_admin / user) ---
-        company_res = db.table("companies").select("id").eq("name", req.company_name).execute()
+        company_res = db.table("companies").select("id, is_active").eq("name", req.company_name).execute()
         if not company_res.data:
             raise _bad_creds
-        company_id = company_res.data[0]["id"]
+        company_row = company_res.data[0]
+        company_id  = company_row["id"]
+
+        if not company_row.get("is_active", True):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="company_deactivated")
 
         user_res = (
             db.table("users")
-            .select("id, password, role")
+            .select("id, password, role, is_active")
             .eq("username", req.username)
             .eq("company_id", company_id)
             .execute()
@@ -106,6 +112,9 @@ async def login(req: LoginRequest):
         user = user_res.data[0] if user_res.data else None
         if not user or not pwd_context.verify(req.password[:72], user["password"]):
             raise _bad_creds
+
+        if not user.get("is_active", True):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="account_deactivated")
 
         role = user.get("role", "user")
         if role not in ("client_admin", "user"):

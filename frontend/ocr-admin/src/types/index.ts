@@ -39,6 +39,11 @@ export interface ClientSummary {
   name: string
   credits: number
   user_count: number
+  is_active: boolean
+  client_code: string | null
+  sync_enabled: boolean
+  catalog_item_count: number
+  last_synced_at: string | null
   // All-time
   ocr_runs: number
   ocr_credits: number
@@ -68,6 +73,26 @@ export interface Company {
   partner_id: string | null
   partner_name: string | null
   user_count: number
+  is_active: boolean
+  client_code: string | null
+  catalog_item_count: number
+  sync_enabled: boolean
+}
+
+export interface SyncLog {
+  id: string
+  mode: 'upsert' | 'replace'
+  records_synced: number
+  records_skipped: number
+  status: 'success' | 'error'
+  error_message: string | null
+  triggered_at: string
+}
+
+export interface SyncStatus {
+  sync_enabled: boolean
+  last_synced_at: string | null
+  recent_syncs: SyncLog[]
 }
 
 export interface AdminUser {
@@ -76,6 +101,7 @@ export interface AdminUser {
   role: string
   company_id: string | null
   company_name: string
+  is_active: boolean
 }
 
 export interface ProcessingRun {
@@ -172,4 +198,32 @@ export interface UsageOverviewData {
   by_company: CompanyUsage[]
   by_user: UserUsage[]
   by_partner: PartnerUsage[]
+}
+
+export interface CreditSetting {
+  company_id: string
+  company_name: string
+  price_per_page: number
+  has_custom: boolean
+  price_updated_at: string | null
+}
+
+export interface CatalogItem {
+  id: string
+  sku_code: string | null
+  plu_code: string
+  sku_description: string | null
+  ean_code: string | null
+  cost_price: number | null
+  mrp: number | null
+  gst_percent: number | null
+  priority: number | null
+  status: string | null
+  uom: string | null
+  synced_at: string | null
+}
+
+export interface ProductCatalogData {
+  items: CatalogItem[]
+  total: number
 }

@@ -1,5 +1,5 @@
 """
-Validation logic for invoice line-item vs master_items table.
+Validation logic for invoice line-item vs product_catalog table.
 
 The public entry point is ValidationProcessor.validate_items().
 """
@@ -18,26 +18,36 @@ from app.context_builder import build_context_block, get_user_preferences
 # Field-name normalisation
 # ---------------------------------------------------------------------------
 
-# Maps normalised OCR header → canonical field name used internally
+# Maps normalised OCR header → canonical field name used internally.
+# Canonical names match product_catalog column names exactly.
 _FIELD_ALIASES: dict[str, str] = {
+    # EAN / barcode
     "eancode":            "ean_code",
     "ean":                "ean_code",
     "barcode":            "ean_code",
-    # "brate":              "cost_price",   # B.RATE column on purchase invoices
-    # "baserate":           "cost_price",
+    # Prices
     "costprice":          "cost_price",
     "mrp":                "mrp",
     "maximumretailprice": "mrp",
-    "tax%":               "tax_pct",
-    "taxpct":             "tax_pct",
-    "tax":                "tax_pct",
-    "taxrate":            "tax_pct",
-    "taxpercentage":      "tax_pct",
-    "taxpercent":         "tax_pct",
-    "product":            "sku_desc",
-    "productname":        "sku_desc",
-    "description":        "sku_desc",
-    "skudesc":            "sku_desc",
+    "saleprice":          "sale_price",
+    # GST / Tax — all common invoice labels map to gst_percent
+    "tax%":               "gst_percent",
+    "taxpct":             "gst_percent",
+    "tax":                "gst_percent",
+    "taxrate":            "gst_percent",
+    "taxpercentage":      "gst_percent",
+    "taxpercent":         "gst_percent",
+    "gstpercent":         "gst_percent",
+    "gst%":               "gst_percent",
+    "gstpercer":          "gst_percent",
+    # Product description
+    "product":            "sku_description",
+    "productname":        "sku_description",
+    "description":        "sku_description",
+    "skudesc":            "sku_description",
+    "skudescription":     "sku_description",
+    "skudescri":          "sku_description",
+    # Quantity (not validated, just passed through)
     "qty":                "quantity",
     "quantity":           "quantity",
 }
@@ -56,7 +66,7 @@ def _to_float(val: object) -> Optional[float]:
 
 
 def _ean_str(val: object) -> Optional[str]:
-    """8901399000591.0 → '8901399000591'."""
+    """8901234567890.0 → '8901234567890'."""
     if val is None:
         return None
     try:
@@ -72,7 +82,6 @@ def normalize_item(raw: dict) -> dict:
     for k, v in raw.items():
         canonical = _FIELD_ALIASES.get(_norm_key(k), k)
         out[canonical] = v
-    # print(out)
     return out
 
 
@@ -88,14 +97,13 @@ def local_compare(item: dict, master: dict) -> dict:
     discrepancies = []
     corrections: dict = {}
 
-    # Numeric field comparison
-    for field in ("cost_price", "mrp", "tax_pct"):
+    for field in ("cost_price", "mrp", "gst_percent"):
         inv_val = _to_float(item.get(field))
         master_val = _to_float(master.get(field))
         if inv_val is None or master_val is None:
             continue
         if abs(inv_val - master_val) > 0.01:
-            label = field.replace("_", " ").title()
+            label = {"cost_price": "Cost Price", "mrp": "MRP", "gst_percent": "GST%"}[field]
             discrepancies.append({
                 "field":    field,
                 "expected": master_val,
@@ -104,17 +112,16 @@ def local_compare(item: dict, master: dict) -> dict:
             })
             corrections[field] = master_val
 
-    # Product description comparison
-    inv_desc = str(item.get("sku_desc") or "").strip().upper()
-    master_desc = str(master.get("sku_desc") or "").strip().upper()
+    inv_desc = str(item.get("sku_description") or "").strip().upper()
+    master_desc = str(master.get("sku_description") or "").strip().upper()
     if inv_desc and master_desc and inv_desc != master_desc:
         discrepancies.append({
-            "field":    "sku_desc",
-            "expected": master.get("sku_desc"),
-            "actual":   item.get("sku_desc"),
-            "message":  f"Product description mismatch: invoice has '{item.get('sku_desc')}', master has '{master.get('sku_desc')}'.",
+            "field":    "sku_description",
+            "expected": master.get("sku_description"),
+            "actual":   item.get("sku_description"),
+            "message":  f"Description mismatch: invoice has '{item.get('sku_description')}', master has '{master.get('sku_description')}'.",
         })
-        corrections["sku_desc"] = master.get("sku_desc")
+        corrections["sku_description"] = master.get("sku_description")
 
     return {
         "matched_plu":           master.get("plu_code"),
@@ -142,24 +149,20 @@ class ValidationProcessor:
         """
         Ask Gemini to select the best-matching PLU and identify discrepancies.
 
-        Called when:
-          - Multiple PLUs exist for the EAN (need to pick best match), or
-          - A single-PLU local check already found at least one discrepancy.
+        Called when multiple PLUs exist for the EAN and all have mismatches
+        (auto_select_plu mode).
         """
         ean     = item.get("ean_code", "unknown")
-        product = item.get("sku_desc", "unknown")
+        product = item.get("sku_description", "unknown")
 
-        # Human-readable summary for the narrative part of the prompt
         master_lines = [
             f"  PLU {r['plu_code']} (priority {r.get('priority', '?')}): "
-            f"'{r.get('sku_desc') or '—'}', "
-            f"Cost Price={r.get('cost_price')}, MRP={r.get('mrp')}, Tax%={r.get('tax_pct')}"
+            f"'{r.get('sku_description') or '—'}', "
+            f"Cost={r.get('cost_price')}, MRP={r.get('mrp')}, GST%={r.get('gst_percent')}"
             for r in master_rows
         ]
-
-        # Compact JSON for the structured reference block
         master_json = json.dumps([
-            {k: r.get(k) for k in ("plu_code", "sku_desc", "cost_price", "mrp", "tax_pct", "priority")}
+            {k: r.get(k) for k in ("plu_code", "sku_description", "cost_price", "mrp", "gst_percent", "priority")}
             for r in master_rows
         ])
 
@@ -174,19 +177,19 @@ Invoice line item:
   Product: {product}
   Cost Price: {_fmt(item.get("cost_price"))}
   MRP: {_fmt(item.get("mrp"))}
-  Tax%: {_fmt(item.get("tax_pct"))}
+  GST%: {_fmt(item.get("gst_percent"))}
 
 Master data records for EAN {ean}:
 {chr(10).join(master_lines)}
 
 Task:
 1. Select the master record whose values are closest to the invoice
-   (prioritise MRP match, then Tax%, then Cost Price).
-2. Compare cost_price, mrp, tax_pct, AND sku_desc between the invoice and the chosen record.
+   (prioritise MRP match, then GST%, then Cost Price).
+2. Compare cost_price, mrp, gst_percent, AND sku_description between the invoice and the chosen record.
    IMPORTANT: If an invoice field says "not provided in invoice", that data was absent
    from the document. Do NOT flag it as a discrepancy — skip it entirely.
-3. For numeric fields (cost_price, mrp, tax_pct): identify any value differences.
-   For sku_desc: identify any mismatch between invoice and master description (case-insensitive).
+3. For numeric fields (cost_price, mrp, gst_percent): identify any value differences.
+   For sku_description: identify any mismatch between invoice and master description (case-insensitive).
 4. Assign a risk_score (0.0–1.0) to each discrepancy: 1.0 = clear pricing or identity error,
    0.1 = trivial formatting difference. Only include discrepancies with risk_score >= {threshold:.2f}.
 5. Suggest corrections using the master record values.
@@ -197,9 +200,9 @@ Return ONLY the following JSON — no markdown, no extra text:
   "is_valid": <true if zero discrepancies survive the threshold, else false>,
   "discrepancies": [
     {{
-      "field":      "<cost_price | mrp | tax_pct | sku_desc>",
-      "expected":   <master value — number for numeric fields, string for sku_desc>,
-      "actual":     <invoice value — number for numeric fields, string for sku_desc>,
+      "field":      "<cost_price | mrp | gst_percent | sku_description>",
+      "expected":   <master value — number for numeric fields, string for sku_description>,
+      "actual":     <invoice value — number for numeric fields, string for sku_description>,
       "message":    "<one-sentence explanation>",
       "risk_score": <0.0–1.0>
     }}
@@ -227,25 +230,25 @@ Master records (JSON):
         self, item: dict, candidates: list[dict], context_block: str = "", threshold: float = 0.5
     ) -> dict:
         """
-        Called when the invoice EAN is not in master_items but a product-name
+        Called when the invoice EAN is not in product_catalog but a product-name
         keyword search returned candidate records.
 
         Gemini selects the closest candidate and returns the same validation
-        shape as _gemini_analyze, plus two extra fields:
-          "match_type":  "fuzzy_name"   (so the frontend can style it differently)
+        shape as _gemini_analyze, plus:
+          "match_type":  "fuzzy_name"
           "match_note":  "<why Gemini chose this record>"
         """
         ean     = item.get("ean_code", "unknown")
-        product = item.get("sku_desc") or item.get("product_name") or "unknown"
+        product = item.get("sku_description") or item.get("product_name") or "unknown"
 
         candidates_lines = [
             f"  PLU {r['plu_code']} | EAN {r.get('ean_code')} | "
-            f"'{r.get('sku_desc') or '—'}' | "
-            f"Cost={r.get('cost_price')}, MRP={r.get('mrp')}, Tax%={r.get('tax_pct')}"
+            f"'{r.get('sku_description') or '—'}' | "
+            f"Cost={r.get('cost_price')}, MRP={r.get('mrp')}, GST%={r.get('gst_percent')}"
             for r in candidates
         ]
         candidates_json = json.dumps([
-            {k: r.get(k) for k in ("plu_code", "ean_code", "sku_desc", "cost_price", "mrp", "tax_pct", "priority")}
+            {k: r.get(k) for k in ("plu_code", "ean_code", "sku_description", "cost_price", "mrp", "gst_percent", "priority")}
             for r in candidates
         ])
 
@@ -260,17 +263,17 @@ Invoice line item:
   Product: {product}
   Cost Price: {item.get("cost_price")}
   MRP: {item.get("mrp")}
-  Tax%: {item.get("tax_pct")}
+  GST%: {item.get("gst_percent")}
 
 Possible master records (matched by product name keyword):
 {chr(10).join(candidates_lines)}
 
 Task:
 1. Choose the master record that most likely represents the same product
-   (use product name similarity, then MRP, then Tax% as tiebreakers).
+   (use product name similarity, then MRP, then GST% as tiebreakers).
 2. If no record is a reasonable match, set "matched_plu" to null.
-3. Compare cost_price, mrp, tax_pct, AND sku_desc between the invoice and the chosen record.
-   For sku_desc: identify any mismatch between invoice and master description (case-insensitive).
+3. Compare cost_price, mrp, gst_percent, AND sku_description between the invoice and the chosen record.
+   For sku_description: identify any mismatch between invoice and master description (case-insensitive).
 4. Assign a risk_score (0.0–1.0) to each discrepancy: 1.0 = clear pricing or identity error,
    0.1 = trivial formatting difference. Only include discrepancies with risk_score >= {threshold:.2f}.
 5. Suggest corrections using the master record values.
@@ -285,9 +288,9 @@ Return ONLY the following JSON — no markdown, no extra text:
   "is_valid":    false,
   "discrepancies": [
     {{
-      "field":      "<ean_code | cost_price | mrp | tax_pct | sku_desc>",
-      "expected":   <master value or null — number for numeric fields, string for sku_desc>,
-      "actual":     <invoice value — number for numeric fields, string for sku_desc>,
+      "field":      "<ean_code | cost_price | mrp | gst_percent | sku_description>",
+      "expected":   <master value or null — number for numeric fields, string for sku_description>,
+      "actual":     <invoice value — number for numeric fields, string for sku_description>,
       "message":    "<one-sentence explanation>",
       "risk_score": <0.0–1.0>
     }}
@@ -311,42 +314,44 @@ Master records (JSON):
     # DB helpers
     # ------------------------------------------------------------------
 
-    def _fetch_master_lookup(self, ean_codes: list[str]) -> dict[str, list[dict]]:
-        """Batch fetch master rows for given EANs; returns {ean_code: [rows]}."""
+    def _fetch_master_lookup(self, ean_codes: list[str], company_id: str = "") -> dict[str, list[dict]]:
+        """Batch fetch product_catalog rows for given EANs, scoped to company."""
         if not ean_codes:
             return {}
-        result = (
+        q = (
             get_supabase()
-            .table("master_items")
+            .table("product_catalog")
             .select("*")
             .in_("ean_code", ean_codes)
             .order("priority")
-            .execute()
         )
+        if company_id:
+            q = q.eq("company_id", company_id)
         lookup: dict[str, list[dict]] = {}
-        for row in result.data:
+        for row in q.execute().data:
             lookup.setdefault(row["ean_code"], []).append(row)
         return lookup
 
-    def _fetch_candidates_by_name(self, product_name: str) -> list[dict]:
+    def _fetch_candidates_by_name(self, product_name: str, company_id: str = "") -> list[dict]:
         """
-        ILIKE search on sku_desc using the first meaningful word from the
+        ILIKE search on sku_description using the first meaningful word from the
         invoice product name (usually the brand).  Returns up to 20 rows.
         """
         words = [w for w in product_name.strip().split() if len(w) >= 3]
         if not words:
             return []
-        keyword = words[0]          # e.g. "SANTOOR" from "SANTOOR SOAP 100G MRP38"
-        result = (
+        keyword = words[0]   # e.g. "SANTOOR" from "SANTOOR SOAP 100G MRP38"
+        q = (
             get_supabase()
-            .table("master_items")
+            .table("product_catalog")
             .select("*")
-            .ilike("sku_desc", f"%{keyword}%")
+            .ilike("sku_description", f"%{keyword}%")
             .order("priority")
             .limit(20)
-            .execute()
         )
-        return result.data
+        if company_id:
+            q = q.eq("company_id", company_id)
+        return q.execute().data
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -359,7 +364,7 @@ Master records (JSON):
         company_id: str = "",
     ) -> tuple[list[dict], int]:
         """
-        Validate a list of raw OCR line items against master_items.
+        Validate a list of raw OCR line items against product_catalog.
 
         Each returned dict is the original item enriched with a `validation` key:
           {
@@ -371,17 +376,15 @@ Master records (JSON):
 
         Decision tree per item
         ──────────────────────
-        EAN not in master, product name yields candidates  →  Gemini fuzzy match      (1 credit)
-        EAN not in master, no name candidates              →  flag immediately, no Gemini
+        EAN not in catalog, product name yields candidates  →  Gemini fuzzy match  (1 credit)
+        EAN not in catalog, no name candidates              →  flag immediately, no Gemini
         Single PLU                                         →  local compare, no Gemini
         Multiple PLUs, clean match found locally           →  auto-select, no Gemini
-        Multiple PLUs, all mismatched, auto_select_plu ON  →  Gemini analyzes         (1 credit)
+        Multiple PLUs, all mismatched, auto_select_plu ON  →  Gemini analyzes     (1 credit)
         Multiple PLUs, all mismatched, auto_select_plu OFF →  return options for user selection
 
-        Returns (validated_items, stats) where stats is a dict with match/outcome
-        breakdowns and gemini_calls count (each Gemini call costs 1 credit).
+        Returns (validated_items, stats).
         """
-        # Build context block and fetch preference flags concurrently.
         context_block   = ""
         auto_select_plu = False
         threshold       = 0.5
@@ -394,26 +397,22 @@ Master records (JSON):
             threshold       = float(prefs.get("effective_risk_threshold", 0.5))
 
         items = [normalize_item(raw) for raw in raw_items]
-        gemini_calls        = 0
-        matched_exact       = 0
-        matched_fuzzy       = 0   # incremented after Gemini resolves (not on exception)
-        matched_auto        = 0   # multi-PLU items resolved via _gemini_analyze
-        matched_multi       = 0   # multi-PLU items left for manual user selection
-        no_match_count      = 0
+        gemini_calls   = 0
+        matched_exact  = 0
+        matched_fuzzy  = 0
+        matched_auto   = 0
+        matched_multi  = 0
+        no_match_count = 0
 
-        # Collect unique EAN codes → single batch DB query
         ean_codes = list({
             _ean_str(item.get("ean_code"))
             for item in items
             if item.get("ean_code")
         } - {None})
 
-        master_lookup = await asyncio.to_thread(self._fetch_master_lookup, ean_codes)
+        master_lookup = await asyncio.to_thread(self._fetch_master_lookup, ean_codes, company_id)
 
         results: list[dict | None] = []
-        # Queue entries: (result_index, coroutine, match_type_override | None)
-        # match_type_override is set for auto-selected items so the result handler
-        # can stamp the correct match_type onto the validation dict.
         gemini_queue: list[tuple[int, object, str | None]] = []
 
         for item in items:
@@ -422,24 +421,22 @@ Master records (JSON):
 
             # ── EAN not found ────────────────────────────────────────────
             if not master_rows:
-                product_name = str(item.get("sku_desc") or item.get("product_name") or "")
+                product_name = str(item.get("sku_description") or item.get("product_name") or "")
                 candidates = await asyncio.to_thread(
-                    self._fetch_candidates_by_name, product_name
+                    self._fetch_candidates_by_name, product_name, company_id
                 )
 
                 placeholder_idx = len(results)
                 results.append(None)
 
                 if candidates:
-                    # Fuzzy match via Gemini — counts as 1 credit
                     gemini_calls += 1
                     gemini_queue.append((
                         placeholder_idx,
                         self._gemini_fuzzy_match(item, candidates, context_block, threshold),
-                        None,   # match_type comes from Gemini response ("fuzzy_name")
+                        None,
                     ))
                 else:
-                    # No name candidates either — flag immediately
                     no_match_count += 1
                     results[placeholder_idx] = {
                         **item,
@@ -451,7 +448,7 @@ Master records (JSON):
                                 "field":    "ean_code",
                                 "expected": None,
                                 "actual":   ean,
-                                "message":  "EAN code not found in master data and no similar product name could be matched.",
+                                "message":  "EAN code not found in master catalog and no similar product name could be matched.",
                             }],
                             "suggested_corrections": {},
                         },
@@ -460,16 +457,11 @@ Master records (JSON):
 
             # ── Single PLU fast path ─────────────────────────────────────
             if len(master_rows) == 1:
-                local = local_compare(item, master_rows[0])
                 matched_exact += 1
-                results.append({**item, "validation": local})
+                results.append({**item, "validation": local_compare(item, master_rows[0])})
                 continue
 
             # ── Multiple PLUs ────────────────────────────────────────────
-            # Run local_compare against every PLU (rows already ordered by priority).
-            # If any PLU is a clean match (zero discrepancies) auto-select it —
-            # no need to bother the user. Only surface the selection UI when every
-            # PLU has at least one mismatch.
             comparisons = [(r, local_compare(item, r)) for r in master_rows]
             clean = next(
                 ((r, cmp) for r, cmp in comparisons if not cmp["discrepancies"]),
@@ -481,19 +473,18 @@ Master records (JSON):
                 matched_exact += 1
                 results.append({**item, "validation": cmp})
             elif auto_select_plu:
-                # User prefers Gemini to pick — queue _gemini_analyze (1 credit).
                 gemini_calls += 1
                 placeholder_idx = len(results)
                 results.append(None)
                 gemini_queue.append((
                     placeholder_idx,
                     self._gemini_analyze(item, master_rows, context_block, threshold),
-                    "auto_selected",   # stamp this onto the result
+                    "auto_selected",
                 ))
             else:
                 matched_multi += 1
                 plu_options = [
-                    {k: r.get(k) for k in ("plu_code", "sku_desc", "cost_price", "mrp", "tax_pct", "priority")}
+                    {k: r.get(k) for k in ("plu_code", "sku_description", "cost_price", "mrp", "gst_percent", "priority")}
                     for r in master_rows
                 ]
                 results.append({
@@ -520,7 +511,6 @@ Master records (JSON):
                     ean = _ean_str(item.get("ean_code"))
                     master_rows_fb = master_lookup.get(ean or "", [])
                     if master_rows_fb:
-                        # Known EAN (auto-select path) — fall back to highest-priority PLU
                         results[result_idx] = {
                             **item,
                             "validation": {
@@ -529,7 +519,6 @@ Master records (JSON):
                             },
                         }
                     else:
-                        # Fuzzy path failed — fall back to no_match flag
                         results[result_idx] = {
                             **item,
                             "validation": {
@@ -540,15 +529,13 @@ Master records (JSON):
                                     "field":    "ean_code",
                                     "expected": None,
                                     "actual":   ean,
-                                    "message":  "EAN code not found in master data.",
+                                    "message":  "EAN code not found in master catalog.",
                                 }],
                                 "suggested_corrections": {},
                             },
                         }
                 else:
                     validation = dict(output)
-                    # Filter out any discrepancies below the user's risk threshold.
-                    # Gemini should already respect it, but this enforces it in code.
                     validation["discrepancies"] = [
                         d for d in validation.get("discrepancies", [])
                         if float(d.get("risk_score", 1.0)) >= threshold
@@ -561,7 +548,6 @@ Master records (JSON):
                         matched_fuzzy += 1
                     results[result_idx] = {**item, "validation": validation}
 
-        # Outcome breakdown (multi_plu and no_match excluded — outcome unknown at run time)
         _unresolved = {"no_match", "multi_plu"}
         valid_items       = sum(1 for r in results if r and r.get("validation", {}).get("is_valid"))
         items_with_issues = sum(
@@ -572,13 +558,13 @@ Master records (JSON):
         )
 
         stats = {
-            "gemini_calls":         gemini_calls,
-            "matched_exact":        matched_exact,
-            "matched_fuzzy":        matched_fuzzy,
+            "gemini_calls":          gemini_calls,
+            "matched_exact":         matched_exact,
+            "matched_fuzzy":         matched_fuzzy,
             "matched_auto_selected": matched_auto,
-            "matched_multi_plu":    matched_multi,
-            "no_match":             no_match_count,
-            "valid_items":          valid_items,
-            "items_with_issues":    items_with_issues,
+            "matched_multi_plu":     matched_multi,
+            "no_match":              no_match_count,
+            "valid_items":           valid_items,
+            "items_with_issues":     items_with_issues,
         }
         return results, stats  # type: ignore[return-value]

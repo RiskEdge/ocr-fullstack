@@ -8,6 +8,8 @@ Three admin roles:
 """
 
 import asyncio
+import os
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -35,6 +37,12 @@ def require_superadmin(current_user: TokenData = Depends(get_current_user)) -> T
 def require_partner_or_above(current_user: TokenData = Depends(get_current_user)) -> TokenData:
     if current_user.role not in ("superadmin", "partner_admin"):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Partner admin or above required.")
+    return current_user
+
+
+def require_partner_admin(current_user: TokenData = Depends(get_current_user)) -> TokenData:
+    if current_user.role != "partner_admin":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Partner admin access required.")
     return current_user
 
 
@@ -205,7 +213,7 @@ async def my_clients(current_user: TokenData = Depends(require_partner_or_above)
         if current_user.role == "partner_admin":
             companies = (
                 db.table("companies")
-                .select("id, name, credits")
+                .select("id, name, credits, client_code, sync_api_key, is_active")
                 .eq("partner_id", current_user.partner_id)
                 .order("name")
                 .execute().data or []
@@ -214,7 +222,7 @@ async def my_clients(current_user: TokenData = Depends(require_partner_or_above)
         else:
             companies = (
                 db.table("companies")
-                .select("id, name, credits, partners(name)")
+                .select("id, name, credits, client_code, sync_api_key, is_active, partners(name)")
                 .order("name")
                 .execute().data or []
             )
@@ -238,21 +246,40 @@ async def my_clients(current_user: TokenData = Depends(require_partner_or_above)
             ocr_30d = [r for r in ocr_rows if (r.get("started_at") or "") >= since_30d]
             val_30d = [r for r in val_rows if (r.get("started_at") or "") >= since_30d]
 
+            catalog_count = (
+                db.table("product_catalog").select("id", count="exact")
+                .eq("company_id", cid).execute().count or 0
+            )
+            sync_log = (
+                db.table("master_sync_logs")
+                .select("triggered_at")
+                .eq("company_id", cid)
+                .eq("status", "success")
+                .order("triggered_at", desc=True)
+                .limit(1)
+                .execute().data
+            )
+
             entry = {
-                "id":              cid,
-                "name":            c["name"],
-                "credits":         c["credits"],
-                "user_count":      user_count,
+                "id":                 cid,
+                "name":               c["name"],
+                "credits":            c["credits"],
+                "client_code":        c.get("client_code"),
+                "is_active":          c.get("is_active", True),
+                "sync_enabled":       bool(c.get("sync_api_key")),
+                "catalog_item_count": catalog_count,
+                "last_synced_at":     sync_log[0]["triggered_at"] if sync_log else None,
+                "user_count":         user_count,
                 # All-time
-                "ocr_runs":        len(ocr_rows),
-                "ocr_credits":     sum(r.get("credits_used", 0) for r in ocr_rows),
-                "val_runs":        len(val_rows),
-                "val_credits":     sum(r.get("credits_used", 0) for r in val_rows),
+                "ocr_runs":           len(ocr_rows),
+                "ocr_credits":        sum(r.get("credits_used", 0) for r in ocr_rows),
+                "val_runs":           len(val_rows),
+                "val_credits":        sum(r.get("credits_used", 0) for r in val_rows),
                 # 30-day
-                "ocr_runs_30d":    len(ocr_30d),
-                "ocr_credits_30d": sum(r.get("credits_used", 0) for r in ocr_30d),
-                "val_runs_30d":    len(val_30d),
-                "val_credits_30d": sum(r.get("credits_used", 0) for r in val_30d),
+                "ocr_runs_30d":       len(ocr_30d),
+                "ocr_credits_30d":    sum(r.get("credits_used", 0) for r in ocr_30d),
+                "val_runs_30d":       len(val_30d),
+                "val_credits_30d":    sum(r.get("credits_used", 0) for r in val_30d),
             }
             if show_partner:
                 entry["partner_name"] = (c.get("partners") or {}).get("name")
@@ -431,7 +458,7 @@ async def admin_users(current_user: TokenData = Depends(require_admin)):
         db = get_supabase()
         company_ids = _company_ids_for_user(db, current_user)
 
-        q = db.table("users").select("id, username, role, company_id, companies(name)")
+        q = db.table("users").select("id, username, role, company_id, is_active, companies(name)")
 
         if company_ids is None:
             q = q.neq("role", "superadmin")
@@ -683,15 +710,21 @@ async def list_all_companies(current_user: TokenData = Depends(require_superadmi
         db = get_supabase()
         companies = (
             db.table("companies")
-            .select("id, name, credits, partner_id, partners(name)")
+            .select("id, name, credits, partner_id, client_code, sync_api_key, is_active, partners(name)")
             .order("name")
             .execute().data or []
         )
         for c in companies:
-            c["user_count"]   = (
+            c["user_count"] = (
                 db.table("users").select("id", count="exact")
                 .eq("company_id", c["id"]).eq("role", "user").execute().count or 0
             )
+            c["catalog_item_count"] = (
+                db.table("product_catalog").select("id", count="exact")
+                .eq("company_id", c["id"]).execute().count or 0
+            )
+            # Convert hash presence to a boolean — never expose the hash itself
+            c["sync_enabled"] = bool(c.pop("sync_api_key", None))
             c["partner_name"] = (c.pop("partners", None) or {}).get("name")
         return companies
 
@@ -702,6 +735,7 @@ class CreateCompanyRequest(BaseModel):
     name: str
     partner_id: Optional[str] = None
     initial_credits: int = 100
+    client_code: Optional[str] = None
 
 
 @router.post("/v1/admin/companies", status_code=201)
@@ -709,15 +743,19 @@ async def create_company(req: CreateCompanyRequest, current_user: TokenData = De
     def _create():
         db = get_supabase()
         try:
-            result = db.table("companies").insert({
+            payload: dict = {
                 "name":       req.name,
                 "partner_id": req.partner_id,
                 "credits":    req.initial_credits,
-            }).execute()
+            }
+            if req.client_code:
+                payload["client_code"] = req.client_code.strip().upper()
+            result = db.table("companies").insert(payload).execute()
             return result.data[0]
         except Exception as e:
-            if "duplicate" in str(e).lower() or "unique" in str(e).lower():
-                raise HTTPException(409, f"Company '{req.name}' already exists.")
+            err = str(e).lower()
+            if "duplicate" in err or "unique" in err:
+                raise HTTPException(409, f"Company '{req.name}' or client_code already exists.")
             raise
 
     return await asyncio.to_thread(_create)
@@ -725,6 +763,35 @@ async def create_company(req: CreateCompanyRequest, current_user: TokenData = De
 
 class UpdateCreditsRequest(BaseModel):
     credits: int
+
+
+class UpdateClientCodeRequest(BaseModel):
+    client_code: str
+
+
+@router.patch("/v1/admin/companies/{company_id}/client-code")
+async def update_client_code(
+    company_id: str,
+    req: UpdateClientCodeRequest,
+    current_user: TokenData = Depends(require_superadmin),
+):
+    """Set or update the ERP client_code for a company."""
+    def _update():
+        db = get_supabase()
+        res = db.table("companies").select("id").eq("id", company_id).execute()
+        if not res.data:
+            raise HTTPException(404, "Company not found.")
+        try:
+            db.table("companies").update(
+                {"client_code": req.client_code.strip().upper()}
+            ).eq("id", company_id).execute()
+        except Exception as e:
+            if "duplicate" in str(e).lower() or "unique" in str(e).lower():
+                raise HTTPException(409, f"client_code '{req.client_code}' is already in use.")
+            raise
+        return {"id": company_id, "client_code": req.client_code.strip().upper()}
+
+    return await asyncio.to_thread(_update)
 
 
 @router.patch("/v1/admin/companies/{company_id}/credits")
@@ -739,5 +806,276 @@ async def update_company_credits(
         if not result.data:
             raise HTTPException(404, "Company not found.")
         return {"id": company_id, "credits": req.credits}
+
+    return await asyncio.to_thread(_update)
+
+
+# ---------------------------------------------------------------------------
+# Sync Key Management  —  superadmin only
+# ---------------------------------------------------------------------------
+
+@router.post("/v1/admin/companies/{company_id}/sync-key")
+async def generate_sync_key(
+    company_id: str,
+    current_user: TokenData = Depends(require_superadmin),
+):
+    """
+    Generate a cryptographically random sync secret for the company, store its
+    bcrypt hash, and return the plaintext exactly once. The plaintext is not
+    stored — after this call it is gone.
+    """
+    def _generate():
+        db = get_supabase()
+        res = db.table("companies").select("id").eq("id", company_id).execute()
+        if not res.data:
+            raise HTTPException(404, "Company not found.")
+
+        plaintext = secrets.token_hex(32)   # 64-char hex string, 256 bits of entropy
+        hashed = _pwd.hash(plaintext)
+        db.table("companies").update({"sync_api_key": hashed}).eq("id", company_id).execute()
+
+        return {
+            "company_id":  company_id,
+            "sync_secret": plaintext,
+            "note":        "Store this secret immediately. It will not be shown again.",
+        }
+
+    return await asyncio.to_thread(_generate)
+
+
+@router.delete("/v1/admin/companies/{company_id}/sync-key", status_code=204)
+async def revoke_sync_key(
+    company_id: str,
+    current_user: TokenData = Depends(require_superadmin),
+):
+    """Revoke the sync secret for a company (sets sync_api_key = NULL)."""
+    def _revoke():
+        db = get_supabase()
+        res = db.table("companies").select("id").eq("id", company_id).execute()
+        if not res.data:
+            raise HTTPException(404, "Company not found.")
+        db.table("companies").update({"sync_api_key": None}).eq("id", company_id).execute()
+
+    await asyncio.to_thread(_revoke)
+
+
+@router.get("/v1/admin/companies/{company_id}/sync-status")
+async def get_sync_status(
+    company_id: str,
+    current_user: TokenData = Depends(require_superadmin),
+):
+    """Return sync key status and the last 10 sync log entries. Never returns the key or hash."""
+    def _fetch():
+        db = get_supabase()
+        company_res = (
+            db.table("companies")
+            .select("id, sync_api_key")
+            .eq("id", company_id)
+            .execute()
+        )
+        if not company_res.data:
+            raise HTTPException(404, "Company not found.")
+
+        company = company_res.data[0]
+        sync_enabled = bool(company.get("sync_api_key"))
+
+        logs_res = (
+            db.table("master_sync_logs")
+            .select("id, mode, records_synced, records_skipped, status, error_message, triggered_at")
+            .eq("company_id", company_id)
+            .order("triggered_at", desc=True)
+            .limit(10)
+            .execute()
+        )
+        recent_syncs = logs_res.data or []
+        last_synced_at = recent_syncs[0]["triggered_at"] if recent_syncs else None
+
+        return {
+            "sync_enabled":  sync_enabled,
+            "last_synced_at": last_synced_at,
+            "recent_syncs":  recent_syncs,
+        }
+
+    return await asyncio.to_thread(_fetch)
+
+
+# ---------------------------------------------------------------------------
+# Activate / Deactivate  —  company (partner_admin+) and user (client_admin+)
+# ---------------------------------------------------------------------------
+
+class ToggleActiveRequest(BaseModel):
+    is_active: bool
+
+
+@router.patch("/v1/admin/companies/{company_id}/active")
+async def toggle_company_active(
+    company_id: str,
+    req: ToggleActiveRequest,
+    current_user: TokenData = Depends(require_partner_or_above),
+):
+    """Partner admin can activate/deactivate their own client companies. Superadmin can do any."""
+    def _update():
+        db = get_supabase()
+        res = db.table("companies").select("id, partner_id").eq("id", company_id).execute()
+        if not res.data:
+            raise HTTPException(404, "Company not found.")
+        company = res.data[0]
+
+        if current_user.role == "partner_admin":
+            if company.get("partner_id") != current_user.partner_id:
+                raise HTTPException(403, "This company does not belong to your partner account.")
+
+        db.table("companies").update({"is_active": req.is_active}).eq("id", company_id).execute()
+        return {"id": company_id, "is_active": req.is_active}
+
+    return await asyncio.to_thread(_update)
+
+
+# ---------------------------------------------------------------------------
+# Credit Settings  —  GET: all admins (scoped)  PATCH: partner_admin only
+# ---------------------------------------------------------------------------
+
+_DEFAULT_PRICE_PER_PAGE = 20.00
+
+
+@router.get("/v1/admin/credit-settings")
+async def get_credit_settings(current_user: TokenData = Depends(require_admin)):
+    """Price-per-page for each company in scope, read directly from the companies table."""
+    def _fetch():
+        db = get_supabase()
+        company_ids = _company_ids_for_user(db, current_user)
+
+        if company_ids is not None and not company_ids:
+            return []
+
+        q = db.table("companies").select("id, name, price_per_page, price_updated_at")
+        if company_ids is not None:
+            q = q.in_("id", company_ids)
+        companies = q.order("name").execute().data or []
+
+        return [
+            {
+                "company_id":       c["id"],
+                "company_name":     c["name"],
+                "price_per_page":   float(c.get("price_per_page") or _DEFAULT_PRICE_PER_PAGE),
+                "has_custom":       float(c.get("price_per_page") or _DEFAULT_PRICE_PER_PAGE) != _DEFAULT_PRICE_PER_PAGE,
+                "price_updated_at": c.get("price_updated_at"),
+            }
+            for c in companies
+        ]
+
+    return await asyncio.to_thread(_fetch)
+
+
+class UpdatePricePerPageRequest(BaseModel):
+    price_per_page: float
+
+
+@router.patch("/v1/admin/companies/{company_id}/price-per-page")
+async def update_price_per_page(
+    company_id: str,
+    req: UpdatePricePerPageRequest,
+    current_user: TokenData = Depends(require_partner_admin),
+):
+    """Set or reset the price per page for a client company. Partner admin only."""
+    if req.price_per_page <= 0:
+        raise HTTPException(400, "price_per_page must be greater than 0.")
+
+    def _update():
+        db = get_supabase()
+        company_ids = _company_ids_for_user(db, current_user)
+        if company_ids is not None and company_id not in company_ids:
+            raise HTTPException(403, "This company does not belong to your partner account.")
+
+        res = db.table("companies").select("id").eq("id", company_id).execute()
+        if not res.data:
+            raise HTTPException(404, "Company not found.")
+
+        db.table("companies").update({
+            "price_per_page":      req.price_per_page,
+            "price_updated_at":    datetime.now(timezone.utc).isoformat(),
+            "price_updated_by_id": current_user.user_id,
+        }).eq("id", company_id).execute()
+
+        return {"company_id": company_id, "price_per_page": req.price_per_page}
+
+    return await asyncio.to_thread(_update)
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/admin/product-catalog  —  any admin, scoped by role
+# ---------------------------------------------------------------------------
+
+@router.get("/v1/admin/product-catalog")
+async def admin_product_catalog(
+    search: str | None = Query(None),
+    limit:  int        = Query(50, le=200),
+    offset: int        = Query(0, ge=0),
+    current_user: TokenData = Depends(require_admin),
+):
+    """Product catalog scoped to the caller's company (client_admin) or all companies in scope."""
+    def _fetch():
+        db = get_supabase()
+        company_ids = _company_ids_for_user(db, current_user)
+
+        if company_ids is not None and not company_ids:
+            return {"items": [], "total": 0}
+
+        q = (
+            db.table("product_catalog")
+            .select(
+                "id, sku_code, plu_code, sku_description, ean_code, "
+                "cost_price, mrp, gst_percent, priority, status, uom, synced_at",
+                count="exact",
+            )
+        )
+        if company_ids is not None:
+            q = q.in_("company_id", company_ids)
+        if search:
+            s = search.strip().replace("%", r"\%").replace("_", r"\_")
+            q = q.or_(
+                f"sku_description.ilike.%{s}%,"
+                f"plu_code.ilike.%{s}%,"
+                f"sku_code.ilike.%{s}%,"
+                f"ean_code.ilike.%{s}%"
+            )
+
+        result = (
+            q.order("sku_description", nullsfirst=False)
+            .range(offset, offset + limit - 1)
+            .execute()
+        )
+        return {"items": result.data or [], "total": result.count or 0}
+
+    return await asyncio.to_thread(_fetch)
+
+
+@router.patch("/v1/admin/users/{user_id}/active")
+async def toggle_user_active(
+    user_id: str,
+    req: ToggleActiveRequest,
+    current_user: TokenData = Depends(require_admin),
+):
+    """Client admin can activate/deactivate users within their company. Partner admin / superadmin have broader scope."""
+    def _update():
+        db = get_supabase()
+        res = db.table("users").select("id, role, company_id").eq("id", user_id).execute()
+        if not res.data:
+            raise HTTPException(404, "User not found.")
+        target = res.data[0]
+
+        if target["role"] in ("superadmin", "partner_admin"):
+            raise HTTPException(403, "Cannot deactivate superadmin or partner_admin accounts.")
+
+        if current_user.role == "client_admin":
+            if target["company_id"] != current_user.company_id:
+                raise HTTPException(403, "Cannot modify users from other companies.")
+        elif current_user.role == "partner_admin":
+            company_ids = _company_ids_for_user(db, current_user)
+            if company_ids is not None and target["company_id"] not in company_ids:
+                raise HTTPException(403, "This user does not belong to any of your client companies.")
+
+        db.table("users").update({"is_active": req.is_active}).eq("id", user_id).execute()
+        return {"id": user_id, "is_active": req.is_active}
 
     return await asyncio.to_thread(_update)

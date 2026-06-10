@@ -88,6 +88,12 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       return { success: true };
     } catch (err: unknown) {
       const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
+      if (detail === 'account_deactivated') {
+        return { success: false, error: 'account_deactivated' };
+      }
+      if (detail === 'company_deactivated') {
+        return { success: false, error: 'company_deactivated' };
+      }
       return { success: false, error: detail || 'Network error — is the backend running?' };
     }
   }, [fetchCredits]);
