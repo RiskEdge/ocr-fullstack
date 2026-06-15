@@ -135,7 +135,7 @@ async def admin_overview(current_user: TokenData = Depends(require_admin)):
         ocr_rows = ocr_q.execute().data or []
         val_rows = val_q.execute().data or []
 
-        return {
+        result = {
             "company_name":           company_name,
             "credits_remaining":      credits_remaining,
             "total_users":            user_count,
@@ -150,6 +150,41 @@ async def admin_overview(current_user: TokenData = Depends(require_admin)):
                 "last_30d": _sum_val([r for r in val_rows if (r.get("started_at") or "") >= since_30d]),
             },
         }
+
+        # Per-user cost breakdown — only when scoped to a single company
+        if company_ids is not None and len(company_ids) == 1:
+            cid = company_ids[0]
+            c_data = db.table("companies").select("price_per_page").eq("id", cid).single().execute().data or {}
+            price = float(c_data.get("price_per_page") or _DEFAULT_PRICE_PER_PAGE)
+
+            user_ocr = (
+                db.table("processing_runs")
+                .select("user_id, total_pages, users!user_id(username)")
+                .eq("company_id", cid)
+                .execute().data or []
+            )
+            u_stats: dict = {}
+            for r in user_ocr:
+                uid = r.get("user_id")
+                if not uid:
+                    continue
+                if uid not in u_stats:
+                    u_stats[uid] = {
+                        "user_id":   uid,
+                        "username":  (r.get("users") or {}).get("username", "—"),
+                        "ocr_pages": 0,
+                    }
+                u_stats[uid]["ocr_pages"] += r.get("total_pages") or 0
+
+            by_user = sorted(u_stats.values(), key=lambda x: x["username"])
+            for u in by_user:
+                u["price_per_page"] = price
+                u["total_cost"] = round(u["ocr_pages"] * price, 2)
+
+            result["by_user"] = by_user
+            result["total_billing_cost"] = round(sum(u["total_cost"] for u in by_user), 2)
+
+        return result
 
     return await asyncio.to_thread(_fetch)
 
@@ -343,11 +378,16 @@ async def usage_overview(
         # All companies in scope, seeded with zeros (shows inactive companies too)
         if company_ids is not None:
             scope_cos = (
-                db.table("companies").select("id, name")
+                db.table("companies").select("id, name, price_per_page")
                 .in_("id", company_ids).order("name").execute().data or []
             )
         else:
-            scope_cos = db.table("companies").select("id, name").order("name").execute().data or []
+            scope_cos = db.table("companies").select("id, name, price_per_page").order("name").execute().data or []
+
+        price_map: dict = {
+            c["id"]: float(c.get("price_per_page") or _DEFAULT_PRICE_PER_PAGE)
+            for c in scope_cos
+        }
 
         co_stats: dict = {
             c["id"]: {
@@ -375,6 +415,9 @@ async def usage_overview(
         by_company = sorted(co_stats.values(), key=lambda x: x["company_name"])
         for entry in by_company:
             entry["total_credits"] = entry["ocr_credits"] + entry["val_credits"]
+            ppp = price_map.get(entry["company_id"], _DEFAULT_PRICE_PER_PAGE)
+            entry["price_per_page"] = ppp
+            entry["total_cost"] = round(entry["ocr_pages"] * ppp, 2)
 
         # Per-user stats (only users with activity)
         user_stats: dict = {}
@@ -388,6 +431,7 @@ async def usage_overview(
                     "user_id":      uid,
                     "username":     (r.get("users")     or {}).get("username", "—"),
                     "company_name": (r.get("companies") or {}).get("name", "—"),
+                    "_company_id":  cid,
                     "partner_name": co_to_partner.get(cid, "No Partner"),
                     "ocr_runs": 0, "ocr_pages": 0, "ocr_credits": 0,
                     "val_runs": 0, "val_items": 0, "val_credits": 0,
@@ -405,6 +449,7 @@ async def usage_overview(
                     "user_id":      uid,
                     "username":     (r.get("users")     or {}).get("username", "—"),
                     "company_name": (r.get("companies") or {}).get("name", "—"),
+                    "_company_id":  cid,
                     "partner_name": co_to_partner.get(cid, "No Partner"),
                     "ocr_runs": 0, "ocr_pages": 0, "ocr_credits": 0,
                     "val_runs": 0, "val_items": 0, "val_credits": 0,
@@ -416,6 +461,10 @@ async def usage_overview(
         by_user = sorted(user_stats.values(), key=lambda x: x["username"])
         for entry in by_user:
             entry["total_credits"] = entry["ocr_credits"] + entry["val_credits"]
+            cid = entry.pop("_company_id", "")
+            ppp = price_map.get(cid, _DEFAULT_PRICE_PER_PAGE)
+            entry["price_per_page"] = ppp
+            entry["total_cost"] = round(entry["ocr_pages"] * ppp, 2)
 
         # Per-partner aggregation (rolled up from by_company)
         p_stats: dict = {}
@@ -428,6 +477,7 @@ async def usage_overview(
                     "ocr_runs":  0, "ocr_pages":  0, "ocr_credits":  0,
                     "val_runs":  0, "val_items":  0, "val_credits":  0,
                     "total_credits": 0,
+                    "total_cost": 0.0,
                 }
             s = p_stats[pn]
             s["company_count"] += 1
@@ -438,8 +488,11 @@ async def usage_overview(
             s["val_items"]     += co["val_items"]
             s["val_credits"]   += co["val_credits"]
             s["total_credits"] += co["total_credits"]
+            s["total_cost"]    += co["total_cost"]
 
         by_partner = sorted(p_stats.values(), key=lambda x: x["partner_name"])
+        for entry in by_partner:
+            entry["total_cost"] = round(entry["total_cost"], 2)
 
         return {"by_company": by_company, "by_user": by_user, "by_partner": by_partner}
 
@@ -458,7 +511,7 @@ async def admin_users(current_user: TokenData = Depends(require_admin)):
         db = get_supabase()
         company_ids = _company_ids_for_user(db, current_user)
 
-        q = db.table("users").select("id, username, role, company_id, is_active, companies(name)")
+        q = db.table("users").select("id, username, role, company_id, is_active, companies!users_company_id_fkey(name)")
 
         if company_ids is None:
             q = q.neq("role", "superadmin")

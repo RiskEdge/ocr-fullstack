@@ -8,13 +8,16 @@ POST /v1/sync/master-data
 """
 
 import asyncio
+import csv
+import io
+import json
 import os
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Header, HTTPException, Request, status
+from fastapi import APIRouter, Form, Header, HTTPException, Request, UploadFile, status
 from passlib.context import CryptContext
 from pydantic import BaseModel
 
@@ -329,3 +332,175 @@ async def sync_master_data(
             raise HTTPException(status_code=500, detail="Sync failed due to an internal error.")
 
     return await asyncio.to_thread(_auth_and_sync)
+
+
+# ---------------------------------------------------------------------------
+# File-upload endpoint
+# POST /v1/sync/master-data/upload
+# Accepts multipart/form-data: file (.csv or .json), client_code, mode
+# ---------------------------------------------------------------------------
+
+def _parse_upload(content: bytes, filename: str) -> list[dict]:
+    suffix = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    if suffix == "json":
+        data = json.loads(content.decode("utf-8"))
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict) and "products" in data:
+            return data["products"]
+        raise ValueError("JSON must be a list of products or an object with a 'products' key.")
+    if suffix == "csv":
+        text = content.decode("utf-8-sig")
+        reader = csv.DictReader(io.StringIO(text))
+        return [row for row in reader]
+    raise ValueError(f"Unsupported file type '.{suffix}'. Upload a .csv or .json file.")
+
+
+@router.post("/v1/sync/master-data/upload")
+async def sync_master_data_upload(
+    request: Request,
+    file: UploadFile,
+    client_code: str = Form(...),
+    mode: str = Form("upsert"),
+    authorization: Optional[str] = Header(None),
+):
+    if mode not in ("upsert", "replace"):
+        raise HTTPException(status_code=400, detail="mode must be 'upsert' or 'replace'.")
+
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authorization header with Bearer token is required.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    sync_secret = authorization[7:].strip()
+
+    content = await file.read()
+    if len(content) > _SYNC_MAX_MB * 1024 * 1024:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File exceeds {_SYNC_MAX_MB} MB limit.",
+        )
+
+    try:
+        products = _parse_upload(content, file.filename or "")
+    except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    if not products:
+        raise HTTPException(status_code=400, detail="File contains no products.")
+
+    client_ip = request.client.host if request.client else "unknown"
+    _check_rate_limit(client_ip)
+
+    # Reuse the same auth + sync logic as the JSON-body endpoint
+    sync_req = SyncRequest(client_code=client_code, mode=mode, products=products)
+
+    def _auth_and_sync_upload() -> dict:
+        db = get_supabase()
+
+        company_res = (
+            db.table("companies")
+            .select("id, sync_api_key, sync_allowed_ips")
+            .eq("client_code", sync_req.client_code)
+            .execute()
+        )
+        company = company_res.data[0] if company_res.data else None
+
+        if not company:
+            _record_fail(client_ip)
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid client_code or sync secret.",
+            )
+
+        if not company.get("sync_api_key"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Sync is not enabled for this company. Contact your administrator.",
+            )
+
+        allowed_ips = company.get("sync_allowed_ips")
+        if allowed_ips and client_ip not in allowed_ips:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Request IP is not whitelisted for this company.",
+            )
+
+        if not _pwd.verify(sync_secret, company["sync_api_key"]):
+            _record_fail(client_ip)
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid client_code or sync secret.",
+            )
+
+        company_id = company["id"]
+
+        last_log = (
+            db.table("master_sync_logs")
+            .select("triggered_at")
+            .eq("company_id", company_id)
+            .eq("status", "success")
+            .order("triggered_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        last_synced_at = last_log.data[0]["triggered_at"] if last_log.data else None
+
+        records: list[dict] = []
+        skipped = 0
+        for raw in sync_req.products:
+            rec, skip = _normalize_product(raw, company_id)
+            if skip:
+                skipped += 1
+            else:
+                records.append(rec)
+
+        triggered_at = datetime.now(timezone.utc)
+
+        try:
+            if sync_req.mode == "replace":
+                db.table("product_catalog").delete().eq("company_id", company_id).execute()
+
+            synced = 0
+            for i in range(0, len(records), _CHUNK):
+                chunk = records[i : i + _CHUNK]
+                db.table("product_catalog").upsert(
+                    chunk, on_conflict="company_id,plu_code"
+                ).execute()
+                synced += len(chunk)
+
+            db.table("master_sync_logs").insert({
+                "company_id":      company_id,
+                "mode":            sync_req.mode,
+                "records_synced":  synced,
+                "records_skipped": skipped,
+                "status":          "success",
+                "triggered_at":    triggered_at.isoformat(),
+            }).execute()
+
+            return {
+                "status":          "success",
+                "mode":            sync_req.mode,
+                "records_synced":  synced,
+                "records_skipped": skipped,
+                "triggered_at":    triggered_at.isoformat(),
+                "last_synced_at":  last_synced_at,
+            }
+
+        except Exception as exc:
+            try:
+                db.table("master_sync_logs").insert({
+                    "company_id":      company_id,
+                    "mode":            sync_req.mode,
+                    "records_synced":  0,
+                    "records_skipped": skipped,
+                    "status":          "error",
+                    "error_message":   str(exc)[:500],
+                    "triggered_at":    triggered_at.isoformat(),
+                }).execute()
+            except Exception:
+                pass
+            raise HTTPException(status_code=500, detail="Sync failed due to an internal error.")
+
+    return await asyncio.to_thread(_auth_and_sync_upload)

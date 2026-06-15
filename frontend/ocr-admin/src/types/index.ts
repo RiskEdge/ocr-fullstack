@@ -15,6 +15,14 @@ export interface ValStats {
   last_at: string | null
 }
 
+export interface OverviewUserCost {
+  user_id: string
+  username: string
+  ocr_pages: number
+  price_per_page: number
+  total_cost: number
+}
+
 export interface OverviewData {
   company_name: string
   credits_remaining: number
@@ -23,6 +31,8 @@ export interface OverviewData {
   total_cost_usd: number
   ocr: { all_time: OcrStats; last_30d: OcrStats }
   validation: { all_time: ValStats; last_30d: ValStats }
+  by_user?: OverviewUserCost[]
+  total_billing_cost?: number
 }
 
 export interface GlobalOverviewData {
@@ -165,6 +175,7 @@ export interface PartnerUsage {
   val_items: number
   val_credits: number
   total_credits: number
+  total_cost: number
 }
 
 export interface CompanyUsage {
@@ -178,6 +189,8 @@ export interface CompanyUsage {
   val_items: number
   val_credits: number
   total_credits: number
+  price_per_page: number
+  total_cost: number
 }
 
 export interface UserUsage {
@@ -192,6 +205,8 @@ export interface UserUsage {
   val_items: number
   val_credits: number
   total_credits: number
+  price_per_page: number
+  total_cost: number
 }
 
 export interface UsageOverviewData {

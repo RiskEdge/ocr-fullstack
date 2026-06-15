@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { CreditCard, Users, Zap } from 'lucide-react';
+import { CreditCard, Users, Zap, IndianRupee } from 'lucide-react';
 import { api, getUserInfo } from '@/lib/api';
 import type { OverviewData } from '@/types';
 import StatCard from '@/components/StatCard';
@@ -118,10 +118,13 @@ export default function Overview() {
 				<p className='text-xs font-semibold text-gray-400 uppercase tracking-widest mb-4'>
 					At a Glance
 				</p>
-				<div className='grid grid-cols-1 sm:grid-cols-3 gap-4'>
-					<StatCard variant={1} icon={CreditCard} label='Credits Remaining' value={data.credits_remaining.toLocaleString()} />
-					<StatCard variant={2} icon={Users}      label='Total Users'        value={data.total_users} />
-					<StatCard variant={3} icon={Zap}        label='Credits Consumed'   value={data.total_credits_consumed.toLocaleString()} />
+				<div className={cn('grid gap-4', data.total_billing_cost !== undefined ? 'grid-cols-2 sm:grid-cols-4' : 'grid-cols-1 sm:grid-cols-3')}>
+					<StatCard variant={1} icon={CreditCard}    label='Credits Remaining' value={data.credits_remaining.toLocaleString()} />
+					<StatCard variant={2} icon={Users}          label='Total Users'        value={data.total_users} />
+					<StatCard variant={3} icon={Zap}            label='Credits Consumed'   value={data.total_credits_consumed.toLocaleString()} />
+					{data.total_billing_cost !== undefined && (
+						<StatCard variant={4} icon={IndianRupee} label='Total Cost (₹)'    value={`₹${data.total_billing_cost.toFixed(2)}`} />
+					)}
 				</div>
 			</section>
 
@@ -152,6 +155,54 @@ export default function Overview() {
 					statDefs={valStats}
 				/>
 			</section>
+
+			{/* Cost by User */}
+			{data.by_user && data.by_user.length > 0 && (
+				<section>
+					<p className='text-xs font-semibold text-gray-400 uppercase tracking-widest mb-4'>
+						Cost by User
+					</p>
+					<div className='bg-white rounded-lg border border-gray-200 overflow-hidden shadow-sm'>
+						<div className={`bg-gradient-to-r ${theme.compCard1} px-6 py-3.5`}>
+							<h3 className='text-white font-semibold text-sm tracking-wide'>
+								OCR Processing Cost Breakdown
+							</h3>
+						</div>
+						<div className='overflow-x-auto'>
+							<table className='w-full text-sm'>
+								<thead>
+									<tr className='border-b border-gray-100 bg-gray-50'>
+										<th className='px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wide'>User</th>
+										<th className='px-6 py-3 text-right text-xs font-semibold text-gray-500 uppercase tracking-wide'>Pages Processed</th>
+										<th className='px-6 py-3 text-right text-xs font-semibold text-gray-500 uppercase tracking-wide'>Rate / Page</th>
+										<th className='px-6 py-3 text-right text-xs font-semibold text-gray-500 uppercase tracking-wide'>Total Cost</th>
+									</tr>
+								</thead>
+								<tbody className='divide-y divide-gray-50'>
+									{data.by_user.map((u, i) => (
+										<tr key={u.user_id} className={i % 2 !== 0 ? 'bg-gray-50/50' : ''}>
+											<td className='px-6 py-3 font-medium text-gray-900'>{u.username}</td>
+											<td className='px-6 py-3 text-right text-gray-600'>{u.ocr_pages.toLocaleString()}</td>
+											<td className='px-6 py-3 text-right text-gray-500'>₹{u.price_per_page.toFixed(2)}</td>
+											<td className='px-6 py-3 text-right font-semibold text-gray-900'>₹{u.total_cost.toFixed(2)}</td>
+										</tr>
+									))}
+									<tr className='border-t-2 border-gray-200 bg-gray-100'>
+										<td className='px-6 py-3 text-xs font-bold text-gray-500 uppercase tracking-wide'>Total</td>
+										<td className='px-6 py-3 text-right font-bold text-gray-900'>
+											{data.by_user.reduce((s, u) => s + u.ocr_pages, 0).toLocaleString()}
+										</td>
+										<td className='px-6 py-3' />
+										<td className='px-6 py-3 text-right font-bold text-gray-900'>
+											₹{data.total_billing_cost?.toFixed(2)}
+										</td>
+									</tr>
+								</tbody>
+							</table>
+						</div>
+					</div>
+				</section>
+			)}
 		</div>
 	);
 }

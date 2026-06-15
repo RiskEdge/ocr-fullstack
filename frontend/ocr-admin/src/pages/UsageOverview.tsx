@@ -98,6 +98,8 @@ export default function UsageOverview() {
 	const showCompanyFilter = showCompany && tab === 'user';
 
 	// Column definitions
+	const fmtCost = (val: number) => `₹${val.toFixed(2)}`;
+
 	const partnerColumns: Column<PartnerUsage>[] = [
 		{ key: 'partner_name', header: 'Partner', sortable: true },
 		{ key: 'company_count', header: 'Companies', sortable: true },
@@ -108,6 +110,7 @@ export default function UsageOverview() {
 		{ key: 'val_items', header: 'Val Items', sortable: true },
 		{ key: 'val_credits', header: 'Val Credits', sortable: true },
 		{ key: 'total_credits', header: 'Total Credits', sortable: true },
+		{ key: 'total_cost', header: 'Total Cost (₹)', sortable: true, render: (row: PartnerUsage) => fmtCost(row.total_cost) },
 	];
 
 	const companyColumns: Column<CompanyUsage>[] = [
@@ -122,6 +125,7 @@ export default function UsageOverview() {
 		{ key: 'val_items', header: 'Val Items', sortable: true },
 		{ key: 'val_credits', header: 'Val Credits', sortable: true },
 		{ key: 'total_credits', header: 'Total Credits', sortable: true },
+		{ key: 'total_cost', header: 'Total Cost (₹)', sortable: true, render: (row: CompanyUsage) => fmtCost(row.total_cost) },
 	];
 
 	const userColumns: Column<UserUsage>[] = [
@@ -139,6 +143,7 @@ export default function UsageOverview() {
 		{ key: 'val_items', header: 'Val Items', sortable: true },
 		{ key: 'val_credits', header: 'Val Credits', sortable: true },
 		{ key: 'total_credits', header: 'Total Credits', sortable: true },
+		{ key: 'total_cost', header: 'Total Cost (₹)', sortable: true, render: (row: UserUsage) => fmtCost(row.total_cost) },
 	];
 
 	function switchTab(t: Tab) {
