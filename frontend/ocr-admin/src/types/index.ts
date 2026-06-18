@@ -18,8 +18,8 @@ export interface ValStats {
 export interface OverviewUserCost {
   user_id: string
   username: string
-  ocr_pages: number
-  price_per_page: number
+  ocr_invoices: number
+  price_per_invoice: number
   total_cost: number
 }
 
@@ -144,7 +144,6 @@ export interface ValidationRun {
   valid_items: number
   items_with_issues: number
   gemini_calls: number
-  credits_used: number
   status: string
   duration_ms: number
   started_at: string
@@ -189,7 +188,7 @@ export interface CompanyUsage {
   val_items: number
   val_credits: number
   total_credits: number
-  price_per_page: number
+  price_per_invoice: number
   total_cost: number
 }
 
@@ -205,7 +204,7 @@ export interface UserUsage {
   val_items: number
   val_credits: number
   total_credits: number
-  price_per_page: number
+  price_per_invoice: number
   total_cost: number
 }
 
@@ -218,7 +217,7 @@ export interface UsageOverviewData {
 export interface CreditSetting {
   company_id: string
   company_name: string
-  price_per_page: number
+  price_per_invoice: number
   has_custom: boolean
   price_updated_at: string | null
 }

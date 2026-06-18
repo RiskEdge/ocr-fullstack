@@ -244,8 +244,8 @@ class OCRProcessor:
         else:
             run_status = "partial"
 
-        # 1 credit per page processed (only successful files contribute pages)
-        credits_used = run_total_pages
+        # 1 credit per successfully processed invoice
+        credits_used = run_successful
 
         # Insert run log
         log_row = {
@@ -294,7 +294,7 @@ class OCRProcessor:
                     return new_credits
 
                 remaining_credits = await asyncio.to_thread(_deduct_credits)
-                print(f"[credits] deducted {credits_used} (pages), remaining: {remaining_credits}")
+                print(f"[credits] deducted {credits_used} (invoices), remaining: {remaining_credits}")
             except Exception as e:
                 import traceback
                 print(f"[credits] FAILED to deduct credits: {e}")

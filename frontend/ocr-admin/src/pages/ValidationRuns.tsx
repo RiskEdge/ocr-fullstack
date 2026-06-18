@@ -127,7 +127,6 @@ export default function ValidationRuns() {
 		{ key: 'valid_items', header: 'Valid', sortable: true },
 		{ key: 'items_with_issues', header: 'Issues', sortable: true },
 		{ key: 'gemini_calls', header: 'AI Calls', sortable: true },
-		{ key: 'credits_used', header: 'Credits', sortable: true },
 		{
 			key: 'duration_ms',
 			header: 'Duration',

@@ -64,7 +64,6 @@ const ocrStats: StatDef[] = [
 const valStats: StatDef[] = [
 	{ key: 'runs', label: 'Runs' },
 	{ key: 'items', label: 'Items Validated' },
-	{ key: 'credits', label: 'Credits Used' },
 	{ key: 'gemini_calls', label: 'AI Calls' },
 ];
 
@@ -173,8 +172,8 @@ export default function Overview() {
 								<thead>
 									<tr className='border-b border-gray-100 bg-gray-50'>
 										<th className='px-6 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wide'>User</th>
-										<th className='px-6 py-3 text-right text-xs font-semibold text-gray-500 uppercase tracking-wide'>Pages Processed</th>
-										<th className='px-6 py-3 text-right text-xs font-semibold text-gray-500 uppercase tracking-wide'>Rate / Page</th>
+										<th className='px-6 py-3 text-right text-xs font-semibold text-gray-500 uppercase tracking-wide'>Invoices Processed</th>
+										<th className='px-6 py-3 text-right text-xs font-semibold text-gray-500 uppercase tracking-wide'>Rate / Invoice</th>
 										<th className='px-6 py-3 text-right text-xs font-semibold text-gray-500 uppercase tracking-wide'>Total Cost</th>
 									</tr>
 								</thead>
@@ -182,15 +181,15 @@ export default function Overview() {
 									{data.by_user.map((u, i) => (
 										<tr key={u.user_id} className={i % 2 !== 0 ? 'bg-gray-50/50' : ''}>
 											<td className='px-6 py-3 font-medium text-gray-900'>{u.username}</td>
-											<td className='px-6 py-3 text-right text-gray-600'>{u.ocr_pages.toLocaleString()}</td>
-											<td className='px-6 py-3 text-right text-gray-500'>₹{u.price_per_page.toFixed(2)}</td>
+											<td className='px-6 py-3 text-right text-gray-600'>{u.ocr_invoices.toLocaleString()}</td>
+											<td className='px-6 py-3 text-right text-gray-500'>₹{u.price_per_invoice.toFixed(2)}</td>
 											<td className='px-6 py-3 text-right font-semibold text-gray-900'>₹{u.total_cost.toFixed(2)}</td>
 										</tr>
 									))}
 									<tr className='border-t-2 border-gray-200 bg-gray-100'>
 										<td className='px-6 py-3 text-xs font-bold text-gray-500 uppercase tracking-wide'>Total</td>
 										<td className='px-6 py-3 text-right font-bold text-gray-900'>
-											{data.by_user.reduce((s, u) => s + u.ocr_pages, 0).toLocaleString()}
+											{data.by_user.reduce((s, u) => s + u.ocr_invoices, 0).toLocaleString()}
 										</td>
 										<td className='px-6 py-3' />
 										<td className='px-6 py-3 text-right font-bold text-gray-900'>

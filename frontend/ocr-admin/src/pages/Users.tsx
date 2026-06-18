@@ -2,7 +2,7 @@ import { useState, useEffect, useMemo } from 'react'
 import { Trash2, Plus, SlidersHorizontal, X, PowerOff, Power } from 'lucide-react'
 import { api, getUserInfo } from '@/lib/api'
 import { useTheme } from '@/contexts/ThemeContext'
-import type { AdminUser } from '@/types'
+import type { AdminUser, Company } from '@/types'
 import DataTable, { type Column } from '@/components/DataTable'
 
 const labelCls = 'text-xs text-gray-400 font-medium whitespace-nowrap'
@@ -23,6 +23,8 @@ export default function Users() {
   const [uname,         setUname]         = useState('')
   const [pass,          setPass]          = useState('')
   const [role,          setRole]          = useState<'user' | 'client_admin'>('user')
+  const [companyId,     setCompanyId]     = useState('')
+  const [companies,     setCompanies]     = useState<Company[]>([])
   const [saving,        setSaving]        = useState(false)
   const [formErr,       setFormErr]       = useState('')
 
@@ -30,9 +32,22 @@ export default function Users() {
   const theme = useTheme()
   const inputCls  = `w-full px-3 py-2 rounded-lg border border-gray-200 text-sm bg-white focus:outline-none focus:ring-2 ${theme.focusRing} focus:border-transparent transition-colors`
   const filterCls = `px-3 py-2 rounded-lg border border-gray-200 text-sm bg-white focus:outline-none focus:ring-2 ${theme.focusRing} focus:border-transparent transition-colors`
-  const canManage   = currentUser?.role === 'client_admin' || currentUser?.role === 'superadmin'
-  const showCompany = currentUser?.role !== 'client_admin'
-  const showFilters = showCompany
+  const canManage        = currentUser?.role === 'client_admin' || currentUser?.role === 'superadmin'
+  const showCompany      = currentUser?.role !== 'client_admin'
+  const showFilters      = showCompany
+  const needsCompanyPick = currentUser?.role === 'superadmin'
+
+  async function openForm() {
+    setShowForm(f => !f)
+    if (needsCompanyPick && companies.length === 0) {
+      try {
+        const list = await api.allCompanies()
+        setCompanies(list.filter(c => c.is_active))
+      } catch {
+        // non-fatal — user can still see the dropdown empty
+      }
+    }
+  }
 
   function loadData() {
     setLoading(true)
@@ -89,8 +104,13 @@ export default function Users() {
     setFormErr('')
     setSaving(true)
     try {
-      await api.createUser({ username: uname.trim(), password: pass, role })
-      setUname(''); setPass(''); setRole('user'); setShowForm(false)
+      await api.createUser({
+        username: uname.trim(),
+        password: pass,
+        role,
+        ...(needsCompanyPick && companyId ? { company_id: companyId } : {}),
+      })
+      setUname(''); setPass(''); setRole('user'); setCompanyId(''); setShowForm(false)
       loadData()
     } catch (err) {
       setFormErr(err instanceof Error ? err.message : 'Failed to create user.')
@@ -166,7 +186,7 @@ export default function Users() {
         </div>
         {canManage && (
           <button
-            onClick={() => setShowForm(f => !f)}
+            onClick={openForm}
             className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-semibold transition-colors ${theme.primaryBtn}`}
           >
             <Plus className="h-4 w-4" />
@@ -226,33 +246,51 @@ export default function Users() {
       {showForm && (
         <div className="bg-white rounded-lg border border-gray-200 shadow-sm p-6">
           <h2 className="text-sm font-semibold text-gray-700 mb-4">Create User</h2>
-          <form onSubmit={handleCreate} className="flex flex-wrap gap-3 items-end">
-            <div className="flex-1 min-w-36">
-              <label className="block text-xs text-gray-500 mb-1">Username *</label>
-              <input value={uname} onChange={e => setUname(e.target.value)} required placeholder="username" className={inputCls} />
+          <form onSubmit={handleCreate} className="space-y-4">
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className="block text-xs text-gray-500 mb-1">Username *</label>
+                <input value={uname} onChange={e => setUname(e.target.value)} required placeholder="username" className={inputCls} />
+              </div>
+              <div>
+                <label className="block text-xs text-gray-500 mb-1">Password *</label>
+                <input type="password" value={pass} onChange={e => setPass(e.target.value)} required placeholder="••••••••" className={inputCls} />
+              </div>
+              <div>
+                <label className="block text-xs text-gray-500 mb-1">Role</label>
+                <select value={role} onChange={e => setRole(e.target.value as 'user' | 'client_admin')} className={inputCls}>
+                  <option value="user">User</option>
+                  <option value="client_admin">Company Admin</option>
+                </select>
+              </div>
+              {needsCompanyPick && (
+                <div>
+                  <label className="block text-xs text-gray-500 mb-1">Company *</label>
+                  <select
+                    value={companyId}
+                    onChange={e => setCompanyId(e.target.value)}
+                    required
+                    className={inputCls}
+                  >
+                    <option value="">Select company…</option>
+                    {companies.map(c => (
+                      <option key={c.id} value={c.id}>{c.name}</option>
+                    ))}
+                  </select>
+                </div>
+              )}
             </div>
-            <div className="flex-1 min-w-36">
-              <label className="block text-xs text-gray-500 mb-1">Password *</label>
-              <input type="password" value={pass} onChange={e => setPass(e.target.value)} required placeholder="••••••••" className={inputCls} />
-            </div>
-            <div className="w-36">
-              <label className="block text-xs text-gray-500 mb-1">Role</label>
-              <select value={role} onChange={e => setRole(e.target.value as 'user' | 'client_admin')} className={inputCls}>
-                <option value="user">User</option>
-                <option value="client_admin">Company Admin</option>
-              </select>
-            </div>
-            <div className="flex gap-2">
-              <button type="submit" disabled={saving || !uname.trim() || !pass}
+            {formErr && <p className="text-xs text-red-500">{formErr}</p>}
+            <div className="flex gap-2 pt-1">
+              <button type="submit" disabled={saving || !uname.trim() || !pass || (needsCompanyPick && !companyId)}
                 className={`px-4 py-2 rounded-lg text-sm font-semibold disabled:opacity-50 transition-colors ${theme.primaryBtn}`}>
                 {saving ? 'Saving…' : 'Create'}
               </button>
-              <button type="button" onClick={() => setShowForm(false)}
+              <button type="button" onClick={() => { setShowForm(false); setCompanyId('') }}
                 className="px-4 py-2 rounded-lg border border-gray-200 text-sm text-gray-600 hover:bg-gray-50 transition-colors">
                 Cancel
               </button>
             </div>
-            {formErr && <p className="w-full text-xs text-red-500">{formErr}</p>}
           </form>
         </div>
       )}

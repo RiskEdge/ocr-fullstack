@@ -108,8 +108,6 @@ export default function UsageOverview() {
 		{ key: 'ocr_credits', header: 'OCR Credits', sortable: true },
 		{ key: 'val_runs', header: 'Val Runs', sortable: true },
 		{ key: 'val_items', header: 'Val Items', sortable: true },
-		{ key: 'val_credits', header: 'Val Credits', sortable: true },
-		{ key: 'total_credits', header: 'Total Credits', sortable: true },
 		{ key: 'total_cost', header: 'Total Cost (₹)', sortable: true, render: (row: PartnerUsage) => fmtCost(row.total_cost) },
 	];
 
@@ -123,8 +121,6 @@ export default function UsageOverview() {
 		{ key: 'ocr_credits', header: 'OCR Credits', sortable: true },
 		{ key: 'val_runs', header: 'Val Runs', sortable: true },
 		{ key: 'val_items', header: 'Val Items', sortable: true },
-		{ key: 'val_credits', header: 'Val Credits', sortable: true },
-		{ key: 'total_credits', header: 'Total Credits', sortable: true },
 		{ key: 'total_cost', header: 'Total Cost (₹)', sortable: true, render: (row: CompanyUsage) => fmtCost(row.total_cost) },
 	];
 
@@ -141,8 +137,6 @@ export default function UsageOverview() {
 		{ key: 'ocr_credits', header: 'OCR Credits', sortable: true },
 		{ key: 'val_runs', header: 'Val Runs', sortable: true },
 		{ key: 'val_items', header: 'Val Items', sortable: true },
-		{ key: 'val_credits', header: 'Val Credits', sortable: true },
-		{ key: 'total_credits', header: 'Total Credits', sortable: true },
 		{ key: 'total_cost', header: 'Total Cost (₹)', sortable: true, render: (row: UserUsage) => fmtCost(row.total_cost) },
 	];
 

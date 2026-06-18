@@ -90,7 +90,6 @@ export default function PartnerOverview() {
     period === 'all' ? 'OCR Runs'    : 'OCR Runs (30d)',
     period === 'all' ? 'OCR Credits' : 'OCR Credits (30d)',
     period === 'all' ? 'Val Runs'    : 'Val Runs (30d)',
-    period === 'all' ? 'Val Credits' : 'Val Credits (30d)',
     '',
   ]
 
@@ -272,11 +271,6 @@ export default function PartnerOverview() {
                         {/* Val Runs */}
                         <div className="px-4 py-3.5 text-gray-600 min-w-[110px]">
                           {runVal(company, 'val_runs').toLocaleString()}
-                        </div>
-
-                        {/* Val Credits */}
-                        <div className="px-4 py-3.5 text-gray-600 min-w-[100px]">
-                          {runVal(company, 'val_credits').toLocaleString()}
                         </div>
 
                         {/* Toggle active */}

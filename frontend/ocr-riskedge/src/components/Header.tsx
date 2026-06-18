@@ -45,7 +45,7 @@ const Header = () => {
                 {/* Credits badge */}
                 <span
                   className={`inline-flex items-center gap-1.5 text-sm font-medium px-3 py-1.5 rounded-full ${creditColor}`}
-                  title="Processing credits remaining"
+                  title="Processing credits remaining · 1 credit per invoice"
                 >
                   <Zap className="w-3.5 h-3.5" />
                   {credits === null ? "—" : credits} credit{credits !== 1 ? "s" : ""}

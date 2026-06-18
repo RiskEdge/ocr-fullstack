@@ -155,11 +155,11 @@ async def admin_overview(current_user: TokenData = Depends(require_admin)):
         if company_ids is not None and len(company_ids) == 1:
             cid = company_ids[0]
             c_data = db.table("companies").select("price_per_page").eq("id", cid).single().execute().data or {}
-            price = float(c_data.get("price_per_page") or _DEFAULT_PRICE_PER_PAGE)
+            price = float(c_data.get("price_per_page") or _DEFAULT_PRICE_PER_INVOICE)
 
             user_ocr = (
                 db.table("processing_runs")
-                .select("user_id, total_pages, users!user_id(username)")
+                .select("user_id, credits_used, users!user_id(username)")
                 .eq("company_id", cid)
                 .execute().data or []
             )
@@ -170,16 +170,16 @@ async def admin_overview(current_user: TokenData = Depends(require_admin)):
                     continue
                 if uid not in u_stats:
                     u_stats[uid] = {
-                        "user_id":   uid,
-                        "username":  (r.get("users") or {}).get("username", "—"),
-                        "ocr_pages": 0,
+                        "user_id":      uid,
+                        "username":     (r.get("users") or {}).get("username", "—"),
+                        "ocr_invoices": 0,
                     }
-                u_stats[uid]["ocr_pages"] += r.get("total_pages") or 0
+                u_stats[uid]["ocr_invoices"] += r.get("credits_used") or 0
 
             by_user = sorted(u_stats.values(), key=lambda x: x["username"])
             for u in by_user:
-                u["price_per_page"] = price
-                u["total_cost"] = round(u["ocr_pages"] * price, 2)
+                u["price_per_invoice"] = price
+                u["total_cost"] = round(u["ocr_invoices"] * price, 2)
 
             result["by_user"] = by_user
             result["total_billing_cost"] = round(sum(u["total_cost"] for u in by_user), 2)
@@ -385,7 +385,7 @@ async def usage_overview(
             scope_cos = db.table("companies").select("id, name, price_per_page").order("name").execute().data or []
 
         price_map: dict = {
-            c["id"]: float(c.get("price_per_page") or _DEFAULT_PRICE_PER_PAGE)
+            c["id"]: float(c.get("price_per_page") or _DEFAULT_PRICE_PER_INVOICE)
             for c in scope_cos
         }
 
@@ -415,9 +415,9 @@ async def usage_overview(
         by_company = sorted(co_stats.values(), key=lambda x: x["company_name"])
         for entry in by_company:
             entry["total_credits"] = entry["ocr_credits"] + entry["val_credits"]
-            ppp = price_map.get(entry["company_id"], _DEFAULT_PRICE_PER_PAGE)
-            entry["price_per_page"] = ppp
-            entry["total_cost"] = round(entry["ocr_pages"] * ppp, 2)
+            ppi = price_map.get(entry["company_id"], _DEFAULT_PRICE_PER_INVOICE)
+            entry["price_per_invoice"] = ppi
+            entry["total_cost"] = round(entry["ocr_credits"] * ppi, 2)
 
         # Per-user stats (only users with activity)
         user_stats: dict = {}
@@ -462,9 +462,9 @@ async def usage_overview(
         for entry in by_user:
             entry["total_credits"] = entry["ocr_credits"] + entry["val_credits"]
             cid = entry.pop("_company_id", "")
-            ppp = price_map.get(cid, _DEFAULT_PRICE_PER_PAGE)
-            entry["price_per_page"] = ppp
-            entry["total_cost"] = round(entry["ocr_pages"] * ppp, 2)
+            ppi = price_map.get(cid, _DEFAULT_PRICE_PER_INVOICE)
+            entry["price_per_invoice"] = ppi
+            entry["total_cost"] = round(entry["ocr_credits"] * ppi, 2)
 
         # Per-partner aggregation (rolled up from by_company)
         p_stats: dict = {}
@@ -988,12 +988,12 @@ async def toggle_company_active(
 # Credit Settings  —  GET: all admins (scoped)  PATCH: partner_admin only
 # ---------------------------------------------------------------------------
 
-_DEFAULT_PRICE_PER_PAGE = 20.00
+_DEFAULT_PRICE_PER_INVOICE = 20.00
 
 
 @router.get("/v1/admin/credit-settings")
 async def get_credit_settings(current_user: TokenData = Depends(require_admin)):
-    """Price-per-page for each company in scope, read directly from the companies table."""
+    """Price-per-invoice for each company in scope, read directly from the companies table."""
     def _fetch():
         db = get_supabase()
         company_ids = _company_ids_for_user(db, current_user)
@@ -1008,11 +1008,11 @@ async def get_credit_settings(current_user: TokenData = Depends(require_admin)):
 
         return [
             {
-                "company_id":       c["id"],
-                "company_name":     c["name"],
-                "price_per_page":   float(c.get("price_per_page") or _DEFAULT_PRICE_PER_PAGE),
-                "has_custom":       float(c.get("price_per_page") or _DEFAULT_PRICE_PER_PAGE) != _DEFAULT_PRICE_PER_PAGE,
-                "price_updated_at": c.get("price_updated_at"),
+                "company_id":         c["id"],
+                "company_name":       c["name"],
+                "price_per_invoice":  float(c.get("price_per_page") or _DEFAULT_PRICE_PER_INVOICE),
+                "has_custom":         float(c.get("price_per_page") or _DEFAULT_PRICE_PER_INVOICE) != _DEFAULT_PRICE_PER_INVOICE,
+                "price_updated_at":   c.get("price_updated_at"),
             }
             for c in companies
         ]
@@ -1020,19 +1020,19 @@ async def get_credit_settings(current_user: TokenData = Depends(require_admin)):
     return await asyncio.to_thread(_fetch)
 
 
-class UpdatePricePerPageRequest(BaseModel):
-    price_per_page: float
+class UpdatePricePerInvoiceRequest(BaseModel):
+    price_per_invoice: float
 
 
-@router.patch("/v1/admin/companies/{company_id}/price-per-page")
-async def update_price_per_page(
+@router.patch("/v1/admin/companies/{company_id}/price-per-invoice")
+async def update_price_per_invoice(
     company_id: str,
-    req: UpdatePricePerPageRequest,
+    req: UpdatePricePerInvoiceRequest,
     current_user: TokenData = Depends(require_partner_admin),
 ):
-    """Set or reset the price per page for a client company. Partner admin only."""
-    if req.price_per_page <= 0:
-        raise HTTPException(400, "price_per_page must be greater than 0.")
+    """Set or reset the price per invoice for a client company. Partner admin only."""
+    if req.price_per_invoice <= 0:
+        raise HTTPException(400, "price_per_invoice must be greater than 0.")
 
     def _update():
         db = get_supabase()
@@ -1045,12 +1045,12 @@ async def update_price_per_page(
             raise HTTPException(404, "Company not found.")
 
         db.table("companies").update({
-            "price_per_page":      req.price_per_page,
+            "price_per_page":      req.price_per_invoice,  # DB column still named price_per_page
             "price_updated_at":    datetime.now(timezone.utc).isoformat(),
             "price_updated_by_id": current_user.user_id,
         }).eq("id", company_id).execute()
 
-        return {"company_id": company_id, "price_per_page": req.price_per_page}
+        return {"company_id": company_id, "price_per_invoice": req.price_per_invoice}
 
     return await asyncio.to_thread(_update)
 

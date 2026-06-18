@@ -188,10 +188,10 @@ export const api = {
   creditSettings: () =>
     adminFetch<CreditSetting[]>('/v1/admin/credit-settings'),
 
-  updatePricePerPage: (companyId: string, pricePerPage: number) =>
-    adminFetch<{ company_id: string; price_per_page: number }>(
-      `/v1/admin/companies/${companyId}/price-per-page`,
-      { method: 'PATCH', body: JSON.stringify({ price_per_page: pricePerPage }) },
+  updatePricePerInvoice: (companyId: string, pricePerInvoice: number) =>
+    adminFetch<{ company_id: string; price_per_invoice: number }>(
+      `/v1/admin/companies/${companyId}/price-per-invoice`,
+      { method: 'PATCH', body: JSON.stringify({ price_per_invoice: pricePerInvoice }) },
     ),
 
   productCatalog: (params: { search?: string; limit?: number; offset?: number } = {}) => {

@@ -283,31 +283,19 @@ async def validate_data(
         print(f"[validate-data] validation failed: {e}")
         raise HTTPException(status_code=500, detail="Validation failed.")
 
-    completed_at  = datetime.now(timezone.utc)
-    duration_ms   = int((completed_at - started_at).total_seconds() * 1000)
-    gemini_calls  = stats["gemini_calls"]
-    credits_used  = gemini_calls
+    completed_at = datetime.now(timezone.utc)
+    duration_ms  = int((completed_at - started_at).total_seconds() * 1000)
+    gemini_calls = stats["gemini_calls"]
 
-    # Deduct credits and log run in a single thread
-    remaining_credits = None
+    # Log validation run (no credit deduction — validation is free)
     try:
         user_id    = current_user.user_id
         company_id = current_user.company_id
         filename   = request.source_filename
         env        = os.environ.get("ENVIRONMENT", "production")
 
-        def _deduct_and_log():
+        def _log():
             db = get_supabase()
-
-            # Credit deduction
-            new_credits = None
-            if credits_used > 0:
-                row = db.table("companies").select("credits").eq("id", company_id).single().execute()
-                new_credits = max(0, row.data["credits"] - credits_used)
-                db.table("companies").update({"credits": new_credits}).eq("id", company_id).execute()
-                print(f"[validate-data] deducted {credits_used} credit(s), remaining: {new_credits}")
-
-            # Log validation run
             db.table("validation_runs").insert({
                 "user_id":           user_id,
                 "company_id":        company_id,
@@ -320,7 +308,7 @@ async def validate_data(
                 "valid_items":       stats["valid_items"],
                 "items_with_issues": stats["items_with_issues"],
                 "gemini_calls":      gemini_calls,
-                "credits_used":      credits_used,
+                "credits_used":      0,
                 "status":            run_status,
                 "duration_ms":       duration_ms,
                 "started_at":        started_at.isoformat(),
@@ -328,14 +316,8 @@ async def validate_data(
                 "environment":       env,
             }).execute()
 
-            return new_credits
-
-        remaining_credits = await asyncio.to_thread(_deduct_and_log)
+        await asyncio.to_thread(_log)
     except Exception as e:
-        print(f"[validate-data] FAILED to deduct credits / log run: {e}")
+        print(f"[validate-data] FAILED to log run: {e}")
 
-    return {
-        "validated_items":  validated,
-        "credits_used":     credits_used,
-        "remaining_credits": remaining_credits,
-    }
+    return {"validated_items": validated}

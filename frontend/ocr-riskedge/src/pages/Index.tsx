@@ -203,7 +203,6 @@ const Index = () => {
   const [dataTab, setDataTab] = useState<"extracted" | "validation">("extracted");
   const [validationState, setValidationState] = useState<"idle" | "validating" | "done">("idle");
   const [validationByFile, setValidationByFile] = useState<Record<number, ValidatedItem[]>>({});
-  const [validationCreditsUsed, setValidationCreditsUsed] = useState<number>(0);
   const [dataPanelFullscreen, setDataPanelFullscreen] = useState(false);
 
   // Ref that mirrors history in sessionStorage (serialisable format)
@@ -278,7 +277,7 @@ const Index = () => {
     setRawContentByFile({});
     setValidationByFile({});
     setValidationState("idle");
-    setValidationCreditsUsed(0);
+
     setDataTab("extracted");
   };
 
@@ -298,7 +297,7 @@ const Index = () => {
     setRawContentByFile({});
     setValidationByFile({});
     setValidationState("idle");
-    setValidationCreditsUsed(0);
+
     setDataTab("extracted");
   };
 
@@ -509,16 +508,14 @@ const Index = () => {
     setValidationState("validating");
     setDataTab("validation");
     try {
-      const { validated_items, credits_used } = await validateItems(items, token, currentFile?.name);
+      const { validated_items } = await validateItems(items, token, currentFile?.name);
       setValidationByFile((prev) => ({ ...prev, [activeFileIndex]: validated_items }));
-      setValidationCreditsUsed(credits_used);
       setValidationState("done");
-      if (credits_used > 0) refreshCredits();
     } catch {
       setValidationState("idle");
       setDataTab("extracted");
     }
-  }, [token, rawContentByFile, activeFileIndex, currentFile, refreshCredits]);
+  }, [token, rawContentByFile, activeFileIndex, currentFile]);
 
   // Update extracted data when switching files
   useEffect(() => {
@@ -655,6 +652,7 @@ const Index = () => {
                     <Zap className="w-3.5 h-3.5 text-yellow-500" />
                     <span>
                       <span className="font-medium text-foreground">{lastRunCreditsUsed}</span> credit{lastRunCreditsUsed !== 1 ? "s" : ""} used this run
+                      <span className="ml-1 text-muted-foreground/70">(1 credit / invoice)</span>
                       {credits !== null && (
                         <span className="ml-2 text-muted-foreground">· {credits} remaining</span>
                       )}
@@ -664,7 +662,13 @@ const Index = () => {
                 <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
                   <div className="flex items-center gap-4">
                     {processingState === "idle" && (
-                      <p className="text-sm text-muted-foreground">Ready to process</p>
+                      <div className="flex items-center gap-2">
+                        <p className="text-sm text-muted-foreground">Ready to process</p>
+                        <span className="inline-flex items-center gap-1 text-xs text-muted-foreground/70 px-2 py-0.5 bg-muted rounded-full">
+                          <Zap className="w-3 h-3" />
+                          1 credit / invoice
+                        </span>
+                      </div>
                     )}
                     {selectedFiles.length > 1 && processingState === "idle" && (
                       <ProcessingModeToggle
@@ -930,14 +934,6 @@ const Index = () => {
                         </div>
                       ) : validationByFile[activeFileIndex] ? (
                         <>
-                          {validationCreditsUsed > 0 && (
-                            <div className="mb-3 px-3 py-2 rounded-lg bg-amber-50 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-800 text-xs text-amber-700 dark:text-amber-400 flex items-center gap-2">
-                              <span className="font-semibold">{validationCreditsUsed} credit{validationCreditsUsed !== 1 ? "s" : ""}</span> used for AI-assisted matching
-                              {credits !== null && (
-                                <span className="text-amber-600 dark:text-amber-500">· {credits} remaining</span>
-                              )}
-                            </div>
-                          )}
                           <ValidationResults
                             items={validationByFile[activeFileIndex]}
                             documentScalars={rawContentByFile[activeFileIndex] ? extractDocumentScalars(rawContentByFile[activeFileIndex]) : undefined}

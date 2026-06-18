@@ -20,7 +20,7 @@ function PriceCell({
 }) {
   const theme = useTheme()
   const [editing, setEditing] = useState(false)
-  const [val,     setVal]     = useState(row.price_per_page.toFixed(2))
+  const [val,     setVal]     = useState(row.price_per_invoice.toFixed(2))
   const [busy,    setBusy]    = useState(false)
 
   async function save() {
@@ -36,7 +36,7 @@ function PriceCell({
   }
 
   async function reset() {
-    if (!confirm(`Reset ${row.company_name} to the default price of ₹${DEFAULT_PRICE.toFixed(2)}/page?`)) return
+    if (!confirm(`Reset ${row.company_name} to the default price of ₹${DEFAULT_PRICE.toFixed(2)}/invoice?`)) return
     setBusy(true)
     try {
       await onUpdate(DEFAULT_PRICE)
@@ -70,7 +70,7 @@ function PriceCell({
           <Check className="h-4 w-4" />
         </button>
         <button
-          onClick={() => { setEditing(false); setVal(row.price_per_page.toFixed(2)) }}
+          onClick={() => { setEditing(false); setVal(row.price_per_invoice.toFixed(2)) }}
           className="text-gray-400 hover:text-gray-600"
         >
           <X className="h-4 w-4" />
@@ -81,7 +81,7 @@ function PriceCell({
 
   return (
     <div className="flex items-center gap-2">
-      <span className="font-medium text-gray-800">₹{Number(row.price_per_page).toFixed(2)}</span>
+      <span className="font-medium text-gray-800">₹{Number(row.price_per_invoice).toFixed(2)}</span>
       <button
         onClick={() => setEditing(true)}
         className={cn('text-gray-300 transition-colors', theme.hoverAccentText)}
@@ -93,7 +93,7 @@ function PriceCell({
         <button
           onClick={reset}
           disabled={busy}
-          title={`Reset to default (₹${DEFAULT_PRICE.toFixed(2)})`}
+          title={`Reset to default (₹${DEFAULT_PRICE.toFixed(2)}/invoice)`}
           className="text-gray-300 hover:text-amber-500 transition-colors disabled:opacity-50"
         >
           <RotateCcw className="h-3.5 w-3.5" />
@@ -127,10 +127,10 @@ export default function CreditSettings() {
   useEffect(loadData, [])
 
   async function handleUpdate(companyId: string, price: number) {
-    await api.updatePricePerPage(companyId, price)
+    await api.updatePricePerInvoice(companyId, price)
     setData(d => d.map(r =>
       r.company_id === companyId
-        ? { ...r, price_per_page: price, has_custom: price !== DEFAULT_PRICE, price_updated_at: new Date().toISOString() }
+        ? { ...r, price_per_invoice: price, has_custom: price !== DEFAULT_PRICE, price_updated_at: new Date().toISOString() }
         : r,
     ))
   }
@@ -143,14 +143,14 @@ export default function CreditSettings() {
   const columns: Column<CreditSetting>[] = [
     { key: 'company_name', header: 'Company', sortable: true },
     {
-      key: 'price_per_page',
-      header: 'Price / Page',
+      key: 'price_per_invoice',
+      header: 'Price / Invoice',
       sortable: true,
       render: row =>
         canEdit ? (
           <PriceCell row={row} onUpdate={price => handleUpdate(row.company_id, price)} />
         ) : (
-          <span className="font-medium text-gray-800">₹{Number(row.price_per_page).toFixed(2)}</span>
+          <span className="font-medium text-gray-800">₹{Number(row.price_per_invoice).toFixed(2)}</span>
         ),
     },
     {
@@ -191,8 +191,8 @@ export default function CreditSettings() {
           </div>
           <p className="text-sm text-gray-400 mt-0.5 pl-7">
             {canEdit
-              ? 'Set a custom price per page for each client company'
-              : 'Price per page charged for OCR processing'}
+              ? 'Set a custom price per invoice for each client company'
+              : 'Price per invoice charged for OCR processing'}
           </p>
         </div>
 
@@ -220,7 +220,7 @@ export default function CreditSettings() {
       <div className={cn('flex items-start gap-3 px-4 py-3 rounded-lg border', theme.accentBg, theme.accentBorder)}>
         <Info className={cn('h-4 w-4 mt-0.5 flex-shrink-0', theme.accentText)} />
         <p className={cn('text-sm', theme.accentTextStrong)}>
-          Platform default is <strong>₹{DEFAULT_PRICE.toFixed(2)} per page</strong>.
+          Platform default is <strong>₹{DEFAULT_PRICE.toFixed(2)} per invoice</strong>.
           {canEdit
             ? ' Click the pencil to set a custom rate, or the reset icon to revert to default.'
             : ' Contact your partner admin to update pricing.'}

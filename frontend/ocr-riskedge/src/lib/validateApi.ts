@@ -38,8 +38,6 @@ export type ValidatedItem = {
 
 export interface ValidationRunResult {
   validated_items: ValidatedItem[];
-  credits_used: number;
-  remaining_credits: number | null;
 }
 
 export async function validateItems(

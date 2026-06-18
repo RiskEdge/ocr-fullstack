@@ -63,7 +63,6 @@ const ocrStatDefs: StatDef[] = [
 const valStatDefs: StatDef[] = [
 	{ key: 'runs', label: 'Runs' },
 	{ key: 'items', label: 'Items Validated' },
-	{ key: 'credits', label: 'Credits Used' },
 	{ key: 'gemini_calls', label: 'AI Calls' },
 ];
 
