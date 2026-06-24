@@ -141,6 +141,19 @@ def _ean_str(val: object) -> Optional[str]:
         return s or None
 
 
+def _plu_str(val: object) -> Optional[str]:
+    """Preserve leading zeros in PLU codes; only strip a float .0 suffix."""
+    if val is None:
+        return None
+    s = str(val).strip()
+    if not s:
+        return None
+    # Strip float suffix only when the whole value is a plain float (e.g. "101.0")
+    if s.endswith(".0") and s[:-2].lstrip("-").isdigit():
+        return s[:-2]
+    return s
+
+
 def _normalize_product(raw: dict, company_id: str) -> tuple[Optional[dict], int]:
     """
     Map ERP field names to product_catalog column names.
@@ -157,7 +170,7 @@ def _normalize_product(raw: dict, company_id: str) -> tuple[Optional[dict], int]
         else:
             extra[k] = v
 
-    plu = _ean_str(normalised.get("plu_code"))
+    plu = _plu_str(normalised.get("plu_code"))
     if not plu:
         return None, 1
 
