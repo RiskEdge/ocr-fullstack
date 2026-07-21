@@ -1132,3 +1132,50 @@ async def toggle_user_active(
         return {"id": user_id, "is_active": req.is_active}
 
     return await asyncio.to_thread(_update)
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/admin/login-events  —  superadmin only, global login audit log
+# ---------------------------------------------------------------------------
+
+@router.get("/v1/admin/login-events")
+async def admin_login_events(
+    username:   str | None = Query(None),
+    role:       str | None = Query(None),
+    login_type: str | None = Query(None, description="'company' or 'global'"),
+    success:    bool | None = Query(None),
+    from_date:  str | None = Query(None),
+    to_date:    str | None = Query(None),
+    limit:      int        = Query(100, le=500),
+    offset:     int        = Query(0, ge=0),
+    current_user: TokenData = Depends(require_superadmin),
+):
+    """System-wide login audit log (users + admins, successes + failures). Superadmin only."""
+    def _fetch():
+        db = get_supabase()
+        q = (
+            db.table("login_events")
+            .select(
+                "id, user_id, company_id, username, company_name, role, "
+                "login_type, success, failure_reason, ip_address, user_agent, created_at",
+                count="exact",
+            )
+            .order("created_at", desc=True)
+        )
+        if username:
+            q = q.eq("username", username)
+        if role:
+            q = q.eq("role", role)
+        if login_type:
+            q = q.eq("login_type", login_type)
+        if success is not None:
+            q = q.eq("success", success)
+        if from_date:
+            q = q.gte("created_at", from_date)
+        if to_date:
+            q = q.lte("created_at", to_date)
+
+        result = q.range(offset, offset + limit - 1).execute()
+        return {"events": result.data or [], "total": result.count or 0}
+
+    return await asyncio.to_thread(_fetch)

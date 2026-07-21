@@ -14,6 +14,7 @@ import AllCompanies from '@/pages/AllCompanies'
 import UsageOverview from '@/pages/UsageOverview'
 import ProductCatalog from '@/pages/ProductCatalog'
 import CreditSettings from '@/pages/CreditSettings'
+import LoginEvents from '@/pages/LoginEvents'
 
 function defaultRoute(role?: string): string {
   if (role === 'superadmin')    return '/superadmin/overview'
@@ -41,6 +42,7 @@ function ProtectedLayout() {
           <Route path="/superadmin/usage-overview"   element={<UsageOverview />} />
           <Route path="/superadmin/processing-runs"  element={<ProcessingRuns />} />
           <Route path="/superadmin/validation-runs"  element={<ValidationRuns />} />
+          <Route path="/superadmin/login-events"     element={<LoginEvents />} />
           <Route path="/superadmin/credit-settings"  element={<CreditSettings />} />
 
           {/* Partner admin */}

@@ -157,6 +157,35 @@ export interface RunFilters {
   username?: string
 }
 
+export interface LoginEvent {
+  id: string
+  user_id: string | null
+  company_id: string | null
+  username: string
+  company_name: string | null
+  role: string | null
+  login_type: 'company' | 'global'
+  success: boolean
+  failure_reason: string | null
+  ip_address: string | null
+  user_agent: string | null
+  created_at: string
+}
+
+export interface LoginEventsData {
+  events: LoginEvent[]
+  total: number
+}
+
+export interface LoginEventFilters {
+  from_date?: string
+  to_date?: string
+  username?: string
+  role?: string
+  login_type?: 'company' | 'global'
+  success?: boolean
+}
+
 export interface UserInfo {
   username: string
   role: string

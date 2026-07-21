@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 from pydantic import BaseModel
 
-from fastapi import FastAPI, File, HTTPException, UploadFile, Depends, status
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from passlib.context import CryptContext
@@ -86,20 +86,52 @@ validator  = ValidationProcessor(client=processor.client)
 async def root():
     return JSONResponse(content={"message": "Backend is working!"})
 
+
+def _record_login_event(**fields):
+    """Insert one row into login_events. Never raises — auditing must not break login."""
+    try:
+        db = get_supabase()
+        db.table("login_events").insert(fields).execute()
+    except Exception as exc:
+        print(f"[login-audit] failed to record login event: {exc}")
+
+
 @app.post("/v1/login")
-async def login(req: LoginRequest):
+async def login(req: LoginRequest, request: Request):
     db = get_supabase()
     _bad_creds = HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Incorrect credentials")
+
+    login_type = "company" if req.company_name else "global"
+    ip_address = (request.headers.get("x-forwarded-for") or request.client.host if request.client else None)
+    if ip_address and "," in ip_address:
+        ip_address = ip_address.split(",")[0].strip()
+    user_agent = request.headers.get("user-agent")
+
+    def _log(*, success, user_id=None, company_id=None, role=None, failure_reason=None):
+        _record_login_event(
+            user_id=user_id,
+            company_id=company_id,
+            username=req.username,
+            company_name=req.company_name,
+            role=role,
+            login_type=login_type,
+            success=success,
+            failure_reason=failure_reason,
+            ip_address=ip_address,
+            user_agent=user_agent,
+        )
 
     if req.company_name:
         # --- Company-scoped login (client_admin / user) ---
         company_res = db.table("companies").select("id, is_active").eq("name", req.company_name).execute()
         if not company_res.data:
+            _log(success=False, failure_reason="bad_credentials")
             raise _bad_creds
         company_row = company_res.data[0]
         company_id  = company_row["id"]
 
         if not company_row.get("is_active", True):
+            _log(success=False, company_id=company_id, failure_reason="company_deactivated")
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="company_deactivated")
 
         user_res = (
@@ -111,13 +143,18 @@ async def login(req: LoginRequest):
         )
         user = user_res.data[0] if user_res.data else None
         if not user or not pwd_context.verify(req.password[:72], user["password"]):
+            _log(success=False, company_id=company_id, failure_reason="bad_credentials")
             raise _bad_creds
 
         if not user.get("is_active", True):
+            _log(success=False, user_id=user["id"], company_id=company_id,
+                 role=user.get("role"), failure_reason="account_deactivated")
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="account_deactivated")
 
         role = user.get("role", "user")
         if role not in ("client_admin", "user"):
+            _log(success=False, user_id=user["id"], company_id=company_id,
+                 role=role, failure_reason="wrong_login_endpoint")
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Use global login for admin accounts.")
 
         access_token = create_access_token(data={
@@ -128,6 +165,7 @@ async def login(req: LoginRequest):
             "company": req.company_name,
             "is_superadmin": False,
         })
+        _log(success=True, user_id=user["id"], company_id=company_id, role=role)
         return {
             "access_token": access_token,
             "token_type": "bearer",
@@ -144,6 +182,7 @@ async def login(req: LoginRequest):
         )
         user = next((u for u in user_res.data if u.get("role") in ("superadmin", "partner_admin")), None)
         if not user or not pwd_context.verify(req.password[:72], user["password"]):
+            _log(success=False, failure_reason="bad_credentials")
             raise _bad_creds
 
         role = user["role"]
@@ -161,6 +200,7 @@ async def login(req: LoginRequest):
             token_data["partner"] = partner_name
 
         access_token = create_access_token(data=token_data)
+        _log(success=True, user_id=user["id"], role=role)
         return {
             "access_token": access_token,
             "token_type": "bearer",

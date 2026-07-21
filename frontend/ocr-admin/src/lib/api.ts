@@ -4,6 +4,7 @@ import type {
   ProcessingRun, ValidationRun,
   RunFilters, UserInfo, UsageOverviewData,
   SyncStatus, ProductCatalogData, CreditSetting,
+  LoginEventsData, LoginEventFilters,
 } from '@/types'
 
 const TOKEN_KEY = 'admin_access_token'
@@ -200,6 +201,18 @@ export const api = {
     if (params.limit !== undefined) p.set('limit',  String(params.limit))
     if (params.offset !== undefined) p.set('offset', String(params.offset))
     return adminFetch<ProductCatalogData>(`/v1/admin/product-catalog?${p}`)
+  },
+
+  loginEvents: (filters: LoginEventFilters = {}, limit = 500) => {
+    const p = new URLSearchParams()
+    if (filters.from_date)          p.set('from_date', filters.from_date)
+    if (filters.to_date)            p.set('to_date', filters.to_date)
+    if (filters.username)           p.set('username', filters.username)
+    if (filters.role)               p.set('role', filters.role)
+    if (filters.login_type)         p.set('login_type', filters.login_type)
+    if (filters.success !== undefined) p.set('success', String(filters.success))
+    p.set('limit', String(limit))
+    return adminFetch<LoginEventsData>(`/v1/admin/login-events?${p}`)
   },
 
   changePassword: (currentPassword: string, newPassword: string) =>

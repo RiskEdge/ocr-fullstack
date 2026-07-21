@@ -13,6 +13,7 @@ import {
 	BarChart3,
 	Package,
 	IndianRupee,
+	LogIn,
 } from 'lucide-react';
 import { clearSession, getUserInfo } from '@/lib/api';
 import { cn } from '@/lib/utils';
@@ -34,6 +35,7 @@ const SUPERADMIN_NAV: NavItem[] = [
 	{ to: '/superadmin/credit-settings', label: 'Credit Settings', Icon: IndianRupee },
 	{ to: '/superadmin/processing-runs', label: 'OCR Runs', Icon: FileText },
 	{ to: '/superadmin/validation-runs', label: 'Validation Runs', Icon: ShieldCheck },
+	{ to: '/superadmin/login-events', label: 'Login Activity', Icon: LogIn },
 ];
 
 const PARTNER_NAV: NavItem[] = [
