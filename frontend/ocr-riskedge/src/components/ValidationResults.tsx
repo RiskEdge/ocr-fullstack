@@ -40,6 +40,7 @@ import {
   Download,
   Pencil,
   Calculator,
+  Sparkles,
 } from "lucide-react";
 import type {
   ValidatedItem,
@@ -101,8 +102,14 @@ function computeLocalValidation(
   const discrepancies: Discrepancy[] = [];
   const corrections: Record<string, number | string> = {};
 
+  // Backend returns invoice items under canonical keys (gst_percent /
+  // sku_description); accept those as fallbacks so tax and description
+  // comparisons are not silently skipped.
+  const invoiceField = (field: "cost_price" | "mrp" | "tax_pct"): unknown =>
+    field === "tax_pct" ? (item.tax_pct ?? item["gst_percent"]) : item[field];
+
   for (const field of ["cost_price", "mrp", "tax_pct"] as const) {
-    const invVal = parseFloat(String(item[field] ?? ""));
+    const invVal = parseFloat(String(invoiceField(field) ?? ""));
     const masterVal = parseFloat(String(master[field] ?? ""));
     if (isNaN(invVal) || isNaN(masterVal)) continue;
     if (Math.abs(invVal - masterVal) > 0.01) {
@@ -116,18 +123,23 @@ function computeLocalValidation(
     }
   }
 
-  const invDesc = String(item.sku_desc ?? item.product_name ?? "")
+  const invDesc = String(
+    item.sku_desc ?? item.product_name ?? item["sku_description"] ?? "",
+  )
     .trim()
     .toUpperCase();
   const masterDesc = String(master.sku_desc ?? "")
     .trim()
     .toUpperCase();
   if (invDesc && masterDesc && invDesc !== masterDesc) {
+    const invDescRaw = String(
+      item.sku_desc ?? item.product_name ?? item["sku_description"] ?? "",
+    );
     discrepancies.push({
       field: "sku_desc",
       expected: master.sku_desc,
-      actual: String(item.sku_desc ?? item.product_name ?? ""),
-      message: `Product description mismatch: invoice has '${item.sku_desc ?? item.product_name}', master has '${master.sku_desc}'.`,
+      actual: invDescRaw,
+      message: `Product description mismatch: invoice has '${invDescRaw}', master has '${master.sku_desc}'.`,
     });
     corrections["sku_desc"] = master.sku_desc ?? "";
   }
@@ -139,6 +151,181 @@ interface PluSelection {
   plu_code: string;
   discrepancies: Discrepancy[];
   corrections: Record<string, number | string>;
+}
+
+// Candidate table for a match Gemini chose out of several plausible records.
+// Its pick is highlighted as recommended; any row can be selected instead.
+function MatchOptionsTable({
+  item,
+  options,
+  recommendedPlu,
+  activePlu,
+  onSelect,
+}: {
+  item: ValidatedItem;
+  options: PluOption[];
+  recommendedPlu?: string | null;
+  activePlu?: string | null;
+  onSelect: (opt: PluOption) => void;
+}) {
+  return (
+    <div className="overflow-x-auto">
+      <Table>
+        <TableHeader>
+          <UITableRow className="bg-muted/50 hover:bg-muted/50">
+            <TableHead className="text-xs font-semibold text-foreground">
+              PLU Code
+            </TableHead>
+            <TableHead className="text-xs font-semibold text-foreground">
+              Product Name
+            </TableHead>
+            <TableHead className="text-xs font-semibold text-foreground">
+              EAN
+            </TableHead>
+            <TableHead className="text-xs font-semibold text-foreground">
+              Cost Price
+            </TableHead>
+            <TableHead className="text-xs font-semibold text-foreground">
+              MRP
+            </TableHead>
+            <TableHead className="text-xs font-semibold text-foreground">
+              Tax %
+            </TableHead>
+            <TableHead className="text-xs font-semibold text-foreground">
+              Differences
+            </TableHead>
+            <TableHead className="w-24" />
+          </UITableRow>
+          {/* Invoice reference row */}
+          <UITableRow className="bg-blue-50/60 dark:bg-blue-950/20 hover:bg-blue-50/60">
+            <TableCell className="text-xs text-blue-600 dark:text-blue-400 font-semibold py-1.5 italic">
+              Invoice
+            </TableCell>
+            <TableCell className="text-xs font-mono py-1.5 text-blue-700 dark:text-blue-300">
+              {String(
+                item.sku_desc ??
+                  item.product_name ??
+                  item["sku_description"] ??
+                  "—",
+              )}
+            </TableCell>
+            <TableCell className="text-xs font-mono py-1.5 text-blue-700 dark:text-blue-300">
+              {String(item.ean_code ?? "—")}
+            </TableCell>
+            <TableCell className="text-xs font-mono py-1.5 text-blue-700 dark:text-blue-300">
+              {String(item.cost_price ?? "—")}
+            </TableCell>
+            <TableCell className="text-xs font-mono py-1.5 text-blue-700 dark:text-blue-300">
+              {String(item.mrp ?? "—")}
+            </TableCell>
+            <TableCell className="text-xs font-mono py-1.5 text-blue-700 dark:text-blue-300">
+              {String(item.tax_pct ?? item["gst_percent"] ?? "—")}
+            </TableCell>
+            <TableCell className="py-1.5" />
+            <TableCell className="py-1.5" />
+          </UITableRow>
+        </TableHeader>
+        <TableBody>
+          {options.map((opt) => {
+            const { discrepancies: optDiffs } = computeLocalValidation(
+              item,
+              opt,
+            );
+            const diffFields = new Set(optDiffs.map((d) => d.field));
+            const cellCls = (field: string) =>
+              diffFields.has(field)
+                ? "text-destructive font-semibold"
+                : "text-green-700 dark:text-green-400";
+            const isRecommended = opt.plu_code === recommendedPlu;
+            const isActive = opt.plu_code === activePlu;
+            return (
+              <UITableRow
+                key={opt.plu_code}
+                className={
+                  isActive
+                    ? "bg-violet-50 dark:bg-violet-950/30 hover:bg-violet-50"
+                    : isRecommended
+                      ? "bg-amber-50/70 dark:bg-amber-950/20 hover:bg-amber-50/70"
+                      : "hover:bg-muted/30"
+                }
+              >
+                <TableCell className="text-sm font-mono py-2 whitespace-nowrap">
+                  <span className="flex items-center gap-1.5">
+                    {opt.plu_code}
+                    {isRecommended && (
+                      <Badge
+                        variant="outline"
+                        className="text-amber-700 dark:text-amber-400 border-amber-300 bg-amber-50 dark:bg-amber-950/20 text-[10px] px-1.5 py-0 gap-0.5"
+                      >
+                        <Sparkles className="w-2.5 h-2.5" />
+                        Recommended
+                      </Badge>
+                    )}
+                  </span>
+                </TableCell>
+                <TableCell className={`text-sm py-2 ${cellCls("sku_desc")}`}>
+                  {opt.sku_desc ?? "—"}
+                </TableCell>
+                <TableCell className="text-sm font-mono py-2">
+                  {opt.ean_code ?? "—"}
+                </TableCell>
+                <TableCell
+                  className={`text-sm font-mono py-2 ${cellCls("cost_price")}`}
+                >
+                  {opt.cost_price ?? "—"}
+                </TableCell>
+                <TableCell className={`text-sm font-mono py-2 ${cellCls("mrp")}`}>
+                  {opt.mrp ?? "—"}
+                </TableCell>
+                <TableCell
+                  className={`text-sm font-mono py-2 ${cellCls("tax_pct")}`}
+                >
+                  {opt.tax_pct ?? "—"}
+                </TableCell>
+                <TableCell className="py-2">
+                  {optDiffs.length === 0 ? (
+                    <span className="flex items-center gap-1 text-xs text-green-600 dark:text-green-400">
+                      <CheckCircle2 className="w-3.5 h-3.5" />
+                      No issues
+                    </span>
+                  ) : (
+                    <span className="flex flex-wrap gap-1">
+                      {optDiffs.map((d) => (
+                        <Badge
+                          key={d.field}
+                          variant="outline"
+                          className="text-destructive border-destructive/30 bg-destructive/5 text-xs px-1.5 py-0"
+                        >
+                          {fieldLabel(d.field)}
+                        </Badge>
+                      ))}
+                    </span>
+                  )}
+                </TableCell>
+                <TableCell className="py-2" onClick={(e) => e.stopPropagation()}>
+                  {isActive ? (
+                    <span className="flex items-center gap-1 text-xs font-medium text-violet-700 dark:text-violet-400">
+                      <CheckCircle2 className="w-3.5 h-3.5" />
+                      Selected
+                    </span>
+                  ) : (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-7 text-xs"
+                      onClick={() => onSelect(opt)}
+                    >
+                      Select
+                    </Button>
+                  )}
+                </TableCell>
+              </UITableRow>
+            );
+          })}
+        </TableBody>
+      </Table>
+    </div>
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -422,26 +609,23 @@ const ValidationResults = ({
 
     for (let idx = 0; idx < items.length; idx++) {
       const v = items[idx].validation;
-      const itemEdits = edits[idx];
       const pluSel = pluSelections[idx];
+      const hasSel = !!pluSel;
 
-      if (v.match_type === "no_match") {
+      // A no-match item the user hasn't resolved via a suggestion is unmatched;
+      // once a candidate is selected it behaves like a resolved match.
+      if (v.match_type === "no_match" && !hasSel) {
         noMatch++;
         continue;
       }
-      if (v.match_type === "multi_plu" && !pluSel) {
+      if (v.match_type === "multi_plu" && !hasSel) {
         pending++;
         continue;
       }
 
-      const effectiveDiscrepanciesRaw =
-        v.match_type === "multi_plu" && pluSel
-          ? pluSel.discrepancies
-          : v.discrepancies;
-      const effectiveCorrections =
-        v.match_type === "multi_plu" && pluSel
-          ? pluSel.corrections
-          : v.suggested_corrections;
+      const effectiveDiscrepanciesRaw = hasSel
+        ? pluSel.discrepancies
+        : v.discrepancies;
 
       let acceptedInRow = 0;
       let remaining = 0;
@@ -456,9 +640,8 @@ const ValidationResults = ({
       if (acceptedInRow > 0) rowsWithAccepted++;
 
       const effectivelyValid =
-        (v.match_type === "multi_plu"
-          ? pluSel!.discrepancies.length === 0
-          : v.is_valid) || remaining === 0;
+        (hasSel ? pluSel.discrepancies.length === 0 : v.is_valid) ||
+        remaining === 0;
       if (effectivelyValid) effectiveValid++;
       else effectiveIssues++;
     }
@@ -1111,20 +1294,37 @@ const ValidationResults = ({
                   const isFuzzy = v.match_type === "fuzzy_name";
                   const isNoMatch = v.match_type === "no_match";
                   const isMultiPlu = v.match_type === "multi_plu";
+                  const isAutoSelected = v.match_type === "auto_selected";
                   const pluSel = pluSelections[idx];
+                  const hasSelection = !!pluSel;
+                  // no_match items may carry "considered" candidates to pick from
+                  const noMatchOptions = isNoMatch ? (v.plu_options ?? []) : [];
+                  const hasSuggestions = noMatchOptions.length > 0;
+                  // A no_match item stays unmatched until the user picks a suggestion.
+                  const stillUnmatched = isNoMatch && !hasSelection;
+                  // Gemini matched one record but others were plausible — offer the
+                  // runners-up with its pick highlighted rather than a silent guess.
+                  const altOptions =
+                    isFuzzy || isAutoSelected ? (v.plu_options ?? []) : [];
+                  const hasAlternatives = altOptions.length > 1;
+                  // Rows that support candidate selection (multi-PLU, no_match with
+                  // suggestions, or an overridable match) share the picker +
+                  // comparison UI.
+                  const canSelect =
+                    isMultiPlu || (isNoMatch && hasSuggestions) || hasAlternatives;
 
-                  // Build effective validation values (override for multi-PLU after selection)
-                  const effectiveMatchedPlu = isMultiPlu
-                    ? (pluSel?.plu_code ?? null)
-                    : v.matched_plu;
-                  const effectiveDiscrepanciesRaw =
-                    isMultiPlu && pluSel
-                      ? pluSel.discrepancies
-                      : v.discrepancies;
-                  const effectiveCorrections =
-                    isMultiPlu && pluSel
-                      ? pluSel.corrections
-                      : v.suggested_corrections;
+                  // Build effective validation values (override after a selection)
+                  const effectiveMatchedPlu = hasSelection
+                    ? pluSel.plu_code
+                    : isMultiPlu
+                      ? null
+                      : v.matched_plu;
+                  const effectiveDiscrepanciesRaw = hasSelection
+                    ? pluSel.discrepancies
+                    : v.discrepancies;
+                  const effectiveCorrections = hasSelection
+                    ? pluSel.corrections
+                    : v.suggested_corrections;
 
                   // Remaining unresolved discrepancies
                   const effectiveDiscrepancies =
@@ -1136,9 +1336,9 @@ const ValidationResults = ({
 
                   const isEffectivelyValid =
                     !isPending &&
-                    !isNoMatch &&
-                    (isMultiPlu
-                      ? pluSel!.discrepancies.length === 0 ||
+                    !stillUnmatched &&
+                    (hasSelection
+                      ? pluSel.discrepancies.length === 0 ||
                         effectiveDiscrepancies.length === 0
                       : v.is_valid || effectiveDiscrepancies.length === 0);
 
@@ -1163,6 +1363,7 @@ const ValidationResults = ({
                     isFuzzy ||
                     isNoMatch ||
                     isMultiPlu ||
+                    hasAlternatives ||
                     hasCalcErrors;
 
                   return (
@@ -1247,6 +1448,14 @@ const ValidationResults = ({
                             >
                               No Match
                             </Badge>
+                          ) : isAutoSelected ? (
+                            <Badge
+                              variant="outline"
+                              className="text-amber-600 border-amber-300 bg-amber-50 dark:bg-amber-950/20 text-xs whitespace-nowrap gap-1"
+                            >
+                              <Sparkles className="w-3 h-3" />
+                              Auto
+                            </Badge>
                           ) : (
                             <Badge
                               variant="outline"
@@ -1273,7 +1482,7 @@ const ValidationResults = ({
                                 <CheckCircle2 className="w-3 h-3" />
                                 Valid
                               </Badge>
-                            ) : isNoMatch ? (
+                            ) : stillUnmatched ? (
                               (acceptedFields[idx]?.size ?? 0) > 0 ? (
                                 <Badge className="bg-amber-500/10 text-amber-600 dark:text-amber-400 border-amber-500/20 gap-1 text-xs whitespace-nowrap">
                                   <CheckCircle2 className="w-3 h-3" />
@@ -1374,6 +1583,7 @@ const ValidationResults = ({
                                           {String(
                                             item.sku_desc ??
                                               item.product_name ??
+                                              item["sku_description"] ??
                                               "—",
                                           )}
                                         </TableCell>
@@ -1384,7 +1594,11 @@ const ValidationResults = ({
                                           {String(item.mrp ?? "—")}
                                         </TableCell>
                                         <TableCell className="text-xs font-mono py-1.5 text-blue-700 dark:text-blue-300">
-                                          {String(item.tax_pct ?? "—")}
+                                          {String(
+                                            item.tax_pct ??
+                                              item["gst_percent"] ??
+                                              "—",
+                                          )}
                                         </TableCell>
                                         <TableCell className="py-1.5" />
                                         <TableCell className="py-1.5" />
@@ -1478,8 +1692,8 @@ const ValidationResults = ({
                                 </div>
                               )}
 
-                              {/* Multi-PLU: selected PLU indicator with Change + Accept All options */}
-                              {isMultiPlu && pluSel && (
+                              {/* Selected PLU indicator with Change + Accept All options */}
+                              {canSelect && pluSel && (
                                 <div className="flex items-center gap-2 text-sm text-violet-700 dark:text-violet-400 bg-violet-50 dark:bg-violet-950/20 border border-violet-200 dark:border-violet-800 rounded-md px-3 py-2">
                                   <CheckCircle2 className="w-4 h-4 shrink-0" />
                                   <span>
@@ -1531,15 +1745,155 @@ const ValidationResults = ({
                                 </div>
                               )}
 
+                              {/* Matched, but other records were plausible —
+                                  show them with the recommendation highlighted */}
+                              {hasAlternatives && (
+                                <div
+                                  className="border border-amber-200 dark:border-amber-800 rounded-lg overflow-hidden"
+                                  onClick={(e) => e.stopPropagation()}
+                                >
+                                  <div className="px-3 py-2 bg-amber-50 dark:bg-amber-950/20 border-b border-amber-200 dark:border-amber-800 flex items-center gap-2">
+                                    <Layers className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+                                    <p className="text-xs font-semibold text-amber-700 dark:text-amber-400">
+                                      {altOptions.length} similar products found —
+                                      the recommended match is highlighted; select
+                                      another if it fits better
+                                    </p>
+                                  </div>
+                                  <MatchOptionsTable
+                                    item={item}
+                                    options={altOptions}
+                                    recommendedPlu={
+                                      v.recommended_plu ?? v.matched_plu
+                                    }
+                                    activePlu={
+                                      pluSel?.plu_code ?? v.matched_plu
+                                    }
+                                    onSelect={(opt) => selectPlu(idx, opt)}
+                                  />
+                                </div>
+                              )}
+
                               {/* No-match message + edit row */}
                               {isNoMatch && (
                                 <>
-                                  {v.discrepancies[0]?.message && (
+                                  {(v.discrepancies[0]?.message ??
+                                    v.match_note) && (
                                     <div className="flex items-start gap-2 text-sm text-muted-foreground bg-muted/40 rounded-md px-3 py-2">
                                       <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
-                                      <span>{v.discrepancies[0].message}</span>
+                                      <span>
+                                        {v.discrepancies[0]?.message ??
+                                          v.match_note}
+                                      </span>
                                     </div>
                                   )}
+
+                                  {/* Considered similar products — pickable when the
+                                      EAN wasn't found but name-similar records exist */}
+                                  {hasSuggestions && !pluSel && (
+                                    <div
+                                      className="border border-border rounded-lg overflow-hidden"
+                                      onClick={(e) => e.stopPropagation()}
+                                    >
+                                      <div className="px-3 py-2 bg-muted/50 border-b border-border flex items-center gap-2">
+                                        <Layers className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
+                                        <p className="text-xs font-semibold text-foreground">
+                                          Considered {noMatchOptions.length} similar
+                                          product
+                                          {noMatchOptions.length !== 1 ? "s" : ""} —
+                                          select the correct match, or leave unmatched
+                                        </p>
+                                      </div>
+                                      <div className="overflow-x-auto">
+                                        <Table>
+                                          <TableHeader>
+                                            <UITableRow className="bg-muted/50 hover:bg-muted/50">
+                                              <TableHead className="text-xs font-semibold text-foreground">
+                                                PLU Code
+                                              </TableHead>
+                                              <TableHead className="text-xs font-semibold text-foreground">
+                                                Product Name
+                                              </TableHead>
+                                              <TableHead className="text-xs font-semibold text-foreground">
+                                                EAN
+                                              </TableHead>
+                                              <TableHead className="text-xs font-semibold text-foreground">
+                                                MRP
+                                              </TableHead>
+                                              <TableHead className="text-xs font-semibold text-foreground">
+                                                Tax %
+                                              </TableHead>
+                                              <TableHead className="text-xs font-semibold text-foreground">
+                                                Differences
+                                              </TableHead>
+                                              <TableHead className="w-20" />
+                                            </UITableRow>
+                                          </TableHeader>
+                                          <TableBody>
+                                            {noMatchOptions.map((opt) => {
+                                              const { discrepancies: optDiffs } =
+                                                computeLocalValidation(item, opt);
+                                              return (
+                                                <UITableRow
+                                                  key={opt.plu_code}
+                                                  className="hover:bg-muted/30"
+                                                >
+                                                  <TableCell className="text-sm font-mono py-2">
+                                                    {opt.plu_code}
+                                                  </TableCell>
+                                                  <TableCell className="text-sm py-2">
+                                                    {opt.sku_desc ?? "—"}
+                                                  </TableCell>
+                                                  <TableCell className="text-sm font-mono py-2">
+                                                    {opt.ean_code ?? "—"}
+                                                  </TableCell>
+                                                  <TableCell className="text-sm font-mono py-2">
+                                                    {opt.mrp ?? "—"}
+                                                  </TableCell>
+                                                  <TableCell className="text-sm font-mono py-2">
+                                                    {opt.tax_pct ?? "—"}
+                                                  </TableCell>
+                                                  <TableCell className="py-2">
+                                                    {optDiffs.length === 0 ? (
+                                                      <span className="flex items-center gap-1 text-xs text-green-600 dark:text-green-400">
+                                                        <CheckCircle2 className="w-3.5 h-3.5" />
+                                                        No issues
+                                                      </span>
+                                                    ) : (
+                                                      <span className="flex flex-wrap gap-1">
+                                                        {optDiffs.map((d) => (
+                                                          <Badge
+                                                            key={d.field}
+                                                            variant="outline"
+                                                            className="text-destructive border-destructive/30 bg-destructive/5 text-xs px-1.5 py-0"
+                                                          >
+                                                            {fieldLabel(d.field)}
+                                                          </Badge>
+                                                        ))}
+                                                      </span>
+                                                    )}
+                                                  </TableCell>
+                                                  <TableCell className="py-2">
+                                                    <Button
+                                                      variant="outline"
+                                                      size="sm"
+                                                      className="h-7 text-xs"
+                                                      onClick={() =>
+                                                        selectPlu(idx, opt)
+                                                      }
+                                                    >
+                                                      Select
+                                                    </Button>
+                                                  </TableCell>
+                                                </UITableRow>
+                                              );
+                                            })}
+                                          </TableBody>
+                                        </Table>
+                                      </div>
+                                    </div>
+                                  )}
+
                                   {editingNoMatch.has(idx) ? (
                                     <div
                                       className="border border-border rounded-lg overflow-hidden"
@@ -1649,8 +2003,8 @@ const ValidationResults = ({
                                 </>
                               )}
 
-                              {/* Multi-PLU selected: full editable comparison for ALL fields */}
-                              {isMultiPlu &&
+                              {/* Selected candidate: full editable comparison for ALL fields */}
+                              {canSelect &&
                                 pluSel &&
                                 (() => {
                                   const selectedOpt = v.plu_options?.find(
@@ -1668,7 +2022,11 @@ const ValidationResults = ({
                                     {
                                       field: "sku_desc",
                                       label: "Product Name",
-                                      invoiceKeys: ["sku_desc", "product_name"],
+                                      invoiceKeys: [
+                                        "sku_desc",
+                                        "product_name",
+                                        "sku_description",
+                                      ],
                                       masterVal: selectedOpt.sku_desc,
                                       isNumeric: false,
                                     },
@@ -1689,7 +2047,7 @@ const ValidationResults = ({
                                     {
                                       field: "tax_pct",
                                       label: "Tax %",
-                                      invoiceKeys: ["tax_pct"],
+                                      invoiceKeys: ["tax_pct", "gst_percent"],
                                       masterVal: selectedOpt.tax_pct,
                                       isNumeric: true,
                                     },

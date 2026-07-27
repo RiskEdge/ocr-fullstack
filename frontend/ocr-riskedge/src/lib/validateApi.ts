@@ -10,6 +10,7 @@ export interface Discrepancy {
 export interface PluOption {
   plu_code: string;
   sku_desc: string | null;
+  ean_code?: string | null;
   cost_price: number | null;
   mrp: number | null;
   tax_pct: number | null;
@@ -19,10 +20,12 @@ export interface PluOption {
 export interface ValidationResult {
   matched_plu: string | null;
   is_valid: boolean;
-  match_type?: "fuzzy_name" | "no_match" | "multi_plu";
+  match_type?: "fuzzy_name" | "no_match" | "multi_plu" | "auto_selected";
   match_note?: string;
   confidence?: "high" | "medium" | "low";
   plu_options?: PluOption[];
+  /** Gemini's pick among plu_options — highlighted as recommended in the UI. */
+  recommended_plu?: string | null;
   discrepancies: Discrepancy[];
   suggested_corrections: Record<string, number | string>;
 }

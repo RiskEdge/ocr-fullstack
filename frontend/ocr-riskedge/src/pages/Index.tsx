@@ -142,8 +142,48 @@ interface RawContent {
   pages: Array<{ page_number: number; extracted_data: Record<string, unknown> }>;
 }
 
+// Column signatures used to tell a line-item table apart from a tax /
+// GST-summary table. Only arrays that look like product line items should be
+// sent for validation — tax tables (which have no EAN) must be ignored.
+const PRODUCT_KEY_HINTS = [
+  "ean", "barcode", "product", "description", "desc",
+  "sku", "plu", "itemname", "item", "particulars",
+  // line-item-only columns tax/GST-summary tables don't carry — extra signals
+  // so a product table is still recognised even if its name column is unusual
+  "mrp", "qty", "quantity", "uom", "unitprice", "packsize", "batch",
+];
+const TAX_KEY_HINTS = [
+  "taxrate", "taxpercent", "taxpct", "taxablevalue", "taxableamount",
+  "taxamount", "cgst", "sgst", "igst", "utgst", "cess", "gstrate", "gstamount",
+];
+const TAX_FIELD_NAME_RE = /(^|[_\s])(tax|gst|hsn[_\s]?summary|tax[_\s]?summary|tax[_\s]?detail|taxes)/i;
+
+const normKey = (k: string) => k.toLowerCase().replace(/[^a-z0-9]/g, "");
+
+// Union of (normalised) column names across all rows in an array.
+function rowKeySet(rows: Record<string, unknown>[]): Set<string> {
+  const keys = new Set<string>();
+  for (const row of rows) {
+    if (row && typeof row === "object") {
+      for (const k of Object.keys(row)) keys.add(normKey(k));
+    }
+  }
+  return keys;
+}
+
+const hasProductSignal = (keys: Set<string>) =>
+  [...keys].some((k) => PRODUCT_KEY_HINTS.some((p) => k.includes(p)));
+
+const looksLikeTax = (fieldKey: string, keys: Set<string>) => {
+  const taxHits = [...keys].filter((k) => TAX_KEY_HINTS.some((t) => k.includes(t))).length;
+  return !hasProductSignal(keys) && (TAX_FIELD_NAME_RE.test(fieldKey) || taxHits >= 2);
+};
+
 function extractLineItems(content: RawContent): Record<string, unknown>[] {
-  const items: Record<string, unknown>[] = [];
+  // Collect every array-of-objects field, classified by its column signature.
+  const productArrays: Record<string, unknown>[][] = [];
+  const otherArrays: Record<string, unknown>[][] = []; // non-product, non-tax fallback
+
   for (const page of content.pages) {
     for (const [key, val] of Object.entries(page.extracted_data)) {
       if (key === "confidence_score") continue;
@@ -153,11 +193,19 @@ function extractLineItems(content: RawContent): Record<string, unknown>[] {
         typeof val[0] === "object" &&
         val[0] !== null
       ) {
-        items.push(...(val as Record<string, unknown>[]));
+        const rows = val as Record<string, unknown>[];
+        const keys = rowKeySet(rows);
+        if (looksLikeTax(key, keys)) continue; // drop tax / GST-summary tables
+        if (hasProductSignal(keys)) productArrays.push(rows);
+        else otherArrays.push(rows);
       }
     }
   }
-  return items;
+
+  // Prefer arrays that clearly look like line items; only fall back to
+  // ambiguous (but non-tax) arrays if no product table was identified.
+  const chosen = productArrays.length > 0 ? productArrays : otherArrays;
+  return chosen.flat();
 }
 
 // Extract top-level scalar fields (strings/numbers) from the OCR output —
