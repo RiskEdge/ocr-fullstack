@@ -82,6 +82,10 @@ ALLOWED_EVENT_TYPES = {
     # Field correction hint interactions
     "field_correction_accepted",    # user clicked "Apply hint" — used remembered value
     "field_correction_overridden",  # user typed a different custom value instead
+    # Duplicate upload warnings
+    "duplicate_prompt_shown",       # duplicate dialog opened after a file select
+    "duplicate_proceeded",          # user chose to extract a known duplicate anyway
+    "duplicate_skipped",            # user removed a known duplicate from the selection
 }
 
 

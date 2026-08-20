@@ -22,6 +22,7 @@ from PIL import Image
 import io
 
 from app.db import get_supabase
+from app.documents import record_processed_documents
 
 
 class OCRProcessor:
@@ -30,7 +31,11 @@ class OCRProcessor:
 
     @staticmethod
     def calculate_cost(input_tokens: int, output_tokens: int, total_pages: int = 1) -> dict:
-        """Returns token counts, cost breakdown, and per-page metrics."""
+        """Returns token counts and USD cost breakdown.
+
+        Per-page figures here are API-cost metrics only — customer billing is a
+        flat 1 credit per document and never uses these.
+        """
         input_cost = (input_tokens / 1_000_000) * _INPUT_PRICE_PER_M
         output_cost = (output_tokens / 1_000_000) * _OUTPUT_PRICE_PER_M
         total_cost = input_cost + output_cost
@@ -173,7 +178,7 @@ class OCRProcessor:
         queue: asyncio.Queue = asyncio.Queue()
         total_files = len(files)
 
-        async def process_and_enqueue(content: bytes, filename: str, mime_type: str) -> None:
+        async def process_and_enqueue(index: int, content: bytes, filename: str, mime_type: str) -> None:
             try:
                 async with semaphore:
                     for attempt in range(_MAX_RETRIES + 1):
@@ -194,17 +199,19 @@ class OCRProcessor:
                         result = {**result, "message": "Processing failed. Please try again later."}
             except Exception as e:
                 result = {"filename": filename, "status": "error", "message": str(e)}
-            await queue.put(result)
+            # The index travels alongside the result so the consumer can map it
+            # back to the source bytes for duplicate-detection bookkeeping.
+            await queue.put((index, result))
 
         # Send a ping immediately to establish chunked transfer encoding.
         yield json.dumps({"type": "ping"}) + "\n"
 
         file_types: dict[str, int] = {}
         tasks = []
-        for content, filename, content_type in files:
+        for index, (content, filename, content_type) in enumerate(files):
             file_types[content_type] = file_types.get(content_type, 0) + 1
             tasks.append(asyncio.create_task(
-                process_and_enqueue(content, filename, content_type)
+                process_and_enqueue(index, content, filename, content_type)
             ))
 
         # Run-level accumulators
@@ -215,16 +222,25 @@ class OCRProcessor:
         run_output_tokens = 0
         run_total_pages = 0
         run_total_fields = 0
+        # Successfully processed files, recorded afterwards for duplicate detection
+        processed_docs: list[dict] = []
 
         # Yield each result as soon as it arrives in the queue
         for _ in range(total_files):
-            result = await queue.get()
+            index, result = await queue.get()
             if result.get("status") == "success":
                 run_successful += 1
                 tu = result.get("token_usage", {})
                 run_input_tokens += tu.get("input_tokens", 0)
                 run_output_tokens += tu.get("output_tokens", 0)
                 run_total_pages += tu.get("total_pages", 0)
+                src_bytes, src_filename, src_mime = files[index]
+                processed_docs.append({
+                    "file_bytes": src_bytes,
+                    "filename": src_filename,
+                    "mime_type": src_mime,
+                    "page_count": tu.get("total_pages"),
+                })
                 # Count extracted fields (top-level keys minus confidence_score)
                 for page in result.get("content", {}).get("pages", []):
                     run_total_fields += max(0, len(page.get("extracted_data", {})) - 1)
@@ -267,17 +283,31 @@ class OCRProcessor:
             "environment": _ENVIRONMENT,
             "credits_used": credits_used,
         }
+        run_id = None
         try:
             def _insert():
                 return get_supabase().table("processing_runs").insert(log_row).execute()
-            result = await asyncio.to_thread(_insert)
-            print(f"[run_log] inserted ok: {result}")
+            run_insert = await asyncio.to_thread(_insert)
+            inserted_rows = getattr(run_insert, "data", None) or []
+            if inserted_rows:
+                run_id = inserted_rows[0].get("id")
+            # print(f"[run_log] inserted ok: {run_insert}")
         except Exception as e:
             import traceback
             print(f"[run_log] FAILED: {e}")
             traceback.print_exc()
 
-        # Deduct 1 credit per page from the company balance
+        # Fingerprint every successful file so a later upload of the same bytes
+        # can be flagged before the user spends credits on it again. Failures
+        # here are swallowed — bookkeeping must not break the stream.
+        await record_processed_documents(
+            company_id=company_id,
+            user_id=user_id,
+            run_id=run_id,
+            documents=processed_docs,
+        )
+
+        # Deduct 1 credit per successful document from the company balance
         remaining_credits = None
         if credits_used > 0:
             try:
@@ -290,11 +320,11 @@ class OCRProcessor:
                     current_credits = row.data["credits"]
                     new_credits = max(0, current_credits - to_deduct)
                     update_result = db.table("companies").update({"credits": new_credits}).eq("id", cid).execute()
-                    print(f"[credits] update result: {update_result}")
+                    # print(f"[credits] update result: {update_result}")
                     return new_credits
 
                 remaining_credits = await asyncio.to_thread(_deduct_credits)
-                print(f"[credits] deducted {credits_used} (invoices), remaining: {remaining_credits}")
+                print(f"[credits] deducted {credits_used} (1/document), remaining: {remaining_credits}")
             except Exception as e:
                 import traceback
                 print(f"[credits] FAILED to deduct credits: {e}")

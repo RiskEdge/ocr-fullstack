@@ -22,6 +22,7 @@ from app.behavior import router as behavior_router
 from app.profiles import router as profiles_router, _aggregate_all
 from app.admin import router as admin_router
 from app.sync import router as sync_router
+from app.documents import router as documents_router
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
@@ -69,6 +70,7 @@ app.include_router(behavior_router)
 app.include_router(profiles_router)
 app.include_router(admin_router)
 app.include_router(sync_router)
+app.include_router(documents_router)
 
 class LoginRequest(BaseModel):
     company_name: Optional[str] = None
@@ -292,8 +294,9 @@ async def process_invoice_stream(
         )
 
     # Check company has at least 1 credit before processing.
-    # Exact page count is unknown upfront — the final per-page deduction
-    # happens after processing completes in stream_documents().
+    # Billing is 1 credit per successfully processed document regardless of
+    # page count; the deduction happens after processing completes in
+    # stream_documents(), once we know how many files actually succeeded.
     db = get_supabase()
     credits_result = (
         db.table("companies")

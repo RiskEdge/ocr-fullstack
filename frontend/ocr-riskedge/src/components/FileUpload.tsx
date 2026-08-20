@@ -1,5 +1,5 @@
 import { useCallback, useState } from "react";
-import { Upload, FileText, Image, File, X, Plus, ChevronDown, ChevronUp, AlertTriangle } from "lucide-react";
+import { Upload, FileText, Image, File, X, Plus, ChevronDown, ChevronUp, AlertTriangle, RefreshCw } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { ScrollArea, ScrollBar } from "@/components/ui/scroll-area";
@@ -23,9 +23,11 @@ interface FileUploadProps {
   onClear: () => void;
   onRemoveFile: (index: number) => void;
   fileStatuses?: Record<number, FileStatus>;
+  /** How many times this company has already processed each staged file. */
+  duplicateCounts?: Map<File, number>;
 }
 
-const FileUpload = ({ onFilesSelect, selectedFiles, onClear, onRemoveFile, fileStatuses = {} }: FileUploadProps) => {
+const FileUpload = ({ onFilesSelect, selectedFiles, onClear, onRemoveFile, fileStatuses = {}, duplicateCounts }: FileUploadProps) => {
   const [isDragging, setIsDragging] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
   const [rejectedFiles, setRejectedFiles] = useState<string[]>([]);
@@ -89,6 +91,22 @@ const FileUpload = ({ onFilesSelect, selectedFiles, onClear, onRemoveFile, fileS
     return (bytes / (1024 * 1024)).toFixed(1) + " MB";
   };
 
+  // Amber pill on files this company has processed before. Stays visible after
+  // the duplicate dialog is dismissed so the warning isn't a one-shot.
+  const renderDuplicateBadge = (file: File) => {
+    const count = duplicateCounts?.get(file);
+    if (!count) return null;
+    return (
+      <span
+        title={`Already processed ${count} time${count !== 1 ? "s" : ""} by your company`}
+        className="inline-flex items-center gap-0.5 shrink-0 text-[10px] font-medium text-warning bg-warning/10 border border-warning/30 rounded-full px-1.5 py-px"
+      >
+        <RefreshCw className="w-2.5 h-2.5" />
+        {count}×
+      </span>
+    );
+  };
+
   const renderFileCard = (file: File, index: number) => (
     <div
       key={`${file.name}-${index}`}
@@ -116,7 +134,10 @@ const FileUpload = ({ onFilesSelect, selectedFiles, onClear, onRemoveFile, fileS
         </div>
         <div className="min-w-0 flex-1">
           <p className="text-sm font-medium text-foreground truncate">{file.name}</p>
-          <p className="text-xs text-muted-foreground">{formatFileSize(file.size)}</p>
+          <div className="flex items-center gap-1.5">
+            <p className="text-xs text-muted-foreground">{formatFileSize(file.size)}</p>
+            {renderDuplicateBadge(file)}
+          </div>
         </div>
         <FileProcessingStatus status={fileStatuses[index] || "idle"} />
       </div>
@@ -229,7 +250,10 @@ const FileUpload = ({ onFilesSelect, selectedFiles, onClear, onRemoveFile, fileS
                     </div>
                     <div className="min-w-0 flex-1">
                       <p className="text-xs font-medium text-foreground truncate">{file.name}</p>
-                      <p className="text-xs text-muted-foreground">{formatFileSize(file.size)}</p>
+                      <div className="flex items-center gap-1.5">
+                        <p className="text-xs text-muted-foreground">{formatFileSize(file.size)}</p>
+                        {renderDuplicateBadge(file)}
+                      </div>
                     </div>
                     <FileProcessingStatus status={fileStatuses[index] || "idle"} />
                   </div>

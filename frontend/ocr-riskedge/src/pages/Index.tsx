@@ -1,4 +1,5 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { toast } from "sonner";
 import api from "@/lib/api";
 import Header from "@/components/Header";
 import FileUpload from "@/components/FileUpload";
@@ -17,6 +18,10 @@ import DocumentGridView from "@/components/DocumentGridView";
 import ValidationResults from "@/components/ValidationResults";
 import { validateItems } from "@/lib/validateApi";
 import type { ValidatedItem } from "@/lib/validateApi";
+import DuplicateWarningDialog, { DuplicateFile, DuplicateDialogMode } from "@/components/DuplicateWarningDialog";
+import { checkDuplicates, DuplicateEntry } from "@/lib/duplicateApi";
+import { hashFiles, isHashingSupported } from "@/lib/fileHash";
+import { track } from "@/lib/behaviorTracker";
 
 // ---------------------------------------------------------------------------
 // Session-storage persistence for processing history
@@ -228,7 +233,7 @@ function extractDocumentScalars(content: RawContent): Record<string, unknown> {
 // ---------------------------------------------------------------------------
 
 const Index = () => {
-  const { token, credits, setCredits, refreshCredits } = useAuth();
+  const { user, token, credits, setCredits, refreshCredits } = useAuth();
 
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [previewUrls, setPreviewUrls] = useState<string[]>([]);
@@ -252,6 +257,30 @@ const Index = () => {
   const [validationState, setValidationState] = useState<"idle" | "validating" | "done">("idle");
   const [validationByFile, setValidationByFile] = useState<Record<number, ValidatedItem[]>>({});
   const [dataPanelFullscreen, setDataPanelFullscreen] = useState(false);
+  // Duplicate detection — populated on file select, before Extract is usable
+  const [duplicateInfo, setDuplicateInfo] = useState<Map<File, DuplicateEntry>>(new Map());
+  const [pendingDuplicates, setPendingDuplicates] = useState<DuplicateFile[]>([]);
+  const [duplicateDialogOpen, setDuplicateDialogOpen] = useState(false);
+  const [duplicateCheckState, setDuplicateCheckState] = useState<"idle" | "checking">("idle");
+  const [duplicateLookbackDays, setDuplicateLookbackDays] = useState(120);
+  const [duplicateDialogMode, setDuplicateDialogMode] = useState<DuplicateDialogMode>("select");
+  /** Files in the dialog's scope that aren't duplicates — shown as context. */
+  const [duplicateOtherCount, setDuplicateOtherCount] = useState(0);
+  /** Set once the user confirms a re-extract, so the run starts after the
+   *  removals have been committed to state. */
+  const [pendingExtract, setPendingExtract] = useState(false);
+  /** SHA-256 per staged file — not rendered, so a ref rather than state. */
+  const fileHashesRef = useRef<Map<File, string>>(new Map());
+  /** Live mirror of selectedFiles, readable from async callbacks. */
+  const selectionRef = useRef<File[]>([]);
+  /** Preview URL per file, so previewUrls can be rebuilt from the selection. */
+  const fileUrlsRef = useRef<Map<File, string>>(new Map());
+  /**
+   * Files already extracted in this session. The server row only lands after a
+   * run finishes, so a second Extract on the same staged file (via Re-process,
+   * or just clicking Extract twice) would otherwise spend credits unwarned.
+   */
+  const sessionProcessedRef = useRef<Map<File, { at: Date; pages: number }>>(new Map());
 
   // Ref that mirrors history in sessionStorage (serialisable format)
   const storedItemsRef = useRef<StoredHistoryItem[]>(loadHistoryFromStorage());
@@ -289,30 +318,191 @@ const Index = () => {
   const currentFile = selectedFiles[activeFileIndex] || null;
   const currentPreviewUrl = previewUrls[activeFileIndex] || null;
 
-  const handleFilesSelect = (files: File[]) => {
-    const newUrls = files.map((file) => URL.createObjectURL(file));
-    setSelectedFiles((prev) => [...prev, ...files]);
-    setPreviewUrls((prev) => [...prev, ...newUrls]);
+  /**
+   * The selection is mirrored in refs so async callbacks (the duplicate check
+   * resolves well after the files were staged) can mutate it without reading a
+   * stale render closure. previewUrls is always derived from selectedFiles, so
+   * the two arrays can never drift out of alignment.
+   */
+  const applySelection = useCallback((files: File[]) => {
+    selectionRef.current = files;
+    setSelectedFiles(files);
+    setPreviewUrls(files.map((file) => fileUrlsRef.current.get(file) ?? ""));
+  }, []);
+
+  /** Drop a set of files from the selection, keeping the active preview put. */
+  const removeFiles = useCallback((toRemove: File[]) => {
+    if (toRemove.length === 0) return;
+    const removeSet = new Set(toRemove);
+    const previous = selectionRef.current;
+    const kept = previous.filter((file) => !removeSet.has(file));
+    if (kept.length === previous.length) return;
+
+    removeSet.forEach((file) => {
+      const url = fileUrlsRef.current.get(file);
+      if (url && url.startsWith("blob:")) URL.revokeObjectURL(url);
+      fileUrlsRef.current.delete(file);
+      fileHashesRef.current.delete(file);
+      sessionProcessedRef.current.delete(file);
+    });
+
+    setActiveFileIndex((prev) => {
+      const removedBefore = previous.slice(0, prev).filter((f) => removeSet.has(f)).length;
+      return Math.max(0, Math.min(prev - removedBefore, kept.length - 1));
+    });
+    setDuplicateInfo((prev) => {
+      const next = new Map(prev);
+      removeSet.forEach((file) => next.delete(file));
+      return next;
+    });
+    applySelection(kept);
+  }, [applySelection]);
+
+  /**
+   * Fingerprint newly staged files and ask the backend whether this company has
+   * processed them before. Runs on select — never on Extract — so the user has
+   * already decided about every duplicate by the time they can start a run.
+   */
+  const runDuplicateCheck = useCallback(async (files: File[]) => {
+    if (!token || files.length === 0 || !isHashingSupported()) return;
+
+    setDuplicateCheckState("checking");
+    try {
+      const hashes = await hashFiles(files);
+
+      // The same bytes staged twice in one selection — drop the extra copies
+      // locally rather than warning about a file the user can already see.
+      const staged = new Set(fileHashesRef.current.values());
+      const inSelectionRepeats: File[] = [];
+      const fresh: File[] = [];
+      for (const file of files) {
+        const hash = hashes.get(file);
+        if (!hash) continue;  // unreadable — leave it alone, it just isn't checked
+        if (staged.has(hash)) {
+          inSelectionRepeats.push(file);
+          continue;
+        }
+        staged.add(hash);
+        fileHashesRef.current.set(file, hash);
+        fresh.push(file);
+      }
+
+      if (inSelectionRepeats.length > 0) {
+        removeFiles(inSelectionRepeats);
+        toast.info(
+          inSelectionRepeats.length === 1
+            ? "That file was already in this batch — the duplicate copy was removed."
+            : `${inSelectionRepeats.length} files were already in this batch — the duplicate copies were removed.`
+        );
+      }
+
+      if (fresh.length === 0) return;
+
+      const response = await checkDuplicates(
+        fresh.map((file) => ({
+          filename: file.name,
+          sha256: fileHashesRef.current.get(file) as string,
+          size: file.size,
+        })),
+        token,
+      );
+      setDuplicateLookbackDays(response.lookback_days);
+
+      const byHash = new Map(response.duplicates.map((entry) => [entry.file_hash, entry]));
+      const found: DuplicateFile[] = [];
+      for (const file of fresh) {
+        const entry = byHash.get(fileHashesRef.current.get(file) as string);
+        if (entry) found.push({ file, info: entry });
+      }
+      if (found.length === 0) return;
+
+      setDuplicateInfo((prev) => {
+        const next = new Map(prev);
+        found.forEach(({ file, info }) => next.set(file, info));
+        return next;
+      });
+      setPendingDuplicates(found);
+      setDuplicateOtherCount(Math.max(0, selectionRef.current.length - found.length));
+      setDuplicateDialogMode("select");
+      setDuplicateDialogOpen(true);
+      track("duplicate_prompt_shown", {
+        duplicate_count: found.length,
+        batch_size: fresh.length,
+        trigger: "select",
+      });
+    } catch (error) {
+      // A failed check must never block extraction, but it shouldn't vanish
+      // without trace either — a 404 here means the backend predates the
+      // /v1/duplicate-check route and needs a restart.
+      console.warn("[duplicate-check] skipped:", error);
+    } finally {
+      setDuplicateCheckState("idle");
+    }
+  }, [token, removeFiles]);
+
+  const handleFilesSelect = useCallback((files: File[]) => {
+    files.forEach((file) => {
+      if (!fileUrlsRef.current.has(file)) {
+        fileUrlsRef.current.set(file, URL.createObjectURL(file));
+      }
+    });
+    applySelection([...selectionRef.current, ...files]);
     setProcessingState("idle");
     setExtractedData([]);
     setFileStatuses({});
     setCompletedCount(0);
     setSelectedHistoryId(null);
-  };
+    void runDuplicateCheck(files);
+  }, [applySelection, runDuplicateCheck]);
 
-  const handleRemoveFile = (index: number) => {
-    URL.revokeObjectURL(previewUrls[index]);
-    setSelectedFiles((prev) => prev.filter((_, i) => i !== index));
-    setPreviewUrls((prev) => prev.filter((_, i) => i !== index));
-    if (activeFileIndex >= index && activeFileIndex > 0) {
-      setActiveFileIndex(activeFileIndex - 1);
+  const handleRemoveFile = useCallback((index: number) => {
+    const file = selectionRef.current[index];
+    if (file) removeFiles([file]);
+  }, [removeFiles]);
+
+  /** Apply the user's choices from the duplicate dialog. */
+  const handleDuplicateResolve = useCallback((filesToRemove: File[]) => {
+    const keptCount = pendingDuplicates.length - filesToRemove.length;
+    const remaining = selectionRef.current.length - filesToRemove.length;
+    if (filesToRemove.length > 0) {
+      removeFiles(filesToRemove);
+      track("duplicate_skipped", { count: filesToRemove.length, mode: duplicateDialogMode });
     }
-  };
+    if (keptCount > 0) {
+      track("duplicate_proceeded", { count: keptCount, mode: duplicateDialogMode });
+    }
+    setDuplicateDialogOpen(false);
+    setPendingDuplicates([]);
+    // Confirming an extract-time warning starts the run. It's deferred to an
+    // effect so the removals above are committed before handleExtract reads
+    // the selection.
+    if (duplicateDialogMode === "extract" && remaining > 0) {
+      setPendingExtract(true);
+    }
+  }, [pendingDuplicates, removeFiles, duplicateDialogMode]);
+
+  /** Backed out of the dialog — nothing removed, and no run started. */
+  const handleDuplicateDismiss = useCallback(() => {
+    track("duplicate_proceeded", {
+      count: pendingDuplicates.length,
+      dismissed: true,
+      mode: duplicateDialogMode,
+    });
+    setDuplicateDialogOpen(false);
+    setPendingDuplicates([]);
+  }, [pendingDuplicates, duplicateDialogMode]);
 
   const handleClearFiles = () => {
-    previewUrls.forEach((url) => URL.revokeObjectURL(url));
-    setSelectedFiles([]);
-    setPreviewUrls([]);
+    fileUrlsRef.current.forEach((url) => {
+      if (url.startsWith("blob:")) URL.revokeObjectURL(url);
+    });
+    fileUrlsRef.current.clear();
+    fileHashesRef.current.clear();
+    sessionProcessedRef.current.clear();
+    setDuplicateInfo(new Map());
+    setPendingDuplicates([]);
+    setDuplicateDialogOpen(false);
+    applySelection([]);
     setActiveFileIndex(0);
     setProcessingState("idle");
     setExtractedData([]);
@@ -330,8 +520,15 @@ const Index = () => {
   };
 
   const handleHistorySelect = (item: HistoryItem) => {
-    setSelectedFiles([item.file]);
-    setPreviewUrls([item.previewUrl]);
+    // Restored history replaces the selection outright — reset the duplicate
+    // state with it, since those warnings belong to the files being dropped.
+    fileHashesRef.current.clear();
+    sessionProcessedRef.current.clear();
+    setDuplicateInfo(new Map());
+    setPendingDuplicates([]);
+    setDuplicateDialogOpen(false);
+    fileUrlsRef.current.set(item.file, item.previewUrl);
+    applySelection([item.file]);
     setActiveFileIndex(0);
     setProcessingState("completed");
     setCompletedCount(1);
@@ -370,17 +567,59 @@ const Index = () => {
     }
   };
 
-  const handleExtract = useCallback(async () => {
-    if (selectedFiles.length === 0 || !token) return;
+  /**
+   * Describe a file already extracted in this session as a duplicate entry, so
+   * the same dialog can present it. Merges in the server-side history when the
+   * file was also processed on an earlier day.
+   */
+  const buildSessionEntry = useCallback((file: File): DuplicateEntry => {
+    const server = duplicateInfo.get(file);
+    const session = sessionProcessedRef.current.get(file);
+    const at = (session?.at ?? new Date()).toISOString();
+    return {
+      file_hash: fileHashesRef.current.get(file) ?? "",
+      count: (server?.count ?? 0) + 1,
+      first_seen_at: server?.first_seen_at ?? at,
+      last_seen_at: at,
+      last_filename: file.name,
+      last_user: user?.username ?? null,
+      first_user: server?.first_user ?? user?.username ?? null,
+      page_count: session?.pages ?? server?.page_count ?? null,
+    };
+  }, [duplicateInfo, user]);
 
-    const filesToProcess = processingMode === "single" ? 1 : selectedFiles.length;
+  const handleExtract = useCallback(async (options?: { skipDuplicateGuard?: boolean }) => {
+    if (selectionRef.current.length === 0 || !token) return;
+
+    const selection = selectionRef.current;
+    const filesToProcess = processingMode === "single" ? 1 : selection.length;
     const startIndex = processingMode === "single" ? activeFileIndex : 0;
-    const filesToSend = selectedFiles.slice(startIndex, startIndex + filesToProcess);
+    const filesToSend = selection.slice(startIndex, startIndex + filesToProcess);
 
-    // Block if company has zero credits (exact page cost is unknown upfront)
+    // Block if company has zero credits (1 credit per document is charged
+    // after the run, once we know which files succeeded)
     if (credits !== null && credits < 1) {
       alert("No credits remaining. Please contact support to top up your balance.");
       return;
+    }
+
+    // Re-extracting a file already processed in this session costs another
+    // credit and yields the same data — confirm before spending it. The server
+    // row for this run doesn't exist yet, so this check has to be local.
+    if (!options?.skipDuplicateGuard) {
+      const repeats = filesToSend.filter((file) => sessionProcessedRef.current.has(file));
+      if (repeats.length > 0) {
+        setPendingDuplicates(repeats.map((file) => ({ file, info: buildSessionEntry(file) })));
+        setDuplicateOtherCount(Math.max(0, filesToSend.length - repeats.length));
+        setDuplicateDialogMode("extract");
+        setDuplicateDialogOpen(true);
+        track("duplicate_prompt_shown", {
+          duplicate_count: repeats.length,
+          batch_size: filesToSend.length,
+          trigger: "extract",
+        });
+        return;
+      }
     }
 
     // Build FormData
@@ -434,6 +673,10 @@ const Index = () => {
 
           if (result.status === "success") {
             const { data, totalPages } = transformOCRResult(result.content);
+            const succeeded = fileIndex === -1 ? filesToSend[doneCount] : filesToSend[fileIndex];
+            if (succeeded) {
+              sessionProcessedRef.current.set(succeeded, { at: new Date(), pages: totalPages });
+            }
             dataByFile[absoluteIndex] = data;
             pagesByFile[absoluteIndex] = totalPages;
             setFileStatuses((prev) => ({ ...prev, [absoluteIndex]: "completed" }));
@@ -544,7 +787,7 @@ const Index = () => {
       setFileStatuses(errorStatuses);
       setProcessingState("completed");
     }
-  }, [selectedFiles, previewUrls, token, credits, setCredits, refreshCredits, processingMode, activeFileIndex, selectedHistoryId]);
+  }, [previewUrls, token, credits, setCredits, refreshCredits, processingMode, activeFileIndex, selectedHistoryId, buildSessionEntry]);
 
   const handleValidate = useCallback(async () => {
     if (!token) return;
@@ -606,11 +849,34 @@ const Index = () => {
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Runs the extraction the user confirmed in an extract-mode dialog, after
+  // the render that applied their removals.
+  useEffect(() => {
+    if (!pendingExtract) return;
+    setPendingExtract(false);
+    void handleExtract({ skipDuplicateGuard: true });
+  }, [pendingExtract, handleExtract]);
+
   const hasFiles = selectedFiles.length > 0;
+  const duplicateCounts = useMemo(() => {
+    const counts = new Map<File, number>();
+    duplicateInfo.forEach((info, file) => counts.set(file, info.count));
+    return counts;
+  }, [duplicateInfo]);
 
   return (
     <div className="min-h-screen bg-background">
       <Header />
+
+      <DuplicateWarningDialog
+        open={duplicateDialogOpen}
+        mode={duplicateDialogMode}
+        duplicates={pendingDuplicates}
+        otherFileCount={duplicateOtherCount}
+        lookbackDays={duplicateLookbackDays}
+        onResolve={handleDuplicateResolve}
+        onDismiss={handleDuplicateDismiss}
+      />
 
       <main className="container mx-auto px-4 py-6">
         <div className="flex gap-6">
@@ -670,6 +936,7 @@ const Index = () => {
                 onClear={handleClearFiles}
                 onRemoveFile={handleRemoveFile}
                 fileStatuses={fileStatuses}
+                duplicateCounts={duplicateCounts}
               />
             </div>
 
@@ -760,13 +1027,27 @@ const Index = () => {
                       </Button>
                     )}
                     <Button
-                      onClick={handleExtract}
-                      disabled={processingState === "processing" || (credits !== null && credits < 1)}
-                      title={credits !== null && credits < 1 ? "No credits remaining" : undefined}
+                      onClick={() => handleExtract()}
+                      disabled={
+                        processingState === "processing" ||
+                        duplicateCheckState === "checking" ||
+                        (credits !== null && credits < 1)
+                      }
+                      title={
+                        credits !== null && credits < 1
+                          ? "No credits remaining"
+                          : duplicateCheckState === "checking"
+                          ? "Checking for files already processed"
+                          : undefined
+                      }
                       className="gap-2 flex-1 sm:flex-none"
                     >
                       <Sparkles className="w-4 h-4" />
-                      {processingMode === "single" ? "Extract Current" : `Extract All (${selectedFiles.length})`}
+                      {duplicateCheckState === "checking"
+                        ? "Checking files..."
+                        : processingMode === "single"
+                        ? "Extract Current"
+                        : `Extract All (${selectedFiles.length})`}
                     </Button>
                     <ExportButtons data={extractedData} disabled={!extractedData.some(r => r.kind === "data")} filename={currentFile?.name} />
                     <DownloadAllButton dataByFile={extractedDataByFile} files={selectedFiles} />
