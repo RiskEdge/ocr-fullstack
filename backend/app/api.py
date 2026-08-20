@@ -254,6 +254,19 @@ async def get_credits(current_user: TokenData = Depends(get_current_user)):
     return {"credits": result.data["credits"]}
 
 
+# Accepted upload formats for OCR — mirrors the client-side guard in
+# frontend/ocr-riskedge/src/components/FileUpload.tsx.
+IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff", "heic", "heif"}
+
+
+def _is_supported_upload(filename: str | None, content_type: str | None) -> bool:
+    if content_type and content_type != "application/octet-stream":
+        return content_type.startswith("image/") or content_type == "application/pdf"
+    # Some clients omit or genericise the MIME type — fall back to the extension.
+    ext = filename.rsplit(".", 1)[-1].lower() if filename and "." in filename else ""
+    return ext == "pdf" or ext in IMAGE_EXTENSIONS
+
+
 @app.post("/v1/process-invoice")
 async def process_invoice_stream(
     files: List[UploadFile] = File(...),
@@ -262,6 +275,21 @@ async def process_invoice_stream(
 
     if len(files) > 100:
         raise HTTPException(status_code=400, detail="Maximum of 100 files allowed.")
+
+    # Reject before any file read, credit check or Gemini call.
+    unsupported = [
+        file.filename or "(unnamed file)"
+        for file in files
+        if not _is_supported_upload(file.filename, file.content_type)
+    ]
+    if unsupported:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Only image and PDF files can be processed. Unsupported: "
+                + ", ".join(unsupported)
+            ),
+        )
 
     # Check company has at least 1 credit before processing.
     # Exact page count is unknown upfront — the final per-page deduction

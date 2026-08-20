@@ -1078,7 +1078,7 @@ async def admin_product_catalog(
             db.table("product_catalog")
             .select(
                 "id, sku_code, plu_code, sku_description, ean_code, "
-                "cost_price, mrp, gst_percent, priority, status, uom, synced_at",
+                "cost_price, mrp, gst_percent, priority, status, uom, uom_qty, synced_at",
                 count="exact",
             )
         )

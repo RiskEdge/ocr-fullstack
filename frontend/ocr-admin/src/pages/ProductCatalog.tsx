@@ -26,6 +26,7 @@ const COLUMNS: { key: keyof CatalogItem | '_row'; label: string }[] = [
   { key: 'cost_price',      label: 'Cost Price'  },
   { key: 'gst_percent',     label: 'GST %'       },
   { key: 'uom',             label: 'UoM'         },
+  { key: 'uom_qty',         label: 'UoM Qty'     },
   { key: 'status',          label: 'Status'      },
   { key: 'synced_at',       label: 'Synced'      },
 ]

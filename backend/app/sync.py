@@ -5,6 +5,9 @@ POST /v1/sync/master-data
   Client ERP/POS systems push their product catalog into product_catalog.
   Auth: Authorization: Bearer <sync_secret> header + client_code in request body.
   No JWT — this is a separate M2M credential issued per company.
+
+POST /v1/sync/master-data/upload
+  Same thing from a .csv/.json file (multipart). Both endpoints share _run_sync().
 """
 
 import asyncio
@@ -13,7 +16,6 @@ import io
 import json
 import os
 import time
-from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -29,7 +31,7 @@ _pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
 # ---------------------------------------------------------------------------
 # Column-name normalisation
 # Maps normalised key → canonical product_catalog column name.
-# _norm() lowercases and strips spaces, underscores, and dots so that
+# _norm_key() lowercases and strips spaces, underscores, and dots so that
 # "Sku Description", "sku_description", "SKU_DESC", "sku_descri" all resolve.
 # ---------------------------------------------------------------------------
 _COLUMN_MAP: dict[str, str] = {
@@ -65,6 +67,8 @@ _COLUMN_MAP: dict[str, str] = {
     # Other fields
     "priority":            "priority",
     "uom":                 "uom",
+    "uomqty":              "uom_qty",
+    "uomquantity":         "uom_qty",
     "hsncode":             "hsn_code",
     "hsn":                 "hsn_code",
     "lastupdated":         "last_updated",
@@ -72,28 +76,29 @@ _COLUMN_MAP: dict[str, str] = {
     "status":              "status",
 }
 
-_CANONICAL = {
-    "plu_code", "sku_code", "sku_description", "sku_short_description",
-    "gst_percent", "ean_code", "basic_price", "cost_price", "mrp", "sale_price",
-    "priority", "uom", "hsn_code", "last_updated", "status",
-}
-
 _SYNC_MAX_MB = int(os.environ.get("SYNC_MAX_PAYLOAD_MB", "5"))
+_MAX_BYTES = _SYNC_MAX_MB * 1024 * 1024
 _CHUNK = 500
+_MODES = ("upsert", "replace")
 
 # ---------------------------------------------------------------------------
 # Per-IP rate limiting for failed auth attempts (in-memory)
 # Limits brute-force attacks without requiring an external cache.
 # ---------------------------------------------------------------------------
-_fail_timestamps: dict[str, list[float]] = defaultdict(list)
+_fail_timestamps: dict[str, list[float]] = {}
 _FAIL_WINDOW = 600   # 10 minutes
 _FAIL_MAX = 5
 
 
 def _check_rate_limit(ip: str) -> None:
     now = time.monotonic()
-    recent = [t for t in _fail_timestamps[ip] if now - t < _FAIL_WINDOW]
-    _fail_timestamps[ip] = recent
+    recent = [t for t in _fail_timestamps.get(ip, []) if now - t < _FAIL_WINDOW]
+    # Drop the key entirely once an IP has no recent failures, so the map does
+    # not keep one permanent entry per IP that ever called the endpoint.
+    if recent:
+        _fail_timestamps[ip] = recent
+    else:
+        _fail_timestamps.pop(ip, None)
     if len(recent) >= _FAIL_MAX:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -102,17 +107,36 @@ def _check_rate_limit(ip: str) -> None:
 
 
 def _record_fail(ip: str) -> None:
-    _fail_timestamps[ip].append(time.monotonic())
+    _fail_timestamps.setdefault(ip, []).append(time.monotonic())
 
 
 # ---------------------------------------------------------------------------
-# Request model
+# Request model + shared request plumbing
 # ---------------------------------------------------------------------------
 
 class SyncRequest(BaseModel):
     client_code: str
     mode: str = "upsert"
     products: list[dict]
+
+
+def _validate_mode(mode: str) -> None:
+    if mode not in _MODES:
+        raise HTTPException(status_code=400, detail="mode must be 'upsert' or 'replace'.")
+
+
+def _extract_bearer(authorization: Optional[str]) -> str:
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authorization header with Bearer token is required.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return authorization[7:].strip()
+
+
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +154,19 @@ def _to_float(val: object) -> Optional[float]:
         return None
 
 
+def _to_int(val: object) -> Optional[int]:
+    f = _to_float(val)
+    return int(f) if f is not None else None
+
+
+def _clean_str(val: object) -> Optional[str]:
+    """Trimmed string, or None for null/blank."""
+    if val is None:
+        return None
+    s = str(val).strip()
+    return s or None
+
+
 def _ean_str(val: object) -> Optional[str]:
     """Convert 8901234567890.0 → '8901234567890'."""
     if val is None:
@@ -137,15 +174,12 @@ def _ean_str(val: object) -> Optional[str]:
     try:
         return str(int(float(str(val))))
     except (ValueError, TypeError):
-        s = str(val).strip()
-        return s or None
+        return _clean_str(val)
 
 
 def _plu_str(val: object) -> Optional[str]:
     """Preserve leading zeros in PLU codes; only strip a float .0 suffix."""
-    if val is None:
-        return None
-    s = str(val).strip()
+    s = _clean_str(val)
     if not s:
         return None
     # Strip float suffix only when the whole value is a plain float (e.g. "101.0")
@@ -154,51 +188,188 @@ def _plu_str(val: object) -> Optional[str]:
     return s
 
 
-def _normalize_product(raw: dict, company_id: str) -> tuple[Optional[dict], int]:
+def _normalize_product(raw: dict, company_id: str) -> Optional[dict]:
     """
     Map ERP field names to product_catalog column names.
     Unknown keys are stored in extra_data (no data lost, no migration needed).
-    Returns (db_record, 0) on success, (None, 1) when plu_code is missing.
+    Returns None when plu_code is missing — the caller counts it as skipped.
     """
     normalised: dict[str, object] = {}
     extra: dict[str, object] = {}
 
     for k, v in raw.items():
-        canonical = _COLUMN_MAP.get(_norm_key(k))
+        # csv.DictReader files surplus columns under a None key; coerce so the
+        # key is always a str (extra_data is stored as JSON).
+        key = str(k) if k is not None else "_unnamed"
+        canonical = _COLUMN_MAP.get(_norm_key(key))
         if canonical:
             normalised[canonical] = v
         else:
-            extra[k] = v
+            extra[key] = v
 
     plu = _plu_str(normalised.get("plu_code"))
     if not plu:
-        return None, 1
+        return None
 
-    record: dict = {
+    # priority: keep an explicit 0; only fall back to 1 when absent/unparseable.
+    priority = _to_float(normalised.get("priority"))
+    # status: "" and None must not raise on [0] or stringify to "N".
+    item_status = _clean_str(normalised.get("status")) or "0"
+
+    return {
         "company_id":            company_id,
         "plu_code":              plu,
-        "sku_code":              str(normalised["sku_code"]).strip() if normalised.get("sku_code") else None,
-        "sku_description":       str(normalised["sku_description"]).strip() if normalised.get("sku_description") else None,
-        "sku_short_description": str(normalised["sku_short_description"]).strip() if normalised.get("sku_short_description") else None,
+        "sku_code":              _clean_str(normalised.get("sku_code")),
+        "sku_description":       _clean_str(normalised.get("sku_description")),
+        "sku_short_description": _clean_str(normalised.get("sku_short_description")),
         "gst_percent":           _to_float(normalised.get("gst_percent")),
         "ean_code":              _ean_str(normalised.get("ean_code")),
         "basic_price":           _to_float(normalised.get("basic_price")),
         "cost_price":            _to_float(normalised.get("cost_price")),
         "mrp":                   _to_float(normalised.get("mrp")),
         "sale_price":            _to_float(normalised.get("sale_price")),
-        "priority":              int(_to_float(normalised.get("priority")) or 1),
-        "uom":                   str(normalised["uom"]).strip() if normalised.get("uom") else None,
-        "hsn_code":              str(normalised["hsn_code"]).strip() if normalised.get("hsn_code") else None,
-        "last_updated":          str(normalised["last_updated"]) if normalised.get("last_updated") else None,
-        "status":                str(normalised.get("status", "0"))[0],  # keep first char only
+        "priority":              int(priority) if priority is not None else 1,
+        "uom":                   _clean_str(normalised.get("uom")),
+        "uom_qty":               _to_int(normalised.get("uom_qty")),
+        "hsn_code":              _clean_str(normalised.get("hsn_code")),
+        "last_updated":          _clean_str(normalised.get("last_updated")),
+        "status":                item_status[0],  # keep first char only
         "extra_data":            extra,
         "synced_at":             datetime.now(timezone.utc).isoformat(),
     }
-    return record, 0
 
 
 # ---------------------------------------------------------------------------
-# Endpoint
+# Shared auth + sync worker
+# Both endpoints funnel into this. Fully synchronous (the Supabase client
+# blocks), so callers run it via asyncio.to_thread.
+# ---------------------------------------------------------------------------
+
+def _run_sync(req: SyncRequest, sync_secret: str, client_ip: str) -> dict:
+    db = get_supabase()
+
+    company_res = (
+        db.table("companies")
+        .select("id, sync_api_key, sync_allowed_ips")
+        .eq("client_code", req.client_code)
+        .execute()
+    )
+    company = company_res.data[0] if company_res.data else None
+
+    # Generic 401 when client_code not found — never reveal whether code exists
+    if not company:
+        _record_fail(client_ip)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid client_code or sync secret.",
+        )
+
+    # The 403s below stay more specific than the 401 on purpose — they are the
+    # errors a legitimate client has to act on. Every failure path records a
+    # rate-limit strike, so the difference cannot be used to enumerate codes.
+
+    # 403 when company exists but no sync key has been issued yet
+    if not company.get("sync_api_key"):
+        _record_fail(client_ip)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Sync is not enabled for this company. Contact your administrator.",
+        )
+
+    # Optional IP whitelist check
+    allowed_ips = company.get("sync_allowed_ips")
+    if allowed_ips and client_ip not in allowed_ips:
+        _record_fail(client_ip)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Request IP is not whitelisted for this company.",
+        )
+
+    # bcrypt verify — generic 401 on mismatch
+    if not _pwd.verify(sync_secret, company["sync_api_key"]):
+        _record_fail(client_ip)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid client_code or sync secret.",
+        )
+
+    company_id = company["id"]
+
+    # Fetch last successful sync time before running the current one
+    last_log = (
+        db.table("master_sync_logs")
+        .select("triggered_at")
+        .eq("company_id", company_id)
+        .eq("status", "success")
+        .order("triggered_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    last_synced_at = last_log.data[0]["triggered_at"] if last_log.data else None
+
+    # Normalise products; collect valid records and count skipped
+    records: list[dict] = []
+    skipped = 0
+    for raw in req.products:
+        rec = _normalize_product(raw, company_id)
+        if rec is None:
+            skipped += 1
+        else:
+            records.append(rec)
+
+    triggered_at = datetime.now(timezone.utc)
+    synced = 0
+
+    try:
+        if req.mode == "replace":
+            db.table("product_catalog").delete().eq("company_id", company_id).execute()
+
+        for i in range(0, len(records), _CHUNK):
+            chunk = records[i : i + _CHUNK]
+            db.table("product_catalog").upsert(
+                chunk, on_conflict="company_id,plu_code"
+            ).execute()
+            synced += len(chunk)
+
+        db.table("master_sync_logs").insert({
+            "company_id":      company_id,
+            "mode":            req.mode,
+            "records_synced":  synced,
+            "records_skipped": skipped,
+            "status":          "success",
+            "triggered_at":    triggered_at.isoformat(),
+        }).execute()
+
+        return {
+            "status":          "success",
+            "mode":            req.mode,
+            "records_synced":  synced,
+            "records_skipped": skipped,
+            "triggered_at":    triggered_at.isoformat(),
+            "last_synced_at":  last_synced_at,
+        }
+
+    except Exception as exc:
+        # `synced` is the count that actually committed. Neither mode is
+        # transactional, so a mid-run failure in "replace" can leave the
+        # catalog partially written — log the real number, not 0.
+        try:
+            db.table("master_sync_logs").insert({
+                "company_id":      company_id,
+                "mode":            req.mode,
+                "records_synced":  synced,
+                "records_skipped": skipped,
+                "status":          "error",
+                "error_message":   str(exc)[:500],
+                "triggered_at":    triggered_at.isoformat(),
+            }).execute()
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail="Sync failed due to an internal error.")
+
+
+# ---------------------------------------------------------------------------
+# Endpoint — JSON body
 # ---------------------------------------------------------------------------
 
 @router.post("/v1/sync/master-data")
@@ -209,147 +380,23 @@ async def sync_master_data(
 ):
     # Payload size guard — checked before any DB work
     content_length = request.headers.get("content-length")
-    if content_length and int(content_length) > _SYNC_MAX_MB * 1024 * 1024:
+    if content_length and content_length.isdigit() and int(content_length) > _MAX_BYTES:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             detail=f"Payload exceeds {_SYNC_MAX_MB} MB limit.",
         )
 
-    if req.mode not in ("upsert", "replace"):
-        raise HTTPException(status_code=400, detail="mode must be 'upsert' or 'replace'.")
+    _validate_mode(req.mode)
+    sync_secret = _extract_bearer(authorization)
 
-    # Extract Bearer token from Authorization header
-    if not authorization or not authorization.lower().startswith("bearer "):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Authorization header with Bearer token is required.",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    sync_secret = authorization[7:].strip()  # strip "Bearer "
-
-    client_ip = request.client.host if request.client else "unknown"
+    client_ip = _client_ip(request)
     _check_rate_limit(client_ip)
 
-    def _auth_and_sync() -> dict:
-        db = get_supabase()
-
-        # Look up company by client_code
-        company_res = (
-            db.table("companies")
-            .select("id, sync_api_key, sync_allowed_ips")
-            .eq("client_code", req.client_code)
-            .execute()
-        )
-        company = company_res.data[0] if company_res.data else None
-
-        # Generic 401 when client_code not found — never reveal whether code exists
-        if not company:
-            _record_fail(client_ip)
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid client_code or sync secret.",
-            )
-
-        # 403 when company exists but no sync key has been issued yet
-        if not company.get("sync_api_key"):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Sync is not enabled for this company. Contact your administrator.",
-            )
-
-        # Optional IP whitelist check
-        allowed_ips = company.get("sync_allowed_ips")
-        if allowed_ips and client_ip not in allowed_ips:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Request IP is not whitelisted for this company.",
-            )
-
-        # bcrypt verify — generic 401 on mismatch
-        if not _pwd.verify(sync_secret, company["sync_api_key"]):
-            _record_fail(client_ip)
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid client_code or sync secret.",
-            )
-
-        company_id = company["id"]
-
-        # Fetch last successful sync time before running the current one
-        last_log = (
-            db.table("master_sync_logs")
-            .select("triggered_at")
-            .eq("company_id", company_id)
-            .eq("status", "success")
-            .order("triggered_at", desc=True)
-            .limit(1)
-            .execute()
-        )
-        last_synced_at = last_log.data[0]["triggered_at"] if last_log.data else None
-
-        # Normalise products; collect valid records and count skipped
-        records: list[dict] = []
-        skipped = 0
-        for raw in req.products:
-            rec, skip = _normalize_product(raw, company_id)
-            if skip:
-                skipped += 1
-            else:
-                records.append(rec)
-
-        triggered_at = datetime.now(timezone.utc)
-
-        try:
-            if req.mode == "replace":
-                db.table("product_catalog").delete().eq("company_id", company_id).execute()
-
-            synced = 0
-            for i in range(0, len(records), _CHUNK):
-                chunk = records[i : i + _CHUNK]
-                db.table("product_catalog").upsert(
-                    chunk, on_conflict="company_id,plu_code"
-                ).execute()
-                synced += len(chunk)
-
-            db.table("master_sync_logs").insert({
-                "company_id":      company_id,
-                "mode":            req.mode,
-                "records_synced":  synced,
-                "records_skipped": skipped,
-                "status":          "success",
-                "triggered_at":    triggered_at.isoformat(),
-            }).execute()
-
-            return {
-                "status":          "success",
-                "mode":            req.mode,
-                "records_synced":  synced,
-                "records_skipped": skipped,
-                "triggered_at":    triggered_at.isoformat(),
-                "last_synced_at":  last_synced_at,
-            }
-
-        except Exception as exc:
-            try:
-                db.table("master_sync_logs").insert({
-                    "company_id":      company_id,
-                    "mode":            req.mode,
-                    "records_synced":  0,
-                    "records_skipped": skipped,
-                    "status":          "error",
-                    "error_message":   str(exc)[:500],
-                    "triggered_at":    triggered_at.isoformat(),
-                }).execute()
-            except Exception:
-                pass
-            raise HTTPException(status_code=500, detail="Sync failed due to an internal error.")
-
-    return await asyncio.to_thread(_auth_and_sync)
+    return await asyncio.to_thread(_run_sync, req, sync_secret, client_ip)
 
 
 # ---------------------------------------------------------------------------
-# File-upload endpoint
-# POST /v1/sync/master-data/upload
+# Endpoint — file upload
 # Accepts multipart/form-data: file (.csv or .json), client_code, mode
 # ---------------------------------------------------------------------------
 
@@ -363,9 +410,7 @@ def _parse_upload(content: bytes, filename: str) -> list[dict]:
             return data["products"]
         raise ValueError("JSON must be a list of products or an object with a 'products' key.")
     if suffix == "csv":
-        text = content.decode("utf-8-sig")
-        reader = csv.DictReader(io.StringIO(text))
-        return [row for row in reader]
+        return list(csv.DictReader(io.StringIO(content.decode("utf-8-sig"))))
     raise ValueError(f"Unsupported file type '.{suffix}'. Upload a .csv or .json file.")
 
 
@@ -377,143 +422,29 @@ async def sync_master_data_upload(
     mode: str = Form("upsert"),
     authorization: Optional[str] = Header(None),
 ):
-    if mode not in ("upsert", "replace"):
-        raise HTTPException(status_code=400, detail="mode must be 'upsert' or 'replace'.")
+    _validate_mode(mode)
+    sync_secret = _extract_bearer(authorization)
 
-    if not authorization or not authorization.lower().startswith("bearer "):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Authorization header with Bearer token is required.",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    sync_secret = authorization[7:].strip()
+    # Rate limit before the body is read, so a blocked IP cannot make us buffer
+    # and parse a multi-MB file on every attempt.
+    client_ip = _client_ip(request)
+    _check_rate_limit(client_ip)
 
     content = await file.read()
-    if len(content) > _SYNC_MAX_MB * 1024 * 1024:
+    if len(content) > _MAX_BYTES:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             detail=f"File exceeds {_SYNC_MAX_MB} MB limit.",
         )
 
     try:
+        # UnicodeDecodeError and json.JSONDecodeError are both ValueError subclasses
         products = _parse_upload(content, file.filename or "")
-    except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+    except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
     if not products:
         raise HTTPException(status_code=400, detail="File contains no products.")
 
-    client_ip = request.client.host if request.client else "unknown"
-    _check_rate_limit(client_ip)
-
-    # Reuse the same auth + sync logic as the JSON-body endpoint
     sync_req = SyncRequest(client_code=client_code, mode=mode, products=products)
-
-    def _auth_and_sync_upload() -> dict:
-        db = get_supabase()
-
-        company_res = (
-            db.table("companies")
-            .select("id, sync_api_key, sync_allowed_ips")
-            .eq("client_code", sync_req.client_code)
-            .execute()
-        )
-        company = company_res.data[0] if company_res.data else None
-
-        if not company:
-            _record_fail(client_ip)
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid client_code or sync secret.",
-            )
-
-        if not company.get("sync_api_key"):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Sync is not enabled for this company. Contact your administrator.",
-            )
-
-        allowed_ips = company.get("sync_allowed_ips")
-        if allowed_ips and client_ip not in allowed_ips:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Request IP is not whitelisted for this company.",
-            )
-
-        if not _pwd.verify(sync_secret, company["sync_api_key"]):
-            _record_fail(client_ip)
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid client_code or sync secret.",
-            )
-
-        company_id = company["id"]
-
-        last_log = (
-            db.table("master_sync_logs")
-            .select("triggered_at")
-            .eq("company_id", company_id)
-            .eq("status", "success")
-            .order("triggered_at", desc=True)
-            .limit(1)
-            .execute()
-        )
-        last_synced_at = last_log.data[0]["triggered_at"] if last_log.data else None
-
-        records: list[dict] = []
-        skipped = 0
-        for raw in sync_req.products:
-            rec, skip = _normalize_product(raw, company_id)
-            if skip:
-                skipped += 1
-            else:
-                records.append(rec)
-
-        triggered_at = datetime.now(timezone.utc)
-
-        try:
-            if sync_req.mode == "replace":
-                db.table("product_catalog").delete().eq("company_id", company_id).execute()
-
-            synced = 0
-            for i in range(0, len(records), _CHUNK):
-                chunk = records[i : i + _CHUNK]
-                db.table("product_catalog").upsert(
-                    chunk, on_conflict="company_id,plu_code"
-                ).execute()
-                synced += len(chunk)
-
-            db.table("master_sync_logs").insert({
-                "company_id":      company_id,
-                "mode":            sync_req.mode,
-                "records_synced":  synced,
-                "records_skipped": skipped,
-                "status":          "success",
-                "triggered_at":    triggered_at.isoformat(),
-            }).execute()
-
-            return {
-                "status":          "success",
-                "mode":            sync_req.mode,
-                "records_synced":  synced,
-                "records_skipped": skipped,
-                "triggered_at":    triggered_at.isoformat(),
-                "last_synced_at":  last_synced_at,
-            }
-
-        except Exception as exc:
-            try:
-                db.table("master_sync_logs").insert({
-                    "company_id":      company_id,
-                    "mode":            sync_req.mode,
-                    "records_synced":  0,
-                    "records_skipped": skipped,
-                    "status":          "error",
-                    "error_message":   str(exc)[:500],
-                    "triggered_at":    triggered_at.isoformat(),
-                }).execute()
-            except Exception:
-                pass
-            raise HTTPException(status_code=500, detail="Sync failed due to an internal error.")
-
-    return await asyncio.to_thread(_auth_and_sync_upload)
+    return await asyncio.to_thread(_run_sync, sync_req, sync_secret, client_ip)

@@ -19,4 +19,6 @@ Master Data Sync API - Implementation Plan.md
 Master_format.csv
 seed_data/
 backend/docs/
+.venv
+Master_format.xlsx
 

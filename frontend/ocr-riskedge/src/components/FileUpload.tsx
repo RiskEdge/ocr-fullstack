@@ -1,11 +1,21 @@
 import { useCallback, useState } from "react";
-import { Upload, FileText, Image, File, X, Plus, ChevronDown, ChevronUp } from "lucide-react";
+import { Upload, FileText, Image, File, X, Plus, ChevronDown, ChevronUp, AlertTriangle } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { ScrollArea, ScrollBar } from "@/components/ui/scroll-area";
 import FileProcessingStatus, { FileStatus } from "@/components/FileProcessingStatus";
 
 const COLLAPSE_THRESHOLD = 10;
+
+// Mirrors the `accept` attribute on the file inputs below: any image plus PDF.
+const IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff", "heic", "heif"];
+
+const isSupportedFile = (file: File) => {
+  if (file.type) return file.type.startsWith("image/") || file.type === "application/pdf";
+  // Dropped files (and folders) can arrive with an empty MIME type — fall back to the extension.
+  const ext = file.name.split(".").pop()?.toLowerCase() ?? "";
+  return ext === "pdf" || IMAGE_EXTENSIONS.includes(ext);
+};
 
 interface FileUploadProps {
   onFilesSelect: (files: File[]) => void;
@@ -18,6 +28,23 @@ interface FileUploadProps {
 const FileUpload = ({ onFilesSelect, selectedFiles, onClear, onRemoveFile, fileStatuses = {} }: FileUploadProps) => {
   const [isDragging, setIsDragging] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
+  const [rejectedFiles, setRejectedFiles] = useState<string[]>([]);
+
+  // Keeps only images/PDFs and reports the rest in a dialog. Applies to both
+  // drag-drop and the file picker (`accept` is only a hint the user can bypass).
+  const selectSupportedFiles = useCallback(
+    (files: File[]) => {
+      const supported: File[] = [];
+      const rejected: string[] = [];
+      for (const file of files) {
+        if (isSupportedFile(file)) supported.push(file);
+        else rejected.push(file.name);
+      }
+      if (rejected.length > 0) setRejectedFiles(rejected);
+      if (supported.length > 0) onFilesSelect(supported);
+    },
+    [onFilesSelect]
+  );
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -34,18 +61,18 @@ const FileUpload = ({ onFilesSelect, selectedFiles, onClear, onRemoveFile, fileS
       e.preventDefault();
       setIsDragging(false);
       const files = Array.from(e.dataTransfer.files);
-      if (files.length > 0) onFilesSelect(files);
+      if (files.length > 0) selectSupportedFiles(files);
     },
-    [onFilesSelect]
+    [selectSupportedFiles]
   );
 
   const handleFileChange = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
       const files = Array.from(e.target.files || []);
-      if (files.length > 0) onFilesSelect(files);
+      if (files.length > 0) selectSupportedFiles(files);
       e.target.value = "";
     },
-    [onFilesSelect]
+    [selectSupportedFiles]
   );
 
   const getFileIcon = (file: File) => {
@@ -96,6 +123,45 @@ const FileUpload = ({ onFilesSelect, selectedFiles, onClear, onRemoveFile, fileS
     </div>
   );
 
+  const rejectedFilesDialog = rejectedFiles.length > 0 && (
+    <div className="fixed inset-0 z-50 flex items-center justify-center">
+      <div className="absolute inset-0 bg-black/40 backdrop-blur-sm" onClick={() => setRejectedFiles([])} />
+      <div className="relative z-10 w-full max-w-sm mx-4 bg-card rounded-xl border border-border shadow-xl p-6">
+        <div className="flex items-center justify-between mb-4">
+          <div className="flex items-center gap-2">
+            <AlertTriangle className="w-4 h-4 text-destructive" />
+            <h2 className="text-sm font-semibold text-foreground">
+              Unsupported file{rejectedFiles.length !== 1 ? "s" : ""}
+            </h2>
+          </div>
+          <button
+            onClick={() => setRejectedFiles([])}
+            className="text-muted-foreground hover:text-foreground transition-colors"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+
+        <p className="text-sm text-muted-foreground">
+          {rejectedFiles.length === 1 ? "This file was" : `These ${rejectedFiles.length} files were`} skipped —
+          only images and PDF files can be processed.
+        </p>
+
+        <ul className="mt-3 max-h-40 overflow-y-auto space-y-1">
+          {rejectedFiles.map((name, index) => (
+            <li key={`${name}-${index}`} className="text-xs text-foreground bg-muted/50 rounded px-2 py-1 truncate">
+              {name}
+            </li>
+          ))}
+        </ul>
+
+        <Button onClick={() => setRejectedFiles([])} className="w-full mt-5 text-sm">
+          Got it
+        </Button>
+      </div>
+    </div>
+  );
+
   const addMoreButton = (
     <label className="cursor-pointer">
       <input type="file" accept="image/*,.pdf" multiple onChange={handleFileChange} className="hidden" />
@@ -117,6 +183,7 @@ const FileUpload = ({ onFilesSelect, selectedFiles, onClear, onRemoveFile, fileS
 
     return (
       <div className="bg-card border border-border rounded-lg p-4">
+        {rejectedFilesDialog}
         <div className="flex items-center justify-between mb-3">
           <span className="text-sm font-medium text-foreground">
             {selectedFiles.length} file{selectedFiles.length !== 1 ? "s" : ""} selected
@@ -205,43 +272,46 @@ const FileUpload = ({ onFilesSelect, selectedFiles, onClear, onRemoveFile, fileS
   }
 
   return (
-    <div
-      onDragOver={handleDragOver}
-      onDragLeave={handleDragLeave}
-      onDrop={handleDrop}
-      className={cn(
-        "relative border-2 border-dashed rounded-xl p-8 text-center transition-all duration-200 cursor-pointer",
-        isDragging
-          ? "border-primary bg-primary/5 scale-[1.02]"
-          : "border-border hover:border-primary/50 hover:bg-muted/50"
-      )}
-    >
-      <input
-        type="file"
-        accept="image/*,.pdf"
-        multiple
-        onChange={handleFileChange}
-        className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
-      />
-      <div className="flex flex-col items-center gap-3">
-        <div
-          className={cn(
-            "w-14 h-14 rounded-full flex items-center justify-center transition-colors",
-            isDragging ? "bg-primary text-primary-foreground" : "bg-muted text-muted-foreground"
-          )}
-        >
-          <Upload className="w-6 h-6" />
-        </div>
-        <div>
-          <p className="font-medium text-foreground">
-            {isDragging ? "Drop your files here" : "Drop your files here, or browse"}
-          </p>
-          <p className="text-sm text-muted-foreground mt-1">
-            Supports images (PNG, JPG, JPEG) and PDF files • Multiple files allowed
-          </p>
+    <>
+      {rejectedFilesDialog}
+      <div
+        onDragOver={handleDragOver}
+        onDragLeave={handleDragLeave}
+        onDrop={handleDrop}
+        className={cn(
+          "relative border-2 border-dashed rounded-xl p-8 text-center transition-all duration-200 cursor-pointer",
+          isDragging
+            ? "border-primary bg-primary/5 scale-[1.02]"
+            : "border-border hover:border-primary/50 hover:bg-muted/50"
+        )}
+      >
+        <input
+          type="file"
+          accept="image/*,.pdf"
+          multiple
+          onChange={handleFileChange}
+          className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+        />
+        <div className="flex flex-col items-center gap-3">
+          <div
+            className={cn(
+              "w-14 h-14 rounded-full flex items-center justify-center transition-colors",
+              isDragging ? "bg-primary text-primary-foreground" : "bg-muted text-muted-foreground"
+            )}
+          >
+            <Upload className="w-6 h-6" />
+          </div>
+          <div>
+            <p className="font-medium text-foreground">
+              {isDragging ? "Drop your files here" : "Drop your files here, or browse"}
+            </p>
+            <p className="text-sm text-muted-foreground mt-1">
+              Supports images (PNG, JPG, JPEG) and PDF files • Multiple files allowed
+            </p>
+          </div>
         </div>
       </div>
-    </div>
+    </>
   );
 };
 

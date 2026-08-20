@@ -263,6 +263,7 @@ export interface CatalogItem {
   priority: number | null
   status: string | null
   uom: string | null
+  uom_qty: number | null
   synced_at: string | null
 }
 
