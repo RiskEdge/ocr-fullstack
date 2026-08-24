@@ -275,6 +275,8 @@ const Index = () => {
   const selectionRef = useRef<File[]>([]);
   /** Preview URL per file, so previewUrls can be rebuilt from the selection. */
   const fileUrlsRef = useRef<Map<File, string>>(new Map());
+  /** Mirror of history, read when deciding whether a URL is safe to revoke. */
+  const historyRef = useRef<HistoryItem[]>([]);
   /**
    * Files already extracted in this session. The server row only lands after a
    * run finishes, so a second Extract on the same staged file (via Re-process,
@@ -324,11 +326,38 @@ const Index = () => {
    * stale render closure. previewUrls is always derived from selectedFiles, so
    * the two arrays can never drift out of alignment.
    */
+  /**
+   * Object URL for a staged file, created on first use and cached. Creating on
+   * demand means a file whose URL was released earlier still renders when it
+   * comes back into the selection, instead of falling back to an empty src.
+   */
+  const getPreviewUrl = useCallback((file: File): string => {
+    let url = fileUrlsRef.current.get(file);
+    if (!url) {
+      url = URL.createObjectURL(file);
+      fileUrlsRef.current.set(file, url);
+    }
+    return url;
+  }, []);
+
+  /**
+   * Drop a file's object URL — unless a history entry still points at that
+   * File. Revoking one of those leaves the history item with a dead URL and a
+   * blank preview when it's reopened.
+   */
+  const releasePreviewUrl = useCallback((file: File) => {
+    const url = fileUrlsRef.current.get(file);
+    fileUrlsRef.current.delete(file);
+    if (!url || !url.startsWith("blob:")) return;
+    if (historyRef.current.some((item) => item.file === file)) return;
+    URL.revokeObjectURL(url);
+  }, []);
+
   const applySelection = useCallback((files: File[]) => {
     selectionRef.current = files;
     setSelectedFiles(files);
-    setPreviewUrls(files.map((file) => fileUrlsRef.current.get(file) ?? ""));
-  }, []);
+    setPreviewUrls(files.map((file) => getPreviewUrl(file)));
+  }, [getPreviewUrl]);
 
   /** Drop a set of files from the selection, keeping the active preview put. */
   const removeFiles = useCallback((toRemove: File[]) => {
@@ -339,9 +368,7 @@ const Index = () => {
     if (kept.length === previous.length) return;
 
     removeSet.forEach((file) => {
-      const url = fileUrlsRef.current.get(file);
-      if (url && url.startsWith("blob:")) URL.revokeObjectURL(url);
-      fileUrlsRef.current.delete(file);
+      releasePreviewUrl(file);
       fileHashesRef.current.delete(file);
       sessionProcessedRef.current.delete(file);
     });
@@ -356,7 +383,7 @@ const Index = () => {
       return next;
     });
     applySelection(kept);
-  }, [applySelection]);
+  }, [applySelection, releasePreviewUrl]);
 
   /**
    * Fingerprint newly staged files and ask the backend whether this company has
@@ -391,8 +418,8 @@ const Index = () => {
         removeFiles(inSelectionRepeats);
         toast.info(
           inSelectionRepeats.length === 1
-            ? "That file was already in this batch — the duplicate copy was removed."
-            : `${inSelectionRepeats.length} files were already in this batch — the duplicate copies were removed.`
+            ? "That file is already selected — the extra copy was dropped, the original is untouched."
+            : `${inSelectionRepeats.length} files were already selected — the extra copies were dropped, the originals are untouched.`
         );
       }
 
@@ -441,15 +468,11 @@ const Index = () => {
   }, [token, removeFiles]);
 
   const handleFilesSelect = useCallback((files: File[]) => {
-    files.forEach((file) => {
-      if (!fileUrlsRef.current.has(file)) {
-        fileUrlsRef.current.set(file, URL.createObjectURL(file));
-      }
-    });
     applySelection([...selectionRef.current, ...files]);
+    // Files are appended, so existing indices are untouched — keep the results
+    // and status badges of anything already extracted rather than making it
+    // look unprocessed (and inviting a second paid run).
     setProcessingState("idle");
-    setExtractedData([]);
-    setFileStatuses({});
     setCompletedCount(0);
     setSelectedHistoryId(null);
     void runDuplicateCheck(files);
@@ -493,9 +516,7 @@ const Index = () => {
   }, [pendingDuplicates, duplicateDialogMode]);
 
   const handleClearFiles = () => {
-    fileUrlsRef.current.forEach((url) => {
-      if (url.startsWith("blob:")) URL.revokeObjectURL(url);
-    });
+    selectionRef.current.forEach(releasePreviewUrl);
     fileUrlsRef.current.clear();
     fileHashesRef.current.clear();
     sessionProcessedRef.current.clear();
@@ -527,7 +548,10 @@ const Index = () => {
     setDuplicateInfo(new Map());
     setPendingDuplicates([]);
     setDuplicateDialogOpen(false);
-    fileUrlsRef.current.set(item.file, item.previewUrl);
+    // item.previewUrl is the blob URL from when the file was first staged, and
+    // it may since have been revoked. Drop the mapping so applySelection mints
+    // a fresh one from the File — restoring history must always show the doc.
+    fileUrlsRef.current.delete(item.file);
     applySelection([item.file]);
     setActiveFileIndex(0);
     setProcessingState("completed");
@@ -557,7 +581,10 @@ const Index = () => {
 
   const handleHistoryClear = () => {
     history.forEach((item) => {
-      URL.revokeObjectURL(item.previewUrl);
+      // Skip files still staged — their preview is on screen right now.
+      if (selectionRef.current.includes(item.file)) return;
+      if (item.previewUrl.startsWith("blob:")) URL.revokeObjectURL(item.previewUrl);
+      fileUrlsRef.current.delete(item.file);
     });
     setHistory([]);
     storedItemsRef.current = [];
@@ -838,6 +865,7 @@ const Index = () => {
   // the latest values and doesn't fire on every state change.
   const previewUrlsRef = useRef(previewUrls);
   previewUrlsRef.current = previewUrls;
+  historyRef.current = history;
   const selectedHistoryIdRef = useRef(selectedHistoryId);
   selectedHistoryIdRef.current = selectedHistoryId;
 

@@ -21,6 +21,8 @@ export interface ValidationResult {
   matched_plu: string | null;
   is_valid: boolean;
   match_type?: "fuzzy_name" | "no_match" | "multi_plu" | "auto_selected";
+  /** Which identifier resolved the match. Absent on Gemini-decided matches. */
+  match_source?: "ean" | "item_code" | "name_exact";
   match_note?: string;
   confidence?: "high" | "medium" | "low";
   plu_options?: PluOption[];

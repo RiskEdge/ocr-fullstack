@@ -28,6 +28,19 @@ _RAW_FIELD_ALIASES: dict[str, str] = {
     "eancode":            "ean_code",
     "ean":                "ean_code",
     "barcode":            "ean_code",
+    # Item / PLU codes — the fallback lookup key when the EAN is missing or
+    # absent from the catalog. Deliberately excludes serial-style headers
+    # ("Item No", "Sr No"), which carry line numbers rather than item codes.
+    "plu":                "plu_code",
+    "plucode":            "plu_code",
+    "pluno":              "plu_code",
+    "sku":                "sku_code",
+    "skucode":            "sku_code",
+    "skuno":              "sku_code",
+    "itemcode":           "sku_code",
+    "productcode":        "sku_code",
+    "articlecode":        "sku_code",
+    "materialcode":       "sku_code",
     # Prices
     "costprice":          "cost_price",
     "mrp":                "mrp",
@@ -172,6 +185,59 @@ def _ean_str(val: object) -> Optional[str]:
         return s or None
 
 
+# Item codes are compared as strings so leading zeros survive. Anything
+# shorter than this is a line serial ("1", "23"), not a catalog code.
+_MIN_CODE_LEN = 4
+# sku_code / plu_code widths in product_catalog, used to restore lost zeros.
+_CATALOG_CODE_WIDTHS = (6, 8)
+# Item codes looked up per request — keeps the PostgREST query string bounded.
+_CODE_QUERY_CHUNK = 80
+
+
+def _code_str(val: object) -> Optional[str]:
+    """'00565701' stays as-is; a JSON-mangled 565701.0 becomes '565701'."""
+    if val is None:
+        return None
+    s = str(val).strip()
+    if not s:
+        return None
+    if re.fullmatch(r"\d+\.0+", s):
+        s = s.split(".")[0]
+    return s
+
+
+def _code_variants(val: object) -> set[str]:
+    """
+    Every spelling of an invoice item code worth looking up: as printed, plus
+    zero-stripped and zero-padded forms, because OCR and upstream exports
+    routinely drop the leading zeros product_catalog keeps ('565701' is the
+    same item as '00565701'). Empty for values too short to be a real code.
+    """
+    s = _code_str(val)
+    if not s:
+        return set()
+    core = s.lstrip("0") or s
+    if len(core) < _MIN_CODE_LEN:
+        return set()
+    if not s.isdigit():
+        return {s}
+    variants = {s, core}
+    for width in _CATALOG_CODE_WIDTHS:
+        if len(core) <= width:
+            variants.add(core.zfill(width))
+    return variants
+
+
+def _item_code_variants(item: dict) -> list[str]:
+    """Lookup keys for whichever item-code columns the invoice carried."""
+    out: list[str] = []
+    for field in ("plu_code", "sku_code"):
+        for v in sorted(_code_variants(item.get(field))):
+            if v not in out:
+                out.append(v)
+    return out
+
+
 def normalize_item(raw: dict) -> dict:
     """
     Remap OCR field names to canonical names; unknown keys are kept as-is.
@@ -230,6 +296,73 @@ def _name_keywords(product_name: str) -> list[str]:
     return words[:1] + sorted(words[1:], key=len, reverse=True)
 
 
+def _name_tokens(product_name: str) -> list[str]:
+    """Lower-cased word tokens of a product name, used for candidate scoring."""
+    return [
+        tok.lower()
+        for tok in re.split(r"[^A-Za-z0-9&]+", product_name.strip())
+        if tok and not _SIZE_TOKEN_RE.match(tok)
+    ]
+
+
+def _name_match_score(query_tokens: list[str], description: object) -> float:
+    """
+    How well a catalog description covers the invoice product name: 1.0 when
+    every invoice word appears as a whole word in the description.
+
+    Whole-word hits count fully; substring hits count a fraction, so
+    "SCRUBBER" never outranks "RUBBER BANDS" for the query word "rubber".
+    """
+    desc = str(description or "").lower()
+    if not query_tokens or not desc:
+        return 0.0
+    desc_words = set(re.split(r"[^a-z0-9&]+", desc))
+    score = 0.0
+    for tok in query_tokens:
+        if tok in desc_words:
+            score += 1.0
+        elif len(tok) >= 4 and tok in desc:
+            score += 0.25
+    return score / len(query_tokens)
+
+
+def _norm_name(value: object) -> str:
+    """
+    Product name reduced to comparable form, so differences in case, spacing
+    and punctuation ('Rubber-Ball,  Magbol') do not hide an identical product.
+    """
+    return " ".join(t for t in re.split(r"[^a-z0-9&]+", str(value or "").lower()) if t)
+
+
+def _exact_name_rows(product_name: str, rows: list[dict]) -> list[dict]:
+    """
+    Rows describing exactly this product. More than one means the same product
+    exists under several PLUs, which the multi-PLU flow already handles.
+    """
+    target = _norm_name(product_name)
+    if not target:
+        return []
+    return [
+        r for r in rows
+        if target in (_norm_name(r.get("sku_description")),
+                      _norm_name(r.get("sku_short_description")))
+    ]
+
+
+def _corroborated_rows(rows: list[dict], product_name: str) -> list[dict]:
+    """
+    Keep only code-matched rows whose description shares something with the
+    invoice product name. An invoice item code can belong to the vendor rather
+    than to this catalog, and a confident wrong match is worse than a flag.
+    Rows pass unfiltered when the line has no usable product name to check.
+    """
+    tokens = _name_tokens(product_name)
+    if not tokens:
+        return rows
+    corroborated = [r for r in rows if _name_match_score(tokens, r.get("sku_description")) > 0]
+    return corroborated
+
+
 def _best_effort_name(item: dict) -> str:
     """
     Last-resort product name for the fuzzy search: the most name-like string
@@ -268,6 +401,21 @@ def _to_plu_option(r: dict) -> dict:
 
 # How many candidates to surface alongside a match the user may want to override.
 _MAX_OPTIONS = 5
+
+# Name-search tunables: how many words of the product name are searched, how
+# many rows each word may contribute, and how many survive ranking.
+_MAX_SEARCH_KEYWORDS = 4
+_KEYWORD_FETCH_LIMIT = 25
+_MAX_CANDIDATES = 20
+
+
+def _ilike_pattern(text: str) -> str:
+    """
+    Wrap a search term for ILIKE. Characters PostgREST reads as wildcards are
+    replaced by a wildcard rather than escaped: in an OCR'd name they are noise
+    ("5% PACK" vs "5 PACK"), so matching anything there is the wanted result.
+    """
+    return "%{}%".format(re.sub(r"[%_*]+", "%", text.strip()))
 
 
 def _rank_options(
@@ -334,8 +482,10 @@ def local_compare(item: dict, master: dict) -> dict:
             })
             corrections[field] = master_val
 
-    inv_desc = str(item.get("sku_description") or "").strip().upper()
-    master_desc = str(master.get("sku_description") or "").strip().upper()
+    # Compared on normalised form: case, spacing and punctuation differences
+    # are OCR noise, not a data discrepancy worth showing the user.
+    inv_desc = _norm_name(item.get("sku_description"))
+    master_desc = _norm_name(master.get("sku_description"))
     if inv_desc and master_desc and inv_desc != master_desc:
         discrepancies.append({
             "field":    "sku_description",
@@ -566,27 +716,81 @@ Master records (JSON):
             lookup.setdefault(row["ean_code"], []).append(row)
         return lookup
 
-    def _fetch_candidates_by_name(self, product_name: str, company_id: str = "") -> list[dict]:
+    def _fetch_master_by_codes(self, codes: list[str], company_id: str = "") -> dict[str, list[dict]]:
         """
-        ILIKE search on sku_description, keyed on the first meaningful word of
-        the invoice product name (usually the brand). Falls back to the next
-        keywords if the first yields nothing. Returns up to 20 rows.
+        Batch fetch product_catalog rows whose plu_code OR sku_code matches any
+        of the invoice item codes. Keyed by both columns, so a line can be
+        looked up by whichever code it happened to print.
         """
-        for keyword in _name_keywords(product_name)[:3]:
+        lookup: dict[str, list[dict]] = {}
+        # Chunked: every code goes into the URL twice (once per column), so a
+        # 100-line invoice would otherwise build a query string long enough to
+        # be rejected before it reaches PostgREST.
+        for start in range(0, len(codes), _CODE_QUERY_CHUNK):
+            chunk = codes[start:start + _CODE_QUERY_CHUNK]
+            quoted = ",".join('"{}"'.format(c.replace('"', "")) for c in chunk)
             q = (
                 get_supabase()
                 .table("product_catalog")
                 .select("*")
-                .ilike("sku_description", f"%{keyword}%")
+                .or_(f"plu_code.in.({quoted}),sku_code.in.({quoted})")
                 .order("priority")
-                .limit(20)
             )
             if company_id:
                 q = q.eq("company_id", company_id)
-            rows = q.execute().data
-            if rows:
-                return rows
-        return []
+            for row in q.execute().data:
+                for col in ("plu_code", "sku_code"):
+                    key = _code_str(row.get(col))
+                    if key and row not in lookup.setdefault(key, []):
+                        lookup[key].append(row)
+        return lookup
+
+    def _fetch_candidates_by_name(self, product_name: str, company_id: str = "") -> list[dict]:
+        """
+        ILIKE search on sku_description for EVERY meaningful word of the invoice
+        product name — not just the first one that returns rows. A common word
+        ("RUBBER" also matches "SCRUBBER") floods the result set and would bury
+        the real record, so the rarer words are always searched too and the
+        pooled rows are re-ranked by how much of the invoice name they cover.
+
+        Returns at most _MAX_CANDIDATES rows, best match first.
+        """
+        keywords = _name_keywords(product_name)[:_MAX_SEARCH_KEYWORDS]
+        if not keywords:
+            return []
+
+        pooled: dict[str, dict] = {}
+
+        def pool(pattern: str) -> None:
+            q = (
+                get_supabase()
+                .table("product_catalog")
+                .select("*")
+                .ilike("sku_description", pattern)
+                .order("priority")
+                .limit(_KEYWORD_FETCH_LIMIT)
+            )
+            if company_id:
+                q = q.eq("company_id", company_id)
+            for row in q.execute().data:
+                pooled.setdefault(str(row.get("plu_code") or row.get("id")), row)
+
+        # The whole description first. A row containing the entire invoice name
+        # is the answer, and a per-word search can bury it behind rows that
+        # merely share one common word.
+        pool(_ilike_pattern(product_name))
+        for keyword in keywords:
+            pool(_ilike_pattern(keyword))
+
+        tokens = _name_tokens(product_name)
+        ranked = sorted(
+            pooled.values(),
+            key=lambda r: (
+                -_name_match_score(tokens, r.get("sku_description")),
+                r.get("priority") if r.get("priority") is not None else 10**9,
+            ),
+        )
+        return ranked[:_MAX_CANDIDATES]
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -645,7 +849,14 @@ Master records (JSON):
             if item.get("ean_code")
         } - {None})
 
-        master_lookup = await asyncio.to_thread(self._fetch_master_lookup, ean_codes, company_id)
+        # Item codes printed on the invoice — the fallback lookup key for lines
+        # whose EAN is missing or absent from the catalog.
+        item_codes = sorted({v for item in items for v in _item_code_variants(item)})
+
+        master_lookup, code_lookup = await asyncio.gather(
+            asyncio.to_thread(self._fetch_master_lookup, ean_codes, company_id),
+            asyncio.to_thread(self._fetch_master_by_codes, item_codes, company_id),
+        )
 
         results: list[dict | None] = []
         gemini_queue: list[tuple[int, object, str | None]] = []
@@ -656,18 +867,44 @@ Master records (JSON):
 
         for item in items:
             ean = _ean_str(item.get("ean_code"))
-            master_rows = master_lookup.get(ean or "", []) if ean else []
+            # Identification cascade — each step runs only when the previous
+            # one found nothing, and every step but the last is exact, so a
+            # line is never sent to Gemini while a definite match exists:
+            #   1. EAN   2. invoice item code   3. identical name   4. fuzzy
+            master_rows  = master_lookup.get(ean or "", []) if ean else []
+            match_source = "ean" if master_rows else None
+            candidates: list[dict] = []
 
-            # ── EAN not found ────────────────────────────────────────────
+            product_name = str(item.get("sku_description") or item.get("product_name") or "")
+            # Fall back whenever the mapped name is unusable for search —
+            # missing, or a value like "1" from a mislabelled column.
+            if not _name_keywords(product_name):
+                product_name = _best_effort_name(item) or product_name
+
+            # ── 2. No EAN match: try the item code the invoice printed ───
             if not master_rows:
-                product_name = str(item.get("sku_description") or item.get("product_name") or "")
-                # Fall back whenever the mapped name is unusable for search —
-                # missing, or a value like "1" from a mislabelled column.
-                if not _name_keywords(product_name):
-                    product_name = _best_effort_name(item) or product_name
+                code_rows: list[dict] = []
+                for variant in _item_code_variants(item):
+                    for row in code_lookup.get(variant, []):
+                        if row not in code_rows:
+                            code_rows.append(row)
+                code_rows = _corroborated_rows(code_rows, product_name)
+                if code_rows:
+                    master_rows  = code_rows
+                    match_source = "item_code"
+
+            # ── 3. Still nothing: an identical product name is a match ───
+            if not master_rows:
                 candidates = await asyncio.to_thread(
                     self._fetch_candidates_by_name, product_name, company_id
                 )
+                exact_rows = _exact_name_rows(product_name, candidates)
+                if exact_rows:
+                    master_rows  = exact_rows
+                    match_source = "name_exact"
+
+            # ── 4. Nothing exact: let Gemini judge the near misses ───────
+            if not master_rows:
                 if not candidates:
                     print(
                         f"[validate-data] no name candidates — ean={ean!r} "
@@ -697,7 +934,13 @@ Master records (JSON):
                                 "field":    "ean_code",
                                 "expected": None,
                                 "actual":   ean,
-                                "message":  "EAN code not found in master catalog and no similar product name could be matched.",
+                                "message":  (
+                                    "EAN code not found in master catalog and no similar "
+                                    "product name could be matched."
+                                    if ean else
+                                    "No EAN code on this line, and neither its item code nor "
+                                    "its product name matched a master record."
+                                ),
                             }],
                             "suggested_corrections": {},
                         },
@@ -707,7 +950,13 @@ Master records (JSON):
             # ── Single PLU fast path ─────────────────────────────────────
             if len(master_rows) == 1:
                 matched_exact += 1
-                results.append({**item, "validation": local_compare(item, master_rows[0])})
+                results.append({
+                    **item,
+                    "validation": {
+                        **local_compare(item, master_rows[0]),
+                        "match_source": match_source,
+                    },
+                })
                 continue
 
             # ── Multiple PLUs ────────────────────────────────────────────
@@ -720,7 +969,7 @@ Master records (JSON):
             if clean:
                 _, cmp = clean
                 matched_exact += 1
-                results.append({**item, "validation": cmp})
+                results.append({**item, "validation": {**cmp, "match_source": match_source}})
             elif auto_select_plu:
                 gemini_calls += 1
                 placeholder_idx = len(results)
