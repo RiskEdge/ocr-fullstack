@@ -45,6 +45,7 @@ import {
 import type {
   ValidatedItem,
   Discrepancy,
+  DerivedField,
   ValidationResult,
   PluOption,
 } from "@/lib/validateApi";
@@ -58,7 +59,43 @@ const FIELD_LABELS: Record<string, string> = {
   sku_desc: "Product Name",
   quantity: "Qty",
   plu_code: "PLU",
+  invoice_price: "Invoice Price",
+  taxable_value: "Taxable Value",
+  sgst_amount: "SGST",
+  cgst_amount: "CGST",
+  igst_amount: "IGST",
+  gst_amount: "GST Amount",
+  uom: "UOM",
+  uom_qty: "UOM Qty",
 };
+
+// The item keys a comparison field can arrive under. The backend normalises
+// OCR headers, but older cached runs and the raw extraction both use variants,
+// so every lookup tries them in order.
+const INVOICE_KEYS: Record<string, string[]> = {
+  sku_desc: ["sku_desc", "product_name", "sku_description"],
+  cost_price: ["cost_price"],
+  mrp: ["mrp"],
+  tax_pct: ["tax_pct", "gst_percent"],
+  ean_code: ["ean_code", "ean"],
+  plu_code: ["plu_code", "plu"],
+};
+
+/**
+ * What the invoice actually says for a comparison field.
+ *
+ * Discrepancies carry their own `actual`, but Gemini returns null for a field
+ * it could not read and a field with no discrepancy has no row at all — in
+ * both cases the item itself still holds the value, so the comparison tables
+ * fall back to it rather than showing a dash.
+ */
+function invoiceValueFor(item: ValidatedItem, field: string): unknown {
+  for (const key of INVOICE_KEYS[field] ?? [field]) {
+    const val = item[key];
+    if (val !== undefined && val !== null && val !== "") return val;
+  }
+  return undefined;
+}
 
 function fieldLabel(field: string): string {
   return (
@@ -91,6 +128,148 @@ function isResolved(
   return accepted?.has(d.field) ?? false;
 }
 
+function num(val: unknown): number | null {
+  if (val === null || val === undefined || val === "") return null;
+  const n = parseFloat(String(val).replace(/[^0-9.\-]/g, ""));
+  return isNaN(n) ? null : n;
+}
+
+function normUom(val: unknown): string {
+  const letters = String(val ?? "")
+    .replace(/[^A-Za-z]/g, "")
+    .toUpperCase();
+  return letters.endsWith("ES") ? letters.slice(0, -2) : letters.replace(/S$/, "");
+}
+
+/**
+ * Client-side mirror of the backend's derive_cost_price().
+ *
+ * Needed because picking a PLU in the multi-PLU table re-runs the comparison
+ * locally against a different catalog row — and uom_qty belongs to the row, so
+ * the cost the invoice implies changes with the pick.
+ *
+ *   base cost per unit = invoice price / uom_qty
+ *   tax per unit       = line tax / (qty * uom_qty)   (or base * gst%)
+ */
+function deriveCostPrice(
+  item: ValidatedItem,
+  master: PluOption,
+): DerivedField | null {
+  // A cost_price the backend derived belongs to the PLU *it* matched, so it
+  // must not block re-derivation against the row the user picked instead —
+  // only a figure the invoice actually printed does.
+  const wasDerived = !!item.validation?.derived_fields?.cost_price;
+  if (!wasDerived && num(item["cost_price"]) !== null) return null;
+
+  const invUom = normUom(item["uom"]);
+  const masterUom = normUom(master.uom);
+  // Quantities counted in different units cannot be reconciled — an invoice in
+  // PCS against a catalog BOX would apply the pack size twice.
+  if (invUom && masterUom && invUom !== masterUom) return null;
+
+  const uomQty = num(master.uom_qty) ?? num(item["uom_qty"]) ?? 1;
+  if (uomQty <= 0) return null;
+
+  const quantity = num(item["quantity"]);
+
+  let unitPrice = num(item["invoice_price"]);
+  let priceSource = "invoice price";
+  if (unitPrice === null) {
+    const taxable = num(item["taxable_value"]);
+    if (taxable === null || quantity === null || quantity <= 0) return null;
+    unitPrice = taxable / quantity;
+    priceSource = "taxable value / qty";
+  }
+  if (unitPrice <= 0) return null;
+
+  const baseUnitCost = unitPrice / uomQty;
+
+  const taxParts = ["sgst_amount", "cgst_amount", "igst_amount"]
+    .map((k) => num(item[k]))
+    .filter((n): n is number => n !== null);
+  const taxTotal = taxParts.length
+    ? taxParts.reduce((a, b) => a + b, 0)
+    : num(item["gst_amount"]);
+  const totalUnits = quantity !== null ? quantity * uomQty : null;
+
+  let taxPerUnit: number;
+  let source: DerivedField["source"];
+  let taxFormula: string;
+  if (taxTotal !== null && totalUnits !== null && totalUnits > 0) {
+    taxPerUnit = taxTotal / totalUnits;
+    source = "tax_amounts";
+    taxFormula = `${trimNum(taxTotal)} / ${trimNum(totalUnits)}`;
+  } else {
+    const rate =
+      num(item["gst_percent"]) ??
+      num(item["tax_pct"]) ??
+      (() => {
+        const halves = ["sgst_pct", "cgst_pct"]
+          .map((k) => num(item[k]))
+          .filter((n): n is number => n !== null);
+        return halves.length ? halves.reduce((a, b) => a + b, 0) : null;
+      })();
+    if (rate === null) return null;
+    taxPerUnit = (baseUnitCost * rate) / 100;
+    source = "gst_rate";
+    taxFormula = `${trimNum(baseUnitCost)} x ${trimNum(rate)}%`;
+  }
+
+  // Only the final value is rounded — rounding the base cost first turns
+  // 12.4992 into 12.4952, which then reads as a discrepancy.
+  const value = Math.round((baseUnitCost + taxPerUnit) * 100) / 100;
+  if (value <= 0) return null;
+
+  return {
+    value,
+    source,
+    unit_price: unitPrice,
+    price_source: priceSource,
+    uom: master.uom ?? (item["uom"] as string | null),
+    uom_qty: uomQty,
+    quantity,
+    base_unit_cost: baseUnitCost,
+    tax_total: taxTotal,
+    total_units: totalUnits,
+    tax_per_unit: taxPerUnit,
+    formula: `${trimNum(unitPrice)} / ${trimNum(uomQty)} + ${taxFormula} = ${value.toFixed(2)}`,
+  };
+}
+
+function trimNum(val: number): string {
+  return String(parseFloat(val.toFixed(4)));
+}
+
+/**
+ * Marks a value that was computed rather than read off the invoice, and shows
+ * the arithmetic behind it. Without this a derived cost price is
+ * indistinguishable from one the vendor actually printed.
+ */
+function DerivedBadge({ derived }: { derived: DerivedField }) {
+  const unitLabel = derived.uom ? ` per ${derived.uom}` : "";
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span className="inline-flex items-center gap-0.5 rounded bg-blue-500/10 px-1 py-0.5 text-[10px] font-medium text-blue-700 dark:text-blue-400 cursor-help align-middle">
+          <Calculator className="w-2.5 h-2.5" />
+          derived
+        </span>
+      </TooltipTrigger>
+      <TooltipContent className="max-w-xs">
+        <p className="font-medium">Not printed on the invoice</p>
+        <p className="font-mono text-xs mt-1">{derived.formula}</p>
+        <p className="text-xs mt-1 opacity-80">
+          {`${trimNum(derived.unit_price ?? 0)}${unitLabel}`}
+          {derived.uom_qty ? ` ÷ ${trimNum(derived.uom_qty)} units` : ""}
+          {derived.source === "tax_amounts"
+            ? ", plus the line's GST spread over every unit."
+            : ", plus GST at the line's rate."}
+        </p>
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
 // Client-side comparison mirroring backend local_compare logic.
 function computeLocalValidation(
   item: ValidatedItem,
@@ -98,15 +277,27 @@ function computeLocalValidation(
 ): {
   discrepancies: Discrepancy[];
   corrections: Record<string, number | string>;
+  derived: DerivedField | null;
 } {
   const discrepancies: Discrepancy[] = [];
   const corrections: Record<string, number | string> = {};
+
+  // A cost price the invoice never printed but the pack size implies — so
+  // picking a PLU compares against the cost that PLU actually works out to
+  // instead of skipping the field.
+  const derived = deriveCostPrice(item, master);
 
   // Backend returns invoice items under canonical keys (gst_percent /
   // sku_description); accept those as fallbacks so tax and description
   // comparisons are not silently skipped.
   const invoiceField = (field: "cost_price" | "mrp" | "tax_pct"): unknown =>
-    field === "tax_pct" ? (item.tax_pct ?? item["gst_percent"]) : item[field];
+    field === "tax_pct"
+      ? (item.tax_pct ?? item["gst_percent"])
+      : field === "cost_price"
+        ? // The freshly derived value wins: any cost_price already on the item
+          // was derived against a different PLU's pack size.
+          (derived?.value ?? item.cost_price)
+        : item[field];
 
   for (const field of ["cost_price", "mrp", "tax_pct"] as const) {
     const invVal = parseFloat(String(invoiceField(field) ?? ""));
@@ -144,13 +335,15 @@ function computeLocalValidation(
     corrections["sku_desc"] = master.sku_desc ?? "";
   }
 
-  return { discrepancies, corrections };
+  return { discrepancies, corrections, derived };
 }
 
 interface PluSelection {
   plu_code: string;
   discrepancies: Discrepancy[];
   corrections: Record<string, number | string>;
+  /** Cost price this PLU's pack size implies, when the invoice printed none. */
+  derived: DerivedField | null;
 }
 
 // Candidate table for a match Gemini chose out of several plausible records.
@@ -369,26 +562,61 @@ const LINE_AMOUNT_CANDIDATES = [
   "lineamount",
   "line_amount",
 ];
+// Ordered most-specific first — findGrandTotal walks this list in order and
+// takes the first candidate present, so an unambiguous "grand_total" always
+// beats a generic "total" that may well be a page subtotal.
 const GRAND_TOTAL_CANDIDATES = [
   "grandtotal",
   "grand_total",
+  "grandtotalamount",
+  "grand_total_amount",
   "invoicetotal",
   "invoice_total",
-  "nettotal",
-  "net_total",
-  "billamount",
-  "bill_amount",
-  "totalamount",
-  "total_amount",
+  "totalinvoicevalue",
+  "total_invoice_value",
+  "totalinvoiceamount",
+  "total_invoice_amount",
+  "invoicevalue",
+  "invoice_value",
   "invoiceamount",
   "invoice_amount",
-  "total",
+  "amountpayable",
+  "amount_payable",
+  "netpayable",
+  "net_payable",
+  "payableamount",
+  "payable_amount",
+  "billamount",
+  "bill_amount",
+  "nettotal",
+  "net_total",
+  "grosstotal",
+  "gross_total",
+  "finalamount",
+  "final_amount",
+  "totalamount",
+  "total_amount",
   "nettaxableamount",
   "net_taxable_amount",
+  "total",
 ];
 
+// Strips every non-alphanumeric character, so "Grand Total (INR)",
+// "grand-total" and "grand_total" all collapse to the same key. Kept in sync
+// with the normKey used for line-item table detection in Index.tsx.
 function normKey(k: string): string {
-  return k.toLowerCase().replace(/[\s_.]/g, "");
+  return k.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+// Drops a trailing currency/unit token from an already-normalised key, so
+// "totalamountinr" can still match the "totalamount" candidate. Applied only
+// when matching grand totals, and only as a fallback.
+const CURRENCY_SUFFIX_RE = /(inr|inrs|rs|rupees|usd|eur|gbp)$/;
+
+function stripCurrencySuffix(norm: string): string {
+  const stripped = norm.replace(CURRENCY_SUFFIX_RE, "");
+  // Guard against eating a whole short key (e.g. "rs" on its own).
+  return stripped.length >= 4 ? stripped : norm;
 }
 
 // Find a field in an item by any of the candidate keys; returns [key, numericValue].
@@ -400,23 +628,45 @@ function findFieldValue(
   for (const [k, v] of Object.entries(item)) {
     if (k === "validation") continue;
     if (normCandidates.has(normKey(k))) {
-      const n = parseFloat(String(v ?? ""));
+      // Thousands separators are common in OCR output — parseFloat would
+      // silently truncate "1,234.56" to 1 and wreck the line-amount sum.
+      const n = parseFloat(String(v ?? "").replace(/[,\s]/g, ""));
       if (!isNaN(n)) return { key: k, value: n };
     }
   }
   return null;
 }
 
-// Find a grand-total field in the document-level scalar map.
+// Find a grand-total field in the document-level scalar map. Candidates are
+// tried in priority order rather than taking whichever key the document
+// happens to list first, so the most specific name present always wins.
 function findGrandTotal(
   scalars: Record<string, unknown>,
 ): { key: string; value: number } | null {
-  const normCandidates = new Set(GRAND_TOTAL_CANDIDATES.map(normKey));
+  // Normalised key → original key + parsed value, for every numeric scalar.
+  const byNorm = new Map<string, { key: string; value: number }>();
+  const numeric: Array<{ key: string; norm: string; value: number }> = [];
   for (const [k, v] of Object.entries(scalars)) {
-    if (normCandidates.has(normKey(k))) {
-      const n = parseFloat(String(v ?? ""));
-      if (!isNaN(n)) return { key: k, value: n };
+    const n = parseFloat(String(v ?? "").replace(/[,\s]/g, ""));
+    if (isNaN(n)) continue;
+    const norm = normKey(k);
+    numeric.push({ key: k, norm, value: n });
+    // first occurrence of a name wins
+    if (!byNorm.has(norm)) byNorm.set(norm, { key: k, value: n });
+  }
+  // Second pass: currency/unit suffixes ride along on plenty of OCR'd headers
+  // — "Total Amount (INR)", "grand_total_rs". Register the stripped form as an
+  // alias, but only after every exact name is in, so a key that matches on its
+  // own is never displaced by another key's alias.
+  for (const { key, norm, value } of numeric) {
+    const denoised = stripCurrencySuffix(norm);
+    if (denoised !== norm && !byNorm.has(denoised)) {
+      byNorm.set(denoised, { key, value });
     }
+  }
+  for (const candidate of GRAND_TOTAL_CANDIDATES) {
+    const hit = byNorm.get(normKey(candidate));
+    if (hit) return hit;
   }
   return null;
 }
@@ -444,6 +694,13 @@ interface CalcValidationResult {
     field: string;
     documentTotal: number;
     ok: boolean;
+    /** Lines that contributed an amount to lineAmountSum. */
+    linesCounted: number;
+    /** Total lines on the invoice. */
+    linesTotal: number;
+    /** True when some line had no recognisable amount column, so the sum is
+     *  known to be short and a mismatch is not necessarily a real discrepancy. */
+    partial: boolean;
   } | null;
   allLinesHaveAmount: boolean;
 }
@@ -663,6 +920,7 @@ const ValidationResults = ({
     const lineResults: LineCalcResult[] = [];
     let lineAmountSum = 0;
     let allLinesHaveAmount = true;
+    let linesWithAmount = 0;
 
     for (let idx = 0; idx < items.length; idx++) {
       const item = items[idx] as Record<string, unknown>;
@@ -744,6 +1002,7 @@ const ValidationResults = ({
 
       if (lineAmtField) {
         lineAmountSum += lineAmtField.value;
+        linesWithAmount += 1;
       } else {
         allLinesHaveAmount = false;
       }
@@ -760,16 +1019,23 @@ const ValidationResults = ({
       });
     }
 
-    // Grand total check
+    // Grand total check. Lines without a recognisable amount column no longer
+    // suppress the whole check — a single scheme/free row used to hide it for
+    // the entire invoice. The sum covers whatever lines did carry an amount and
+    // is reported as partial so a shortfall isn't read as a real discrepancy.
     let grandTotalCheck: CalcValidationResult["grandTotalCheck"] = null;
-    if (documentScalars && allLinesHaveAmount && lineResults.length > 0) {
+    if (documentScalars && linesWithAmount > 0) {
       const gtField = findGrandTotal(documentScalars);
       if (gtField) {
         const sumRounded = parseFloat(lineAmountSum.toFixed(2));
+        const partial = !allLinesHaveAmount;
         grandTotalCheck = {
           field: gtField.key,
           documentTotal: gtField.value,
           ok: Math.abs(sumRounded - gtField.value) <= 0.05,
+          linesCounted: linesWithAmount,
+          linesTotal: lineResults.length,
+          partial,
         };
       }
     }
@@ -929,13 +1195,13 @@ const ValidationResults = ({
   }
 
   function selectPlu(itemIdx: number, opt: PluOption) {
-    const { discrepancies, corrections } = computeLocalValidation(
+    const { discrepancies, corrections, derived } = computeLocalValidation(
       items[itemIdx],
       opt,
     );
     setPluSelections((prev) => ({
       ...prev,
-      [itemIdx]: { plu_code: opt.plu_code, discrepancies, corrections },
+      [itemIdx]: { plu_code: opt.plu_code, discrepancies, corrections, derived },
     }));
 
     track("plu_selected", {
@@ -1325,6 +1591,15 @@ const ValidationResults = ({
                   const effectiveCorrections = hasSelection
                     ? pluSel.corrections
                     : v.suggested_corrections;
+                  // Values worked out rather than read off the invoice. A
+                  // selection re-derives locally, since the pack size that
+                  // produces the cost belongs to the chosen PLU.
+                  const derivedFields: Record<string, DerivedField> =
+                    hasSelection
+                      ? pluSel.derived
+                        ? { cost_price: pluSel.derived }
+                        : {}
+                      : (v.derived_fields ?? {});
 
                   // Remaining unresolved discrepancies
                   const effectiveDiscrepancies =
@@ -1398,6 +1673,14 @@ const ValidationResults = ({
                             editedVal !== undefined ? editedVal : item[key];
                           const isAccepted =
                             acceptedFields[idx]?.has(editKey) ?? false;
+                          // A value we worked out from the invoice's other
+                          // columns is labelled here too, not only inside the
+                          // expanded comparison — this row is what most users
+                          // read.
+                          const cellDerived =
+                            editedVal === undefined && !isAccepted
+                              ? (derivedFields[key] ?? null)
+                              : null;
                           return (
                             <TableCell
                               key={key}
@@ -1409,7 +1692,14 @@ const ValidationResults = ({
                                     : "text-foreground"
                               }`}
                             >
-                              {formatCellValue(displayVal)}
+                              <span className="inline-flex items-center gap-1.5">
+                                {formatCellValue(
+                                  cellDerived ? cellDerived.value : displayVal,
+                                )}
+                                {cellDerived && (
+                                  <DerivedBadge derived={cellDerived} />
+                                )}
+                              </span>
                             </TableCell>
                           );
                         })}
@@ -2079,11 +2369,21 @@ const ValidationResults = ({
                                               masterVal,
                                               isNumeric,
                                             }) => {
+                                              // A derived cost belongs to the
+                                              // selected PLU's pack size, so it
+                                              // takes precedence over anything
+                                              // already on the item.
+                                              const derivedHere =
+                                                field === "cost_price"
+                                                  ? (pluSel.derived ?? null)
+                                                  : null;
                                               const invoiceRaw =
+                                                derivedHere?.value ??
                                                 invoiceKeys.reduce<unknown>(
                                                   (acc, k) =>
                                                     acc !== undefined &&
-                                                    acc !== null
+                                                    acc !== null &&
+                                                    acc !== ""
                                                       ? acc
                                                       : item[k],
                                                   undefined,
@@ -2170,10 +2470,19 @@ const ValidationResults = ({
                                                         }
                                                       />
                                                     ) : (
-                                                      <span
-                                                        className={`text-sm font-mono ${isResolved2 ? "text-green-700 dark:text-green-400 font-medium" : ""}`}
-                                                      >
-                                                        {currentVal || "—"}
+                                                      <span className="inline-flex items-center gap-1.5">
+                                                        <span
+                                                          className={`text-sm font-mono ${isResolved2 ? "text-green-700 dark:text-green-400 font-medium" : ""}`}
+                                                        >
+                                                          {currentVal || "—"}
+                                                        </span>
+                                                        {derivedHere && (
+                                                          <DerivedBadge
+                                                            derived={
+                                                              derivedHere
+                                                            }
+                                                          />
+                                                        )}
                                                       </span>
                                                     )}
                                                   </TableCell>
@@ -2316,11 +2625,23 @@ const ValidationResults = ({
                                                 editingDiscrepancy[idx]?.has(
                                                   d.field,
                                                 ) ?? false;
+                                              // Gemini returns actual: null for
+                                              // a field it could not read, and
+                                              // a derived cost never reaches
+                                              // the discrepancy at all — fall
+                                              // back to the item so the column
+                                              // always shows Master vs Invoice.
+                                              const invoiceFallback =
+                                                derivedFields[d.field]?.value ??
+                                                d.actual ??
+                                                invoiceValueFor(item, d.field);
                                               const currentVal = getEditValue(
                                                 idx,
                                                 d.field,
-                                                d.actual,
+                                                invoiceFallback,
                                               );
+                                              const derivedHere =
+                                                derivedFields[d.field] ?? null;
                                               const masterStr =
                                                 effectiveCorrections[
                                                   d.field
@@ -2379,10 +2700,20 @@ const ValidationResults = ({
                                                         }
                                                       />
                                                     ) : (
-                                                      <span
-                                                        className={`text-sm font-mono ${resolved ? "text-green-700 dark:text-green-400 font-medium" : ""}`}
-                                                      >
-                                                        {currentVal || "—"}
+                                                      <span className="inline-flex items-center gap-1.5">
+                                                        <span
+                                                          className={`text-sm font-mono ${resolved ? "text-green-700 dark:text-green-400 font-medium" : ""}`}
+                                                        >
+                                                          {currentVal || "—"}
+                                                        </span>
+                                                        {derivedHere &&
+                                                          !resolved && (
+                                                            <DerivedBadge
+                                                              derived={
+                                                                derivedHere
+                                                              }
+                                                            />
+                                                          )}
                                                       </span>
                                                     )}
                                                   </TableCell>
@@ -2811,6 +3142,14 @@ const ValidationResults = ({
                 <CheckCircle2 className="w-3 h-3" />
                 Matches line sum
               </Badge>
+            ) : calcResults.grandTotalCheck.partial ? (
+              // Some lines had no amount column, so the sum is short by
+              // construction — flag it as incomplete, not as a discrepancy.
+              <Badge className="ml-auto bg-yellow-500/10 text-yellow-700 dark:text-yellow-400 border-yellow-500/20 gap-1 text-xs">
+                <AlertCircle className="w-3 h-3" />
+                Partial — {calcResults.grandTotalCheck.linesCounted} of{" "}
+                {calcResults.grandTotalCheck.linesTotal} lines
+              </Badge>
             ) : (
               <Badge className="ml-auto bg-destructive/10 text-destructive border-destructive/20 gap-1 text-xs">
                 <XCircle className="w-3 h-3" />
@@ -2842,7 +3181,9 @@ const ValidationResults = ({
                 <span className="text-xs text-muted-foreground">
                   Difference
                 </span>
-                <span className="font-mono font-semibold text-destructive">
+                <span
+                  className={`font-mono font-semibold ${calcResults.grandTotalCheck.partial ? "text-yellow-700 dark:text-yellow-400" : "text-destructive"}`}
+                >
                   {Math.abs(
                     calcResults.lineAmountSum -
                       calcResults.grandTotalCheck.documentTotal,
@@ -2851,6 +3192,15 @@ const ValidationResults = ({
               </div>
             )}
           </div>
+          {calcResults.grandTotalCheck.partial && (
+            <p className="px-4 pb-3 text-xs text-muted-foreground">
+              {calcResults.grandTotalCheck.linesTotal -
+                calcResults.grandTotalCheck.linesCounted}{" "}
+              line item(s) had no recognisable amount column and are not
+              included in the sum, so a difference here may not be a real
+              discrepancy.
+            </p>
+          )}
         </div>
       )}
     </TooltipProvider>

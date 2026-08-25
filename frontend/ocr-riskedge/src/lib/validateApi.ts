@@ -15,6 +15,27 @@ export interface PluOption {
   mrp: number | null;
   tax_pct: number | null;
   priority: number | null;
+  /** Unit of measure the catalog costs this item in, e.g. "BOX". */
+  uom?: string | null;
+  /** Individual units inside one UOM — the divisor that turns an invoice's
+   *  pack price into a per-unit cost. */
+  uom_qty?: number | null;
+}
+
+/** How a value the invoice never printed was worked out. */
+export interface DerivedField {
+  value: number;
+  source: "tax_amounts" | "gst_rate";
+  formula: string;
+  unit_price?: number;
+  price_source?: string;
+  uom?: string | null;
+  uom_qty?: number | null;
+  quantity?: number | null;
+  base_unit_cost?: number;
+  tax_total?: number | null;
+  total_units?: number | null;
+  tax_per_unit?: number;
 }
 
 export interface ValidationResult {
@@ -30,6 +51,10 @@ export interface ValidationResult {
   recommended_plu?: string | null;
   discrepancies: Discrepancy[];
   suggested_corrections: Record<string, number | string>;
+  /** Fields computed from other invoice columns rather than read off the
+   *  document — currently only cost_price. Rendered with a "derived" badge so
+   *  a computed figure is never mistaken for a printed one. */
+  derived_fields?: Record<string, DerivedField>;
 }
 
 export type ValidatedItem = {

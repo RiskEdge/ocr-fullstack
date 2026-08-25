@@ -12,6 +12,8 @@ dist
 dist-ssr
 *.local
 
+src/components/ValidationResults.derived.test.tsx
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

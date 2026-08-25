@@ -5,8 +5,10 @@ The public entry point is ValidationProcessor.validate_items().
 """
 
 import asyncio
+import difflib
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 from google import genai
@@ -90,6 +92,34 @@ _RAW_FIELD_ALIASES: dict[str, str] = {
     # Quantity (not validated, just passed through)
     "qty":                "quantity",
     "quantity":           "quantity",
+    # Pack size — the number of individual units inside one invoiced UOM.
+    # The catalog is the authority on it, but an invoice that prints its own
+    # value lets a line be reconciled even when the catalog's is missing.
+    "uom":                "uom",
+    "unit":               "uom",
+    "unitofmeasure":      "uom",
+    "uomqty":             "uom_qty",
+    "uomquantity":        "uom_qty",
+    "packsize":           "uom_qty",
+    "unitsperpack":       "uom_qty",
+    "conversionfactor":   "uom_qty",
+    # Invoice-side money columns used to derive a missing cost price.
+    # "Rate"/"Price" on an item table is the price of one invoiced UOM, not of
+    # one individual unit — see derive_cost_price().
+    "invoiceprice":       "invoice_price",
+    "rate":               "invoice_price",
+    "brate":              "invoice_price",
+    "basicrate":          "invoice_price",
+    "baserate":           "invoice_price",
+    "purchaserate":       "invoice_price",
+    "unitprice":          "invoice_price",
+    "unitrate":           "invoice_price",
+    "price":              "invoice_price",
+    # Line totals before tax — the fallback when no unit rate is printed.
+    "taxablevalue":       "taxable_value",
+    "taxableamount":      "taxable_value",
+    "taxableamt":         "taxable_value",
+    "assessablevalue":    "taxable_value",
 }
 
 
@@ -112,6 +142,11 @@ _FIELD_ALIASES: dict[str, str] = {
 _TAX_TOKENS     = ("gst", "tax", "vat")
 _RATE_TOKENS    = ("percent", "percentage", "pct", "rate", "%")
 _AMOUNT_TOKENS  = ("amount", "amt", "value", "total", "sum")
+# Rate/price columns that are somebody else's number, not the price this
+# invoice charges per unit.
+_NOT_INVOICE_PRICE = (
+    "retail", "mrp", "sale", "sell", "discount", "margin", "exchange", "conversion",
+)
 
 
 # A description column names a *thing*, so it must not be a code/number column:
@@ -120,13 +155,49 @@ _NAME_SUBJECTS = ("item", "product", "article", "goods", "material", "commodity"
 _NOT_NAME      = ("code", "ean", "barcode", "hsn", "sac", "plu", "sku no", "number")
 
 
+# GST is split into halves on an intra-state invoice (SGST + CGST) and levied
+# whole on an inter-state one (IGST). Their *amounts* are summed to recover the
+# line's tax; their *rates* are not interchangeable with the GST rate, since
+# SGST 2.5% + CGST 2.5% is a 5% item.
+_TAX_COMPONENTS = (
+    ("sgst",  "sgst_amount",  "sgst_pct"),
+    ("utgst", "sgst_amount",  "sgst_pct"),
+    ("cgst",  "cgst_amount",  "cgst_pct"),
+    ("igst",  "igst_amount",  "gst_percent"),
+)
+
+
+def _infer_tax_component(raw_key: str) -> Optional[str]:
+    """
+    Classify an SGST/CGST/IGST column as an amount or a rate.
+
+    _norm_key() strips the '%' that is often the only thing telling them apart
+    ('SGST' vs 'SGST %'), so this runs on the raw header ahead of the alias
+    table. Only IGST's rate is the full GST rate; the state/central halves get
+    their own keys and are never compared against the catalog's gst_percent.
+    """
+    k = raw_key.strip().lower()
+    for token, amount_field, rate_field in _TAX_COMPONENTS:
+        if token not in k:
+            continue
+        is_rate = any(t in k for t in _RATE_TOKENS)
+        return rate_field if is_rate else amount_field
+    return None
+
+
 def _infer_canonical(raw_key: str) -> Optional[str]:
     """
     Map unseen header spellings to canonical fields:
       'GST Rate %', 'Tax-Rate'                  → gst_percent
+      'Tax Amount', 'GST Amt'                   → gst_amount
       'Item Description', 'Name of the Article' → sku_description
     """
     k = raw_key.strip().lower()
+
+    # 'Taxable Value' names the base the tax is charged on, not the tax — it is
+    # spelled out in the alias table and must not fall into either branch below.
+    if "taxable" in k or "assessable" in k:
+        return None
 
     if any(t in k for t in _TAX_TOKENS) and any(t in k for t in _RATE_TOKENS):
         if not any(t in k for t in _AMOUNT_TOKENS):
@@ -134,7 +205,24 @@ def _infer_canonical(raw_key: str) -> Optional[str]:
         return None
 
     if any(t in k for t in _AMOUNT_TOKENS):
+        # A combined tax-amount column ('GST Amount') stands in for SGST+CGST
+        # when the invoice does not split them. Every other amount column is
+        # left alone.
+        if any(t in k for t in _TAX_TOKENS):
+            return "gst_amount"
         return None
+
+    # What one invoiced unit costs, under whichever of the endless spellings
+    # this vendor uses: 'Net Rate', 'Basic Price', 'P.Rate', 'Rate / Unit'.
+    # Line totals were excluded by the amount branch above, and the specific
+    # price columns (cost / sale / MRP) are spelled out in the alias table —
+    # so what is left here is the unit rate.
+    if any(t in k for t in ("rate", "price")):
+        if any(t in k for t in _NOT_INVOICE_PRICE):
+            return None
+        if "cost" in k:
+            return "cost_price"
+        return "invoice_price"
     if any(t in k for t in _NOT_NAME):
         return None
     if "desc" in k or "particular" in k:
@@ -146,7 +234,14 @@ def _infer_canonical(raw_key: str) -> Optional[str]:
 
 # Canonical fields coerced to numbers at normalisation time, so every consumer
 # (local compare, Gemini prompts, the frontend) sees 5.0 rather than "5%".
-_NUMERIC_FIELDS = frozenset({"cost_price", "mrp", "sale_price", "gst_percent"})
+_NUMERIC_FIELDS = frozenset({
+    "cost_price", "mrp", "sale_price", "gst_percent",
+    # Inputs to derive_cost_price() — parsed here so the derivation works on
+    # '₹1,190.40' and '5 %' exactly as it does on plain numbers.
+    "invoice_price", "taxable_value", "quantity", "uom_qty",
+    "sgst_amount", "cgst_amount", "igst_amount", "gst_amount",
+    "sgst_pct", "cgst_pct",
+})
 
 _CURRENCY_RE = re.compile(r"^(?:rs\.?|inr|usd|₹|\$)\s*", re.IGNORECASE)
 _NUMERIC_RE  = re.compile(r"^[-+]?\d[\d,]*(?:\.\d*)?$")
@@ -247,7 +342,12 @@ def normalize_item(raw: dict) -> dict:
     """
     out: dict = {}
     for k, v in raw.items():
-        canonical = _FIELD_ALIASES.get(_norm_key(k)) or _infer_canonical(k) or k
+        canonical = (
+            _infer_tax_component(k)
+            or _FIELD_ALIASES.get(_norm_key(k))
+            or _infer_canonical(k)
+            or k
+        )
         if canonical in _NUMERIC_FIELDS:
             num = _to_float(v)
             if num is not None:
@@ -305,13 +405,45 @@ def _name_tokens(product_name: str) -> list[str]:
     ]
 
 
+# A token this similar to a catalog word is treated as the same word misspelt.
+# Calibrated on real catalog data: "tennis"/"tennies" = 0.92 and "ball"/"balls"
+# = 0.89 are the same product, while "cotton"/"cricket" = 0.31 and
+# "ball"/"balloons" = 0.67 are not. 0.85 sits in the empty band between them.
+_FUZZY_TOKEN_THRESHOLD = 0.85
+# Below this length a single edit swamps the ratio ("pen"/"pin" = 0.67), so
+# short tokens must match exactly.
+_FUZZY_MIN_TOKEN_LEN = 5
+
+
+def _fuzzy_token_hit(tok: str, desc_words: set[str]) -> float:
+    """
+    Best similarity between `tok` and any word of the description, as a credit
+    in [0, 1]; 0.0 when nothing clears _FUZZY_TOKEN_THRESHOLD.
+
+    This is what lets an invoice "TENNIS BALL" find the catalog's misspelt
+    "CRICKET TENNIES BALL" — a plain substring search never can.
+    """
+    if len(tok) < _FUZZY_MIN_TOKEN_LEN:
+        return 0.0
+    best = 0.0
+    for word in desc_words:
+        if not word or abs(len(word) - len(tok)) > 3:
+            continue  # length gap that far apart is never a typo
+        ratio = difflib.SequenceMatcher(None, tok, word).ratio()
+        if ratio > best:
+            best = ratio
+    return best if best >= _FUZZY_TOKEN_THRESHOLD else 0.0
+
+
 def _name_match_score(query_tokens: list[str], description: object) -> float:
     """
     How well a catalog description covers the invoice product name: 1.0 when
     every invoice word appears as a whole word in the description.
 
-    Whole-word hits count fully; substring hits count a fraction, so
-    "SCRUBBER" never outranks "RUBBER BANDS" for the query word "rubber".
+    Whole-word hits count fully; near-miss hits count almost as much, so a
+    misspelt master record still outranks an unrelated one that happens to
+    share a common word; substring hits count a fraction, so "SCRUBBER" never
+    outranks "RUBBER BANDS" for the query word "rubber".
     """
     desc = str(description or "").lower()
     if not query_tokens or not desc:
@@ -321,9 +453,28 @@ def _name_match_score(query_tokens: list[str], description: object) -> float:
     for tok in query_tokens:
         if tok in desc_words:
             score += 1.0
+            continue
+        fuzzy = _fuzzy_token_hit(tok, desc_words)
+        if fuzzy:
+            # Scaled by similarity so an exact hit always beats a near one.
+            score += fuzzy
         elif len(tok) >= 4 and tok in desc:
             score += 0.25
     return score / len(query_tokens)
+
+
+def _best_name_score(query_tokens: list[str], row: dict) -> float:
+    """
+    Score a catalog row on whichever of its two description columns fits the
+    invoice name better. The short description is not a truncation of the long
+    one — the ERP supplies it separately, brand-stripped and abbreviated
+    ("COCA COLA 2LTR" / "COKE 2L") — so an invoice name may only resemble one
+    of them.
+    """
+    return max(
+        _name_match_score(query_tokens, row.get("sku_description")),
+        _name_match_score(query_tokens, row.get("sku_short_description")),
+    )
 
 
 def _norm_name(value: object) -> str:
@@ -359,7 +510,9 @@ def _corroborated_rows(rows: list[dict], product_name: str) -> list[dict]:
     tokens = _name_tokens(product_name)
     if not tokens:
         return rows
-    corroborated = [r for r in rows if _name_match_score(tokens, r.get("sku_description")) > 0]
+    # Either description may be the one that corroborates the code — the short
+    # form drops the brand, so it can match an invoice name the long form misses.
+    corroborated = [r for r in rows if _best_name_score(tokens, r) > 0]
     return corroborated
 
 
@@ -391,11 +544,19 @@ def _to_plu_option(r: dict) -> dict:
     return {
         "plu_code":   r.get("plu_code"),
         "sku_desc":   r.get("sku_description"),
+        # The ERP's brand-stripped alias, carried through so the multi-PLU
+        # picker can show it: it is often the form a user recognises when the
+        # long description is unfamiliar. Nothing renders it yet.
+        "sku_short_desc": r.get("sku_short_description"),
         "ean_code":   r.get("ean_code"),
         "cost_price": r.get("cost_price"),
         "mrp":        r.get("mrp"),
         "tax_pct":    r.get("gst_percent"),
         "priority":   r.get("priority"),
+        # Pack size — the frontend re-derives a missing cost price when the
+        # user picks a PLU, and cannot do that without it.
+        "uom":        r.get("uom"),
+        "uom_qty":    r.get("uom_qty"),
     }
 
 
@@ -404,9 +565,29 @@ _MAX_OPTIONS = 5
 
 # Name-search tunables: how many words of the product name are searched, how
 # many rows each word may contribute, and how many survive ranking.
+#
+# The fetch limit is per probe and exists only to bound a pathological query,
+# not to rank — ranking happens in Python over the pooled rows. It was 25,
+# which on a 20k-row catalog silently dropped correct matches: a common word
+# like "BALL" matches 59 rows of which 51 share priority=1, so
+# `ORDER BY priority LIMIT 25` returned an arbitrary 25 of the 51 and the right
+# row was discarded before it could ever be scored.
+# One shared pool for every probe fan-out, rather than a pool per call.
+# get_supabase() hands out one client per thread, so fresh threads would mean a
+# fresh client and TLS handshake on every line item. Sized to cover a whole
+# fan-out at once (the full name plus _MAX_SEARCH_KEYWORDS words) with room for
+# a second request running alongside; beyond that, probes queue rather than
+# opening more connections to the database.
+_PROBE_POOL = ThreadPoolExecutor(max_workers=10, thread_name_prefix="catalog-probe")
+
 _MAX_SEARCH_KEYWORDS = 4
-_KEYWORD_FETCH_LIMIT = 25
+_KEYWORD_FETCH_LIMIT = 400
 _MAX_CANDIDATES = 20
+
+# Words are also probed by prefix, so a description that misspells the tail of
+# a word ("TENNIS" vs "TENNIES") is still retrieved. Short enough to survive a
+# typo, long enough not to drag in unrelated rows.
+_PREFIX_PROBE_LEN = 5
 
 
 def _ilike_pattern(text: str) -> str:
@@ -416,6 +597,20 @@ def _ilike_pattern(text: str) -> str:
     ("5% PACK" vs "5 PACK"), so matching anything there is the wanted result.
     """
     return "%{}%".format(re.sub(r"[%_*]+", "%", text.strip()))
+
+
+def _or_ilike_filter(pattern: str) -> str:
+    """
+    An `or=` filter matching `pattern` against either description column.
+
+    PostgREST parses `or=(...)` on commas and parentheses, so a product name
+    containing them ("PACK (2), 500G") would otherwise split the filter into
+    nonsense and error the query. They are replaced by a wildcard for the same
+    reason _ilike_pattern replaces the wildcard characters: in an OCR'd name
+    they are noise, and matching anything in their place is what we want.
+    """
+    safe = re.sub(r'[(),."]+', "%", pattern)
+    return f"sku_description.ilike.{safe},sku_short_description.ilike.{safe}"
 
 
 def _rank_options(
@@ -453,6 +648,274 @@ def _rank_options(
             seen.add(plu)
 
     return [_to_plu_option(r) for r in ordered[:limit]]
+
+
+# ---------------------------------------------------------------------------
+# Derived cost price
+# ---------------------------------------------------------------------------
+
+# Money is compared to the paisa, so the derived figure is published at the same
+# precision. Only the final value is rounded — rounding the base cost first
+# turns 12.4992 into 12.4952, which then reads as a discrepancy against a
+# catalog cost of 12.50.
+_COST_PRECISION = 2
+
+# Below this the derivation is dividing by noise (a zero rate, a blank qty) and
+# would publish a confidently wrong cost.
+_MIN_DERIVE_INPUT = 0.0001
+
+
+def _norm_uom(val: object) -> str:
+    """'BOX', 'Box.', 'boxes' → 'BOX'. Empty when the value carries no letters."""
+    letters = re.sub(r"[^A-Za-z]", "", str(val or "")).upper()
+    return letters[:-2] if letters.endswith("ES") else letters.rstrip("S")
+
+
+def _uom_compatible(item: dict, master: dict) -> bool:
+    """
+    Whether the invoice quantity counts the same thing the catalog's uom_qty
+    unpacks. When the invoice prints 'PCS' against a catalog 'BOX' its quantity
+    is already in individual units, so applying uom_qty would count the pack
+    twice — better to leave the cost blank than to state a wrong one. A line
+    that prints no UOM at all is taken at the catalog's word.
+    """
+    inv_uom    = _norm_uom(item.get("uom"))
+    master_uom = _norm_uom(master.get("uom"))
+    if not inv_uom or not master_uom:
+        return True
+    return inv_uom == master_uom
+
+
+def _tax_total(item: dict) -> Optional[float]:
+    """
+    The line's total tax: SGST + CGST + IGST as printed, or a combined GST
+    amount column when the invoice does not split them. None when the invoice
+    shows no tax amount at all — 0.0 is a real (exempt) answer and is kept.
+    """
+    parts = [
+        _to_float(item.get(f))
+        for f in ("sgst_amount", "cgst_amount", "igst_amount")
+    ]
+    present = [p for p in parts if p is not None]
+    if present:
+        return sum(present)
+    return _to_float(item.get("gst_amount"))
+
+
+def _gst_rate(item: dict) -> Optional[float]:
+    """The line's full GST rate, reassembled from the halves if that is all
+    the invoice printed."""
+    rate = _to_float(item.get("gst_percent"))
+    if rate is not None:
+        return rate
+    halves = [_to_float(item.get("sgst_pct")), _to_float(item.get("cgst_pct"))]
+    present = [h for h in halves if h is not None]
+    return sum(present) if present else None
+
+
+def _fmt_num(val: float) -> str:
+    """Trim a computed float for display: 11.904 stays, 10.0 becomes 10."""
+    return f"{val:.4f}".rstrip("0").rstrip(".") or "0"
+
+
+def derive_cost_price(item: dict, master: dict) -> tuple[Optional[float], Optional[dict]]:
+    """
+    Reconstruct the per-unit cost price of a line the invoice never printed one
+    for, from the money it did print plus the catalog's pack size.
+
+    An invoice prices a pack ("119.04 per BOX") while the catalog costs an
+    individual unit, so the two only meet once uom_qty is applied:
+
+        base cost per unit = invoice price / uom_qty        119.04 / 10 = 11.904
+        tax per unit       = line tax / (qty * uom_qty)     29.76 / 50  = 0.5952
+        cost price         = base + tax                                 = 12.50
+
+    The tax leg falls back to the GST rate when the invoice prints no tax
+    amounts; the two routes are algebraically the same, since the printed
+    SGST + CGST is itself qty * price * rate.
+
+    Returns (value, breakdown) — (None, None) whenever an input is missing,
+    non-positive, or the units do not line up. A cost price the invoice *did*
+    print is never overwritten.
+    """
+    if _to_float(item.get("cost_price")) is not None:
+        return None, None
+    if not _uom_compatible(item, master):
+        return None, None
+
+    uom_qty = _to_float(master.get("uom_qty"))
+    if uom_qty is None:
+        uom_qty = _to_float(item.get("uom_qty"))
+    # A catalog that does not unpack the UOM sells the invoiced unit itself.
+    if uom_qty is None:
+        uom_qty = 1.0
+    if uom_qty < _MIN_DERIVE_INPUT:
+        return None, None
+
+    quantity = _to_float(item.get("quantity"))
+
+    # Unit price as printed, else recovered from the line total before tax.
+    unit_price = _to_float(item.get("invoice_price"))
+    price_note = "invoice price"
+    if unit_price is None:
+        taxable = _to_float(item.get("taxable_value"))
+        if taxable is None or quantity is None or quantity < _MIN_DERIVE_INPUT:
+            return None, None
+        unit_price = taxable / quantity
+        price_note = "taxable value / qty"
+    if unit_price < _MIN_DERIVE_INPUT:
+        return None, None
+
+    base_unit_cost = unit_price / uom_qty
+
+    tax_total   = _tax_total(item)
+    total_units = quantity * uom_qty if quantity is not None else None
+    if tax_total is not None and total_units is not None and total_units >= _MIN_DERIVE_INPUT:
+        tax_per_unit = tax_total / total_units
+        source       = "tax_amounts"
+        tax_formula  = f"{_fmt_num(tax_total)} / {_fmt_num(total_units)}"
+    else:
+        rate = _gst_rate(item)
+        if rate is None:
+            return None, None
+        tax_per_unit = base_unit_cost * rate / 100.0
+        source       = "gst_rate"
+        tax_formula  = f"{_fmt_num(base_unit_cost)} x {_fmt_num(rate)}%"
+
+    cost_price = round(base_unit_cost + tax_per_unit, _COST_PRECISION)
+    if cost_price <= 0:
+        return None, None
+
+    breakdown = {
+        "value":          cost_price,
+        "source":         source,
+        "unit_price":     round(unit_price, 4),
+        "price_source":   price_note,
+        "uom_qty":        uom_qty,
+        "uom":            master.get("uom") or item.get("uom"),
+        "quantity":       quantity,
+        "base_unit_cost": round(base_unit_cost, 4),
+        "tax_total":      tax_total,
+        "total_units":    total_units,
+        "tax_per_unit":   round(tax_per_unit, 4),
+        "formula": (
+            f"{_fmt_num(unit_price)} / {_fmt_num(uom_qty)} + {tax_formula} "
+            f"= {cost_price:.2f}"
+        ),
+    }
+    return cost_price, breakdown
+
+
+def with_derived_cost(
+    item: dict, master: dict, log: bool = True
+) -> tuple[dict, Optional[dict]]:
+    """
+    `item` with a derived cost_price filled in where the invoice left one out,
+    plus the breakdown that produced it (None when nothing was derived).
+
+    Applied per candidate row rather than once per line, because uom_qty is a
+    property of the PLU: two candidates can imply two different unit costs.
+    """
+    value, breakdown = derive_cost_price(item, master)
+    if value is None:
+        # Only interesting when a cost price was actually wanted: a line that
+        # printed one is supposed to skip this path silently. Named inputs make
+        # an unrecognised column header a one-line diagnosis instead of a
+        # guessing game about why a line came back blank.
+        if log and _to_float(item.get("cost_price")) is None:
+            print(
+                f"[validate-data] cost price not derived — plu={master.get('plu_code')} "
+                f"reason={_derive_blocker(item, master)} keys={sorted(item.keys())}"
+            )
+        return item, None
+    return {**item, "cost_price": value}, breakdown
+
+
+def _derive_blocker(item: dict, master: dict) -> str:
+    """Which input stopped derive_cost_price() — for the log line above."""
+    if not _uom_compatible(item, master):
+        return (
+            f"uom mismatch (invoice {item.get('uom')!r} vs catalog {master.get('uom')!r})"
+        )
+    uom_qty = _to_float(master.get("uom_qty"))
+    if uom_qty is None:
+        uom_qty = _to_float(item.get("uom_qty"))
+    if uom_qty is not None and uom_qty < _MIN_DERIVE_INPUT:
+        return f"uom_qty is {uom_qty}"
+
+    quantity = _to_float(item.get("quantity"))
+    if _to_float(item.get("invoice_price")) is None:
+        if _to_float(item.get("taxable_value")) is None:
+            return "no unit price and no taxable value on the line"
+        if quantity is None or quantity < _MIN_DERIVE_INPUT:
+            return "taxable value present but quantity missing"
+    if _tax_total(item) is None and _gst_rate(item) is None:
+        return "no tax amount and no gst rate on the line"
+    return "inputs present but non-positive"
+
+
+def _derived_fields(breakdown: Optional[dict]) -> dict:
+    """
+    The `derived_fields` key for a validation result, or nothing at all.
+
+    A derived cost price is filled into the item so every existing consumer
+    (comparison table, export) shows it, which would otherwise make it
+    indistinguishable from a figure the vendor printed. This is what lets the
+    UI label it as computed and show the arithmetic behind it.
+    """
+    if not breakdown:
+        return {}
+    return {"derived_fields": {"cost_price": breakdown}}
+
+
+def _row_by_plu(rows: list[dict], plu: object) -> Optional[dict]:
+    """The row Gemini named, matched on PLU as a string so 02176501 and
+    2176501 do not miss each other."""
+    if plu is None:
+        return None
+
+    def key(val: object) -> str:
+        code = _code_str(val) or ""
+        # A PLU that survived a JSON round-trip as a number has lost its
+        # leading zeros; the catalog's has not.
+        return code.lstrip("0") or code
+
+    target = key(plu)
+    for r in rows:
+        if key(r.get("plu_code")) == target:
+            return r
+    return None
+
+
+def _reconcile_cost_price(validation: dict, item: dict, master: dict) -> None:
+    """
+    Re-decide the cost_price verdict in place, now that the line has a derived
+    cost to compare. Gemini saw no cost price at all, so whatever it said about
+    the field was said blind: any existing cost_price discrepancy is replaced,
+    never stacked on top of.
+    """
+    inv_val    = _to_float(item.get("cost_price"))
+    master_val = _to_float(master.get("cost_price"))
+
+    validation["discrepancies"] = [
+        d for d in validation.get("discrepancies", []) if d.get("field") != "cost_price"
+    ]
+    corrections = dict(validation.get("suggested_corrections") or {})
+    corrections.pop("cost_price", None)
+
+    if inv_val is not None and master_val is not None and abs(inv_val - master_val) > 0.01:
+        validation["discrepancies"].append({
+            "field":    "cost_price",
+            "expected": master_val,
+            "actual":   inv_val,
+            "message": (
+                f"Cost Price mismatch: invoice works out to {inv_val}, "
+                f"master has {master_val}."
+            ),
+        })
+        corrections["cost_price"] = master_val
+
+    validation["suggested_corrections"] = corrections
 
 
 # ---------------------------------------------------------------------------
@@ -619,14 +1082,19 @@ Master records (JSON):
         ean     = item.get("ean_code", "unknown")
         product = item.get("sku_description") or item.get("product_name") or "unknown"
 
+        # Both descriptions are shown: the short form is the ERP's own
+        # brand-stripped alias ("COKE 2L" for "COCA COLA 2LTR"), so it often
+        # resembles the invoice wording more closely than the long one, and it
+        # also reveals a misspelling present in only one of the two.
         candidates_lines = [
             f"  PLU {r['plu_code']} | EAN {r.get('ean_code')} | "
             f"'{r.get('sku_description') or '—'}' | "
+            f"short: '{r.get('sku_short_description') or '—'}' | "
             f"Cost={r.get('cost_price')}, MRP={r.get('mrp')}, GST%={r.get('gst_percent')}"
             for r in candidates
         ]
         candidates_json = json.dumps([
-            {k: r.get(k) for k in ("plu_code", "ean_code", "sku_description", "cost_price", "mrp", "gst_percent", "priority")}
+            {k: r.get(k) for k in ("plu_code", "ean_code", "sku_description", "sku_short_description", "cost_price", "mrp", "gst_percent", "priority")}
             for r in candidates
         ])
 
@@ -649,6 +1117,11 @@ Possible master records (matched by product name keyword):
 Task:
 1. Choose the master record that most likely represents the same product
    (use product name similarity, then MRP, then GST% as tiebreakers).
+   Master descriptions are ERP-entered and may be MISSPELT or abbreviated
+   ("TENNIES" for "TENNIS"), and the short description drops the brand
+   ("COKE 2L" for "COCA COLA 2LTR"). Judge the product identity, not the
+   spelling: a misspelt record naming the same product beats a correctly
+   spelt record naming a different one.
 2. If no record is a reasonable match, set "matched_plu" to null.
 3. Compare cost_price, mrp, gst_percent, AND sku_description between the invoice and the chosen record.
    Compare numeric fields NUMERICALLY — values that differ only in formatting are EQUAL and must
@@ -753,43 +1226,110 @@ Master records (JSON):
         the real record, so the rarer words are always searched too and the
         pooled rows are re-ranked by how much of the invoice name they cover.
 
+        Both description columns are searched. sku_short_description is not a
+        truncation of sku_description — the ERP supplies it separately, with
+        the brand stripped and words abbreviated ("COCA COLA 2LTR" is stored
+        alongside "COKE 2L") — so an invoice name frequently matches only one
+        of the two.
+
         Returns at most _MAX_CANDIDATES rows, best match first.
         """
         keywords = _name_keywords(product_name)[:_MAX_SEARCH_KEYWORDS]
         if not keywords:
             return []
 
-        pooled: dict[str, dict] = {}
-
-        def pool(pattern: str) -> None:
+        def probe(pattern: str) -> list[dict]:
             q = (
                 get_supabase()
                 .table("product_catalog")
                 .select("*")
-                .ilike("sku_description", pattern)
+                # Either description column may carry the recognisable name.
+                .or_(_or_ilike_filter(pattern))
+                # plu_code breaks priority ties deterministically. Without it a
+                # truncated result set is an arbitrary sample of the tied rows,
+                # so the same query can return different rows run to run.
                 .order("priority")
+                .order("plu_code")
                 .limit(_KEYWORD_FETCH_LIMIT)
             )
             if company_id:
                 q = q.eq("company_id", company_id)
-            for row in q.execute().data:
-                pooled.setdefault(str(row.get("plu_code") or row.get("id")), row)
+            return q.execute().data
+
+        def run(patterns: list[str]) -> list[list[dict]]:
+            """
+            Probes are independent queries, so they go out together rather than
+            one round-trip after another — this function is already called once
+            per line item, and the round-trips dominate its cost. Results are
+            returned in `patterns` order, so pooling stays deterministic.
+            """
+            if len(patterns) == 1:
+                return [probe(patterns[0])]
+            return list(_PROBE_POOL.map(probe, patterns))
 
         # The whole description first. A row containing the entire invoice name
         # is the answer, and a per-word search can bury it behind rows that
         # merely share one common word.
-        pool(_ilike_pattern(product_name))
-        for keyword in keywords:
-            pool(_ilike_pattern(keyword))
+        wave1 = [_ilike_pattern(product_name)] + [_ilike_pattern(k) for k in keywords]
+        results = run(wave1)
+
+        pooled: dict[str, dict] = {}
+
+        def absorb(rows: list[dict]) -> None:
+            for row in rows:
+                pooled.setdefault(str(row.get("plu_code") or row.get("id")), row)
+
+        for rows in results:
+            absorb(rows)
+
+        # Prefix probes retrieve rows whose spelling diverges after the first
+        # few characters, which an exact substring search misses entirely. Only
+        # worth a round-trip for a word that found nothing — that is exactly the
+        # misspelt case ("TENNIS" finds no row because the catalog says
+        # "TENNIES"). When the word did match, the prefix returns a superset we
+        # do not need and every lookup would pay for it.
+        prefixes: list[str] = []
+        for keyword, rows in zip(keywords, results[1:]):
+            if rows or len(keyword) <= _PREFIX_PROBE_LEN:
+                continue
+            prefix = _ilike_pattern(keyword[:_PREFIX_PROBE_LEN])
+            if prefix not in prefixes:
+                prefixes.append(prefix)
+        if prefixes:
+            for rows in run(prefixes):
+                absorb(rows)
 
         tokens = _name_tokens(product_name)
-        ranked = sorted(
-            pooled.values(),
-            key=lambda r: (
-                -_name_match_score(tokens, r.get("sku_description")),
+        target = _norm_name(product_name)
+
+        def sort_key(r: dict) -> tuple:
+            score = _best_name_score(tokens, r)
+            names = (_norm_name(r.get("sku_description")),
+                     _norm_name(r.get("sku_short_description")))
+            # A description identical to the invoice name is the answer and must
+            # never be cut by the _MAX_CANDIDATES trim. Without this an invoice
+            # name that reduces to one common token ("MAGGI 560GM" -> "maggi")
+            # leaves every MAGGI row tied on score, and the exact row can lose
+            # its place to an arbitrary sibling.
+            exact = 0 if target and target in names else 1
+            # Among equal scores prefer the tighter description: every query
+            # word is present in both, so the one carrying fewer unrelated
+            # extra words is the closer product ("TATA SALT 1KG" over
+            # "TATA SALT PLUS IRON+IODINE 1KG"). Only ever a tiebreaker.
+            extra = min(
+                (len([w for w in re.split(r"[^a-z0-9&]+", n) if w and w not in tokens])
+                 for n in names if n),
+                default=10**6,
+            )
+            return (
+                exact,
+                -score,
+                extra,
                 r.get("priority") if r.get("priority") is not None else 10**9,
-            ),
-        )
+                str(r.get("plu_code") or ""),
+            )
+
+        ranked = sorted(pooled.values(), key=sort_key)
         return ranked[:_MAX_CANDIDATES]
 
     # ------------------------------------------------------------------
@@ -950,26 +1490,49 @@ Master records (JSON):
             # ── Single PLU fast path ─────────────────────────────────────
             if len(master_rows) == 1:
                 matched_exact += 1
+                priced, derived = with_derived_cost(item, master_rows[0])
                 results.append({
-                    **item,
+                    **priced,
                     "validation": {
-                        **local_compare(item, master_rows[0]),
+                        **local_compare(priced, master_rows[0]),
                         "match_source": match_source,
+                        **_derived_fields(derived),
                     },
                 })
                 continue
 
             # ── Multiple PLUs ────────────────────────────────────────────
-            comparisons = [(r, local_compare(item, r)) for r in master_rows]
+            # Derivation is per row: uom_qty belongs to the PLU, so each
+            # candidate implies its own unit cost and must be compared against
+            # the one it implies.
+            # Every candidate is tried, but only the first reports a failure:
+            # the blocker is a property of the invoice line, so N candidates
+            # would otherwise print N copies of the same diagnosis.
+            priced_rows  = [
+                with_derived_cost(item, r, log=(i == 0))
+                for i, r in enumerate(master_rows)
+            ]
+            comparisons  = [
+                (r, priced, derived, local_compare(priced, r))
+                for r, (priced, derived) in zip(master_rows, priced_rows)
+            ]
             clean = next(
-                ((r, cmp) for r, cmp in comparisons if not cmp["discrepancies"]),
+                ((r, priced, derived, cmp) for r, priced, derived, cmp in comparisons
+                 if not cmp["discrepancies"]),
                 None,
             )
 
             if clean:
-                _, cmp = clean
+                _, priced, derived, cmp = clean
                 matched_exact += 1
-                results.append({**item, "validation": {**cmp, "match_source": match_source}})
+                results.append({
+                    **priced,
+                    "validation": {
+                        **cmp,
+                        "match_source": match_source,
+                        **_derived_fields(derived),
+                    },
+                })
             elif auto_select_plu:
                 gemini_calls += 1
                 placeholder_idx = len(results)
@@ -1007,11 +1570,13 @@ Master records (JSON):
                     ean = _ean_str(item.get("ean_code"))
                     master_rows_fb = master_lookup.get(ean or "", [])
                     if master_rows_fb:
+                        priced, derived = with_derived_cost(item, master_rows_fb[0])
                         results[result_idx] = {
-                            **item,
+                            **priced,
                             "validation": {
-                                **local_compare(item, master_rows_fb[0]),
+                                **local_compare(priced, master_rows_fb[0]),
                                 "match_type": "auto_selected",
+                                **_derived_fields(derived),
                             },
                         }
                     else:
@@ -1036,6 +1601,22 @@ Master records (JSON):
                         d for d in validation.get("discrepancies", [])
                         if float(d.get("risk_score", 1.0)) >= threshold
                     ]
+
+                    # Gemini is told to skip fields the invoice left blank, so a
+                    # cost price that only exists once the pack size is applied
+                    # is invisible to it. Derive it here — against the record it
+                    # actually chose, since uom_qty is per-PLU — and reconcile
+                    # the cost_price verdict with the value that produces.
+                    matched_row = _row_by_plu(
+                        queued_candidates.get(result_idx, []),
+                        validation.get("matched_plu"),
+                    )
+                    if matched_row is not None:
+                        item, derived = with_derived_cost(item, matched_row)
+                        if derived:
+                            validation.update(_derived_fields(derived))
+                            _reconcile_cost_price(validation, item, matched_row)
+
                     # An item is only valid if a real master record was matched
                     # AND no discrepancies survive the risk threshold. When
                     # matched_plu is null (Gemini found no genuine match) there

@@ -4,6 +4,13 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 import { TableRow } from "@/components/DataTable";
 
+/** Raw OCR payload as returned by the backend, kept alongside the rendered
+ *  rows so validation can still run after a restore from history. */
+export interface RawContent {
+  total_pages: number;
+  pages: Array<{ page_number: number; extracted_data: Record<string, unknown> }>;
+}
+
 export interface HistoryItem {
   id: string;
   fileName: string;
@@ -16,6 +23,8 @@ export interface HistoryItem {
   extractedData: TableRow[];
   totalPages: number;
   processingDuration: number; // ms, shared across all files in the same batch
+  /** Absent for entries stored before raw content was persisted. */
+  rawContent?: RawContent;
 }
 
 interface ProcessingHistoryProps {

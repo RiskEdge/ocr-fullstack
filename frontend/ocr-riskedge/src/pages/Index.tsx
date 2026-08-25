@@ -7,7 +7,7 @@ import DocumentPreview from "@/components/DocumentPreview";
 import DataTable, { ExtractedData, TableRow } from "@/components/DataTable";
 import ExportButtons from "@/components/ExportButtons";
 import DownloadAllButton from "@/components/DownloadAllButton";
-import ProcessingHistory, { HistoryItem } from "@/components/ProcessingHistory";
+import ProcessingHistory, { HistoryItem, RawContent } from "@/components/ProcessingHistory";
 import ProcessingModeToggle, { ProcessingMode } from "@/components/ProcessingModeToggle";
 import OverallProgress from "@/components/OverallProgress";
 import { FileStatus } from "@/components/FileProcessingStatus";
@@ -40,6 +40,8 @@ interface StoredHistoryItem {
   extractedData: TableRow[];
   totalPages: number;
   processingDuration: number;
+  /** Optional — entries written before this field existed won't carry it. */
+  rawContent?: RawContent;
 }
 
 async function fileToBase64(file: File): Promise<string> {
@@ -142,10 +144,8 @@ function transformOCRResult(content: {
 // Raw OCR content types + line item extractor for validation
 // ---------------------------------------------------------------------------
 
-interface RawContent {
-  total_pages: number;
-  pages: Array<{ page_number: number; extracted_data: Record<string, unknown> }>;
-}
+// RawContent is defined alongside HistoryItem — history persists it so a
+// restored document can still be validated.
 
 // Column signatures used to tell a line-item table apart from a tax /
 // GST-summary table. Only arrays that look like product line items should be
@@ -213,17 +213,46 @@ function extractLineItems(content: RawContent): Record<string, unknown>[] {
   return chosen.flat();
 }
 
-// Extract top-level scalar fields (strings/numbers) from the OCR output —
-// used to find the invoice grand total for calculation validation.
+// Extract scalar fields (strings/numbers) from the OCR output — used to find
+// the invoice grand total for calculation validation.
+//
+// Gemini names every key itself, so totals land at the top level on some
+// documents and nested under a "totals" / "invoice_summary" object on others.
+// The walk is breadth-first with first-writer-wins, so a shallower field always
+// takes precedence over a deeper one sharing its name. Arrays are skipped —
+// those are line-item tables, handled by extractLineItems.
+// Across pages the *last* page wins, since on a multi-page invoice the closing
+// page carries the real grand total while earlier pages carry carry-forward
+// subtotals under the same key names.
+const MAX_SCALAR_DEPTH = 4;
+
+function scalarsForPage(root: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  // Each level's objects are drained before descending into the next.
+  let level: Record<string, unknown>[] = [root];
+
+  for (let depth = 0; depth < MAX_SCALAR_DEPTH && level.length > 0; depth++) {
+    const next: Record<string, unknown>[] = [];
+    for (const obj of level) {
+      for (const [key, val] of Object.entries(obj)) {
+        if (key === "confidence_score") continue;
+        if (Array.isArray(val)) continue;
+        if (typeof val === "number" || typeof val === "string") {
+          if (!(key in out)) out[key] = val; // shallower wins
+        } else if (typeof val === "object" && val !== null) {
+          next.push(val as Record<string, unknown>);
+        }
+      }
+    }
+    level = next;
+  }
+  return out;
+}
+
 function extractDocumentScalars(content: RawContent): Record<string, unknown> {
   const scalars: Record<string, unknown> = {};
   for (const page of content.pages) {
-    for (const [key, val] of Object.entries(page.extracted_data)) {
-      if (key === "confidence_score") continue;
-      if (!Array.isArray(val) && (typeof val === "number" || typeof val === "string")) {
-        scalars[key] = val;
-      }
-    }
+    Object.assign(scalars, scalarsForPage(page.extracted_data));
   }
   return scalars;
 }
@@ -309,6 +338,7 @@ const Index = () => {
             extractedData: s.extractedData,
             totalPages: s.totalPages,
             processingDuration: s.processingDuration,
+            rawContent: s.rawContent,
           };
         })
       );
@@ -563,7 +593,9 @@ const Index = () => {
     setPageCountByFile({ 0: item.totalPages });
     setSelectedHistoryId(item.id);
     setActiveTab("data");
-    setRawContentByFile({});
+    // Restoring the raw payload is what keeps Validate (and with it the grand
+    // total check) available on a document reopened from history.
+    setRawContentByFile(item.rawContent ? { 0: item.rawContent } : {});
     setValidationByFile({});
     setValidationState("idle");
 
@@ -672,6 +704,7 @@ const Index = () => {
     try {
       const dataByFile: Record<number, TableRow[]> = {};
       const pagesByFile: Record<number, number> = {};
+      const rawByFile: Record<number, RawContent> = {};
       let doneCount = 0;
       let buffer = "";
 
@@ -706,6 +739,7 @@ const Index = () => {
             }
             dataByFile[absoluteIndex] = data;
             pagesByFile[absoluteIndex] = totalPages;
+            rawByFile[absoluteIndex] = result.content as RawContent;
             setFileStatuses((prev) => ({ ...prev, [absoluteIndex]: "completed" }));
             setExtractedDataByFile((prev) => ({ ...prev, [absoluteIndex]: data }));
             setPageCountByFile((prev) => ({ ...prev, [absoluteIndex]: totalPages }));
@@ -780,6 +814,7 @@ const Index = () => {
             extractedData: data,
             totalPages: pagesByFile[absIdx] ?? 1,
             processingDuration: batchDuration,
+            rawContent: rawByFile[absIdx],
           };
         });
         setHistory((prev) => [...newHistoryItems, ...prev]);
@@ -802,6 +837,7 @@ const Index = () => {
               extractedData: item.extractedData,
               totalPages: item.totalPages,
               processingDuration: item.processingDuration,
+              rawContent: item.rawContent,
             } satisfies StoredHistoryItem;
           })
         );
