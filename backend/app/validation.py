@@ -5,16 +5,98 @@ The public entry point is ValidationProcessor.validate_items().
 """
 
 import asyncio
+import copy
 import difflib
 import json
+import os
 import re
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 from google import genai
 
 from app.db import get_supabase
 from app.context_builder import build_context_block, get_user_preferences
+
+
+# ---------------------------------------------------------------------------
+# Gemini call throttling
+# ---------------------------------------------------------------------------
+
+# A single invoice can queue one Gemini call per unmatched line, so a 200-line
+# invoice would otherwise fire 200 requests at once and be throttled wholesale.
+# The cap is process-wide, not per-request: the quota is shared by every user
+# validating at the same time, so a per-request limit would not bound it.
+_GEMINI_CONCURRENCY = int(os.environ.get("VALIDATION_GEMINI_CONCURRENCY", "6"))
+_GEMINI_MAX_RETRIES = 3
+# Keywords that identify a Gemini rate-limit / quota error.
+_RATE_LIMIT_SIGNALS = ("quota", "rate limit", "429", "resource exhausted", "too many requests")
+
+_gemini_semaphore: Optional[asyncio.Semaphore] = None
+
+
+def _get_gemini_semaphore() -> asyncio.Semaphore:
+    """
+    Lazily created so the semaphore binds to the running server loop rather
+    than to whatever loop happened to be current at import time.
+    """
+    global _gemini_semaphore
+    if _gemini_semaphore is None:
+        _gemini_semaphore = asyncio.Semaphore(_GEMINI_CONCURRENCY)
+    return _gemini_semaphore
+
+
+async def _call_gemini(label: str, call: Callable[[], Awaitable[dict]]) -> dict:
+    """
+    Run one Gemini validation call under the shared concurrency cap, retrying
+    with exponential backoff while the failure is a rate limit.
+
+    Takes a factory rather than a coroutine because a coroutine is single-use —
+    a retry needs a fresh one. Non-rate-limit errors are raised immediately;
+    validate_items turns those into a per-item fallback.
+    """
+    async with _get_gemini_semaphore():
+        for attempt in range(_GEMINI_MAX_RETRIES + 1):
+            try:
+                return await call()
+            except Exception as exc:
+                msg = str(exc).lower()
+                is_rate_limit = any(sig in msg for sig in _RATE_LIMIT_SIGNALS)
+                if not is_rate_limit or attempt == _GEMINI_MAX_RETRIES:
+                    raise
+                wait = 2 ** attempt
+                print(
+                    f"[validate-data] rate limit on {label}, retrying in {wait}s "
+                    f"(attempt {attempt + 1})"
+                )
+                await asyncio.sleep(wait)
+    raise RuntimeError("unreachable")  # pragma: no cover
+
+
+def _gemini_dedup_key(kind: str, item: dict, rows: list[dict]) -> tuple:
+    """
+    Identity of a Gemini prompt, for reusing one answer across identical lines.
+
+    Covers exactly the inputs both prompts read — the invoice fields they quote
+    and the candidate records they choose from. The priced fields are part of
+    the key because the answer carries a price comparison: two lines naming the
+    same product at different costs need their own verdicts, not a shared one.
+
+    Names and numbers are compared in normalised form, so the case and spacing
+    noise OCR introduces between one page and the next does not split what is
+    really the same question. The shared answer's match_note may then quote
+    whichever spelling arrived first; the chosen PLU and the price verdict —
+    the parts acted on — are identical either way.
+    """
+    names   = tuple(_norm_name(item.get(f)) for f in ("sku_description", "product_name"))
+    numbers = tuple(_to_float(item.get(f)) for f in ("cost_price", "mrp", "gst_percent"))
+    return (
+        kind,
+        _ean_str(item.get("ean_code")),
+        names,
+        numbers,
+        tuple(str(r.get("plu_code")) for r in rows),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -572,17 +654,50 @@ _MAX_OPTIONS = 5
 # like "BALL" matches 59 rows of which 51 share priority=1, so
 # `ORDER BY priority LIMIT 25` returned an arbitrary 25 of the 51 and the right
 # row was discarded before it could ever be scored.
+_MAX_SEARCH_KEYWORDS = 4
+
+# How many line-item name searches run at once. The searches for one invoice are
+# independent, so they overlap rather than queueing behind each other; the cap
+# stops a 200-line invoice from opening a search per line. Each search fans out
+# further into its own probes, so the real ceiling on in-flight queries is this
+# times the fan-out below.
+_NAME_SEARCH_CONCURRENCY = int(os.environ.get("VALIDATION_NAME_SEARCH_CONCURRENCY", "4"))
+
 # One shared pool for every probe fan-out, rather than a pool per call.
 # get_supabase() hands out one client per thread, so fresh threads would mean a
-# fresh client and TLS handshake on every line item. Sized to cover a whole
-# fan-out at once (the full name plus _MAX_SEARCH_KEYWORDS words) with room for
-# a second request running alongside; beyond that, probes queue rather than
-# opening more connections to the database.
-_PROBE_POOL = ThreadPoolExecutor(max_workers=10, thread_name_prefix="catalog-probe")
+# fresh client and TLS handshake on every line item. Sized so the searches
+# running concurrently can each fan out fully (the full name plus
+# _MAX_SEARCH_KEYWORDS words) without waiting on one another; beyond that,
+# probes queue rather than opening more connections to the database.
+_PROBE_POOL = ThreadPoolExecutor(
+    max_workers=_NAME_SEARCH_CONCURRENCY * (_MAX_SEARCH_KEYWORDS + 1),
+    thread_name_prefix="catalog-probe",
+)
 
-_MAX_SEARCH_KEYWORDS = 4
 _KEYWORD_FETCH_LIMIT = 400
 _MAX_CANDIDATES = 20
+
+# Exactly the product_catalog columns this module reads — a name search can pull
+# _KEYWORD_FETCH_LIMIT rows per probe and up to nine probes per line, so `*`
+# meant dragging the whole row across for each. The table also carries
+# `extra_data jsonb`, which the ERP sync fills with arbitrary per-product
+# fields: unbounded weight on every row, none of it ever looked at here.
+# Anything added to this list must be a column the code below actually uses;
+# anything the code starts using must be added here, or it silently reads None.
+_CATALOG_COLUMNS = ",".join((
+    "id",
+    "plu_code",
+    "sku_code",
+    "ean_code",
+    "sku_description",
+    "sku_short_description",
+    "cost_price",
+    "mrp",
+    "gst_percent",
+    "priority",
+    "uom",
+    "uom_qty",
+))
 
 # Words are also probed by prefix, so a description that misspells the tail of
 # a word ("TENNIS" vs "TENNIES") is still retrieved. Short enough to survive a
@@ -1178,7 +1293,7 @@ Master records (JSON):
         q = (
             get_supabase()
             .table("product_catalog")
-            .select("*")
+            .select(_CATALOG_COLUMNS)
             .in_("ean_code", ean_codes)
             .order("priority")
         )
@@ -1205,7 +1320,7 @@ Master records (JSON):
             q = (
                 get_supabase()
                 .table("product_catalog")
-                .select("*")
+                .select(_CATALOG_COLUMNS)
                 .or_(f"plu_code.in.({quoted}),sku_code.in.({quoted})")
                 .order("priority")
             )
@@ -1242,7 +1357,7 @@ Master records (JSON):
             q = (
                 get_supabase()
                 .table("product_catalog")
-                .select("*")
+                .select(_CATALOG_COLUMNS)
                 # Either description column may carry the recognisable name.
                 .or_(_or_ilike_filter(pattern))
                 # plu_code breaks priority ties deterministically. Without it a
@@ -1399,21 +1514,61 @@ Master records (JSON):
         )
 
         results: list[dict | None] = []
-        gemini_queue: list[tuple[int, object, str | None]] = []
+        # One entry per DISTINCT Gemini prompt: (label, call factory). Several
+        # result rows can point at the same job — see gemini_waiters.
+        gemini_jobs: list[tuple[str, Callable[[], Awaitable[dict]]]] = []
+        # dedup key → index into gemini_jobs
+        gemini_job_ids: dict[tuple, int] = {}
+        # (placeholder_idx, job_id, match_type_override) for every queued row
+        gemini_waiters: list[tuple[int, int, str | None]] = []
         # placeholder_idx → the candidate rows Gemini chose from, so its pick can
         # be shown alongside the runners-up (and so a null-match result can still
         # surface "considered" products to pick from).
         queued_candidates: dict[int, list[dict]] = {}
+        # Normalised product name → candidate rows. Invoices repeat the same
+        # product across pages, and the search behind it costs up to nine
+        # round-trips, so it is run once per distinct name rather than per line.
+        name_cache: dict[str, list[dict]] = {}
+
+        def queue_gemini(
+            placeholder_idx: int,
+            key: tuple,
+            label: str,
+            call: Callable[[], Awaitable[dict]],
+            override: str | None,
+        ) -> None:
+            """
+            Register a row as waiting on a Gemini answer, reusing an identical
+            pending prompt when one exists. Two lines only share a job when the
+            whole prompt would be identical — same candidates AND same invoice
+            values — because the answer carries the price comparison, not just
+            the chosen PLU.
+            """
+            job_id = gemini_job_ids.get(key)
+            if job_id is None:
+                job_id = len(gemini_jobs)
+                gemini_job_ids[key] = job_id
+                gemini_jobs.append((label, call))
+            gemini_waiters.append((placeholder_idx, job_id, override))
+
+        # ── Pass 1: the exact steps, which need no I/O ───────────────────
+        # Identification cascade — each step runs only when the previous one
+        # found nothing, and every step but the last is exact, so a line is
+        # never sent to Gemini while a definite match exists:
+        #   1. EAN   2. invoice item code   3. identical name   4. fuzzy
+        # Steps 1 and 2 read the two batch lookups already in hand, so the whole
+        # invoice is resolved against them before any further query is issued —
+        # which is what makes the remaining searches known up front.
+        prepared: list[tuple[dict, list[dict], str | None, str]] = []
+        # Normalised name → the spelling to search it under. Deduped here so a
+        # product repeated down the invoice is searched once, and collected for
+        # every line at once so the searches can overlap.
+        pending_names: dict[str, str] = {}
 
         for item in items:
             ean = _ean_str(item.get("ean_code"))
-            # Identification cascade — each step runs only when the previous
-            # one found nothing, and every step but the last is exact, so a
-            # line is never sent to Gemini while a definite match exists:
-            #   1. EAN   2. invoice item code   3. identical name   4. fuzzy
             master_rows  = master_lookup.get(ean or "", []) if ean else []
             match_source = "ean" if master_rows else None
-            candidates: list[dict] = []
 
             product_name = str(item.get("sku_description") or item.get("product_name") or "")
             # Fall back whenever the mapped name is unusable for search —
@@ -1433,11 +1588,37 @@ Master records (JSON):
                     master_rows  = code_rows
                     match_source = "item_code"
 
+            if not master_rows:
+                pending_names.setdefault(_norm_name(product_name), product_name)
+
+            prepared.append((item, master_rows, match_source, product_name))
+
+        # ── Pass 2: run the outstanding name searches together ───────────
+        # Each search is up to nine round-trips, and they are independent, so
+        # running them one line after another made the round-trips serial —
+        # the dominant cost on an invoice whose products are mostly unmatched.
+        if pending_names:
+            search_sem = asyncio.Semaphore(_NAME_SEARCH_CONCURRENCY)
+
+            async def search(key: str, name: str) -> tuple[str, list[dict]]:
+                async with search_sem:
+                    return key, await asyncio.to_thread(
+                        self._fetch_candidates_by_name, name, company_id
+                    )
+
+            for key, rows in await asyncio.gather(
+                *(search(k, n) for k, n in pending_names.items())
+            ):
+                name_cache[key] = rows
+
+        # ── Pass 3: resolve each line against what the searches found ────
+        for item, master_rows, match_source, product_name in prepared:
+            ean = _ean_str(item.get("ean_code"))
+            candidates: list[dict] = []
+
             # ── 3. Still nothing: an identical product name is a match ───
             if not master_rows:
-                candidates = await asyncio.to_thread(
-                    self._fetch_candidates_by_name, product_name, company_id
-                )
+                candidates = name_cache.get(_norm_name(product_name), [])
                 exact_rows = _exact_name_rows(product_name, candidates)
                 if exact_rows:
                     master_rows  = exact_rows
@@ -1455,13 +1636,18 @@ Master records (JSON):
                 results.append(None)
 
                 if candidates:
-                    gemini_calls += 1
                     queued_candidates[placeholder_idx] = candidates
-                    gemini_queue.append((
+                    queue_gemini(
                         placeholder_idx,
-                        self._gemini_fuzzy_match(item, candidates, context_block, threshold),
+                        _gemini_dedup_key("fuzzy", item, candidates),
+                        f"fuzzy match {product_name!r}",
+                        # Bound as defaults: the loop rebinds both names before
+                        # the factory ever runs.
+                        lambda it=item, cs=candidates: self._gemini_fuzzy_match(
+                            it, cs, context_block, threshold
+                        ),
                         None,
-                    ))
+                    )
                 else:
                     no_match_count += 1
                     results[placeholder_idx] = {
@@ -1534,15 +1720,18 @@ Master records (JSON):
                     },
                 })
             elif auto_select_plu:
-                gemini_calls += 1
                 placeholder_idx = len(results)
                 results.append(None)
                 queued_candidates[placeholder_idx] = master_rows
-                gemini_queue.append((
+                queue_gemini(
                     placeholder_idx,
-                    self._gemini_analyze(item, master_rows, context_block, threshold),
+                    _gemini_dedup_key("analyze", item, master_rows),
+                    f"plu select {product_name!r}",
+                    lambda it=item, rs=master_rows: self._gemini_analyze(
+                        it, rs, context_block, threshold
+                    ),
                     "auto_selected",
-                ))
+                )
             else:
                 matched_multi += 1
                 plu_options = [_to_plu_option(r) for r in master_rows]
@@ -1558,12 +1747,20 @@ Master records (JSON):
                     },
                 })
 
-        # ── Run all Gemini calls concurrently ────────────────────────────
-        if gemini_queue:
-            indices, coros, overrides = zip(*gemini_queue)
-            outputs = await asyncio.gather(*coros, return_exceptions=True)
+        # ── Run the distinct Gemini calls, at bounded concurrency ────────
+        if gemini_jobs:
+            gemini_calls = len(gemini_jobs)
+            outputs = await asyncio.gather(
+                *(_call_gemini(label, call) for label, call in gemini_jobs),
+                return_exceptions=True,
+            )
 
-            for result_idx, output, match_type_override in zip(indices, outputs, overrides):
+            for result_idx, job_id, match_type_override in gemini_waiters:
+                # Deep-copied because one answer can serve several identical
+                # lines, and everything below edits its verdict in place.
+                output = outputs[job_id]
+                if not isinstance(output, BaseException):
+                    output = copy.deepcopy(output)
                 item = items[result_idx]
                 if isinstance(output, Exception):
                     print(f"[validate-data] Gemini failed for index {result_idx}: {output}")
@@ -1580,21 +1777,35 @@ Master records (JSON):
                             },
                         }
                     else:
-                        results[result_idx] = {
-                            **item,
-                            "validation": {
-                                "matched_plu":           None,
-                                "match_type":            "no_match",
-                                "is_valid":              False,
-                                "discrepancies": [{
-                                    "field":    "ean_code",
-                                    "expected": None,
-                                    "actual":   ean,
-                                    "message":  "EAN code not found in master catalog.",
-                                }],
-                                "suggested_corrections": {},
-                            },
+                        # The call failed — that is not the same as the product
+                        # being absent, and saying so would send the user off
+                        # correcting a catalog that is fine. Report the failure
+                        # and hand back the candidates the search did find, so
+                        # the line stays resolvable by hand.
+                        no_match_count += 1
+                        cands = queued_candidates.get(result_idx, [])
+                        failure = {
+                            "matched_plu":           None,
+                            "match_type":            "no_match",
+                            "is_valid":              False,
+                            "discrepancies": [{
+                                "field":    "ean_code",
+                                "expected": None,
+                                "actual":   ean,
+                                "message": (
+                                    "Automatic matching was unavailable for this line "
+                                    "(the matching service could not be reached). "
+                                    + (
+                                        "Pick from the similar products below, or retry."
+                                        if cands else "Please retry."
+                                    )
+                                ),
+                            }],
+                            "suggested_corrections": {},
                         }
+                        if cands:
+                            failure["plu_options"] = [_to_plu_option(c) for c in cands[:8]]
+                        results[result_idx] = {**item, "validation": failure}
                 else:
                     validation = dict(output)
                     validation["discrepancies"] = [
