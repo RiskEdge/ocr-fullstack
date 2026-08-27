@@ -71,8 +71,15 @@ AUTO_SUPPRESS_THRESHOLD = 3
 # Valid outcomes for the investigations table.
 VALID_OUTCOMES = {"Fraud", "VendorError", "FalsePositive"}
 
-# Fields eligible for correction hint tracking.
-HINT_FIELDS = {"mrp", "cost_price", "tax_pct", "sku_desc"}
+# Fields eligible for correction hint tracking, under the canonical invoice-side
+# names normalize_item() produces — the same names the frontend keys edits by.
+HINT_FIELDS = {"mrp", "cost_price", "gst_percent", "sku_description"}
+
+# The catalog-side spellings of the same two fields. Folded onto the canonical
+# name on the way in, so a correction is stored under one key no matter which
+# name the caller used and hints written before the two were unified still line
+# up with what the UI looks for.
+HINT_FIELD_ALIASES = {"tax_pct": "gst_percent", "sku_desc": "sku_description"}
 
 
 # ── Signal map processor ──────────────────────────────────────────────────────
@@ -406,7 +413,8 @@ async def record_field_correction(
     request: FieldCorrectionRequest,
     current_user: TokenData = Depends(get_current_user),
 ):
-    if request.field not in HINT_FIELDS:
+    field = HINT_FIELD_ALIASES.get(request.field, request.field)
+    if field not in HINT_FIELDS:
         return Response(status_code=204)
     if not request.plu_code and not request.ean_code:
         return Response(status_code=204)
@@ -422,7 +430,7 @@ async def record_field_correction(
             .select("id, count")
             .eq("user_id", current_user.user_id)
             .eq(key_field, key_value)
-            .eq("field", request.field)
+            .eq("field", field)
             .execute()
         )
         if existing.data:
@@ -439,7 +447,7 @@ async def record_field_correction(
                 "company_id":      current_user.company_id,
                 "plu_code":        request.plu_code,
                 "ean_code":        request.ean_code,
-                "field":           request.field,
+                "field":           field,
                 "corrected_value": request.corrected_value,
                 "source_filename": request.source_filename,
             }).execute()

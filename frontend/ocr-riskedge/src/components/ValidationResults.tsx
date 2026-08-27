@@ -53,6 +53,12 @@ import type {
 const FIELD_LABELS: Record<string, string> = {
   cost_price: "Cost Price",
   mrp: "MRP",
+  // Canonical invoice-side names, as normalised by the backend. Without these
+  // the table headers and discrepancy rows read "Gst Percent" / "Sku
+  // Description".
+  gst_percent: "Tax %",
+  sku_description: "Product Name",
+  // Catalog-side and pre-normalisation spellings of the same two fields.
   tax_pct: "Tax %",
   ean_code: "EAN Code",
   product_name: "Product Name",
@@ -73,12 +79,9 @@ const FIELD_LABELS: Record<string, string> = {
 // OCR headers, but older cached runs and the raw extraction both use variants,
 // so every lookup tries them in order.
 const INVOICE_KEYS: Record<string, string[]> = {
-  sku_desc: ["sku_desc", "product_name", "sku_description"],
-  cost_price: ["cost_price"],
-  mrp: ["mrp"],
-  tax_pct: ["tax_pct", "gst_percent"],
+  sku_description: ["sku_description", "sku_desc", "product_name"],
+  gst_percent: ["gst_percent", "tax_pct"],
   ean_code: ["ean_code", "ean"],
-  plu_code: ["plu_code", "plu"],
 };
 
 /**
@@ -104,15 +107,6 @@ function fieldLabel(field: string): string {
   );
 }
 
-// Maps item key names to the canonical edit key used in the edits state
-const ITEM_KEY_TO_EDIT_KEY: Record<string, string> = {
-  product_name: "sku_desc",
-  sku_desc: "sku_desc",
-  cost_price: "cost_price",
-  mrp: "mrp",
-  tax_pct: "tax_pct",
-};
-
 function formatCellValue(val: unknown): string {
   if (val === null || val === undefined) return "—";
   if (Array.isArray(val)) return val.map((v) => String(v ?? "")).join(", ");
@@ -130,7 +124,7 @@ function isResolved(
 
 function num(val: unknown): number | null {
   if (val === null || val === undefined || val === "") return null;
-  const n = parseFloat(String(val).replace(/[^0-9.\-]/g, ""));
+  const n = parseFloat(String(val).replace(/[^0-9.-]/g, ""));
   return isNaN(n) ? null : n;
 }
 
@@ -173,12 +167,10 @@ function deriveCostPrice(
   const quantity = num(item["quantity"]);
 
   let unitPrice = num(item["invoice_price"]);
-  let priceSource = "invoice price";
   if (unitPrice === null) {
     const taxable = num(item["taxable_value"]);
     if (taxable === null || quantity === null || quantity <= 0) return null;
     unitPrice = taxable / quantity;
-    priceSource = "taxable value / qty";
   }
   if (unitPrice <= 0) return null;
 
@@ -224,12 +216,9 @@ function deriveCostPrice(
     value,
     source,
     unit_price: unitPrice,
-    price_source: priceSource,
     uom: master.uom ?? (item["uom"] as string | null),
     uom_qty: uomQty,
-    quantity,
     base_unit_cost: baseUnitCost,
-    tax_total: taxTotal,
     total_units: totalUnits,
     tax_per_unit: taxPerUnit,
     formula: `${trimNum(unitPrice)} / ${trimNum(uomQty)} + ${taxFormula} = ${value.toFixed(2)}`,
@@ -270,6 +259,25 @@ function DerivedBadge({ derived }: { derived: DerivedField }) {
   );
 }
 
+/**
+ * The three numeric fields a catalog row is compared on.
+ *
+ * The invoice side and the catalog side spell two of them differently: the
+ * backend normalises every OCR header onto `gst_percent`, while `master_items`
+ * calls the same number `tax_pct`. Everything keyed off a *discrepancy* — the
+ * edits map, accepted-field highlighting, the CSV export, correction hints —
+ * uses the invoice-side name, so that is what `field` carries. Mixing the two
+ * is what previously made an accepted tax correction vanish from the table.
+ */
+const COMPARE_FIELDS: Array<{
+  field: string;
+  masterKey: "cost_price" | "mrp" | "tax_pct";
+}> = [
+  { field: "cost_price", masterKey: "cost_price" },
+  { field: "mrp", masterKey: "mrp" },
+  { field: "gst_percent", masterKey: "tax_pct" },
+];
+
 // Client-side comparison mirroring backend local_compare logic.
 function computeLocalValidation(
   item: ValidatedItem,
@@ -287,21 +295,18 @@ function computeLocalValidation(
   // instead of skipping the field.
   const derived = deriveCostPrice(item, master);
 
-  // Backend returns invoice items under canonical keys (gst_percent /
-  // sku_description); accept those as fallbacks so tax and description
-  // comparisons are not silently skipped.
-  const invoiceField = (field: "cost_price" | "mrp" | "tax_pct"): unknown =>
-    field === "tax_pct"
-      ? (item.tax_pct ?? item["gst_percent"])
+  const invoiceField = (field: string): unknown =>
+    field === "gst_percent"
+      ? (item["gst_percent"] ?? item.tax_pct)
       : field === "cost_price"
         ? // The freshly derived value wins: any cost_price already on the item
           // was derived against a different PLU's pack size.
           (derived?.value ?? item.cost_price)
         : item[field];
 
-  for (const field of ["cost_price", "mrp", "tax_pct"] as const) {
+  for (const { field, masterKey } of COMPARE_FIELDS) {
     const invVal = parseFloat(String(invoiceField(field) ?? ""));
-    const masterVal = parseFloat(String(master[field] ?? ""));
+    const masterVal = parseFloat(String(master[masterKey] ?? ""));
     if (isNaN(invVal) || isNaN(masterVal)) continue;
     if (Math.abs(invVal - masterVal) > 0.01) {
       discrepancies.push({
@@ -314,25 +319,21 @@ function computeLocalValidation(
     }
   }
 
-  const invDesc = String(
-    item.sku_desc ?? item.product_name ?? item["sku_description"] ?? "",
-  )
-    .trim()
-    .toUpperCase();
+  const invDescRaw = String(
+    item["sku_description"] ?? item.sku_desc ?? item.product_name ?? "",
+  );
+  const invDesc = invDescRaw.trim().toUpperCase();
   const masterDesc = String(master.sku_desc ?? "")
     .trim()
     .toUpperCase();
   if (invDesc && masterDesc && invDesc !== masterDesc) {
-    const invDescRaw = String(
-      item.sku_desc ?? item.product_name ?? item["sku_description"] ?? "",
-    );
     discrepancies.push({
-      field: "sku_desc",
+      field: "sku_description",
       expected: master.sku_desc,
       actual: invDescRaw,
       message: `Product description mismatch: invoice has '${invDescRaw}', master has '${master.sku_desc}'.`,
     });
-    corrections["sku_desc"] = master.sku_desc ?? "";
+    corrections["sku_description"] = master.sku_desc ?? "";
   }
 
   return { discrepancies, corrections, derived };
@@ -346,259 +347,310 @@ interface PluSelection {
   derived: DerivedField | null;
 }
 
-// Candidate table for a match Gemini chose out of several plausible records.
-// Its pick is highlighted as recommended; any row can be selected instead.
+/** Middle columns a candidate table can carry, between PLU/name and the
+ *  differences summary. */
+type OptionColumn = "ean" | "cost_price" | "mrp" | "tax_pct" | "priority";
+
+const OPTION_COLUMNS: Record<
+  OptionColumn,
+  {
+    header: string;
+    value: (opt: PluOption) => string | number | null | undefined;
+    /** Discrepancy field this column tracks, when a mismatch should colour it. */
+    compare?: string;
+    /** Value for the invoice reference row; a column without one sits empty. */
+    invoice?: (item: ValidatedItem) => string;
+    mono?: boolean;
+  }
+> = {
+  ean: {
+    header: "EAN",
+    value: (opt) => opt.ean_code,
+    invoice: (item) => String(item.ean_code ?? "—"),
+    mono: true,
+  },
+  cost_price: {
+    header: "Cost Price",
+    value: (opt) => opt.cost_price,
+    compare: "cost_price",
+    invoice: (item) => String(item.cost_price ?? "—"),
+    mono: true,
+  },
+  mrp: {
+    header: "MRP",
+    value: (opt) => opt.mrp,
+    compare: "mrp",
+    invoice: (item) => String(item.mrp ?? "—"),
+    mono: true,
+  },
+  tax_pct: {
+    header: "Tax %",
+    value: (opt) => opt.tax_pct,
+    compare: "gst_percent",
+    invoice: (item) => String(item["gst_percent"] ?? item.tax_pct ?? "—"),
+    mono: true,
+  },
+  priority: {
+    header: "Priority",
+    value: (opt) => opt.priority,
+  },
+};
+
+const DEFAULT_OPTION_COLUMNS: OptionColumn[] = [
+  "ean",
+  "cost_price",
+  "mrp",
+  "tax_pct",
+];
+
+// The one candidate table behind every place a catalog record gets picked: the
+// multi-PLU chooser, the runners-up behind a fuzzy or auto-selected match, and
+// the records considered for an item that matched nothing. They differ only in
+// which middle columns they carry and whether the invoice values head the
+// table, so those are props rather than three copies of the markup.
 function MatchOptionsTable({
   item,
   options,
+  columns = DEFAULT_OPTION_COLUMNS,
+  showInvoiceRow = true,
   recommendedPlu,
   activePlu,
   onSelect,
 }: {
   item: ValidatedItem;
   options: PluOption[];
+  columns?: OptionColumn[];
+  showInvoiceRow?: boolean;
   recommendedPlu?: string | null;
   activePlu?: string | null;
   onSelect: (opt: PluOption) => void;
 }) {
+  const cols = columns.map((key) => ({ key, ...OPTION_COLUMNS[key] }));
   return (
-    <div className="overflow-x-auto">
-      <Table>
-        <TableHeader>
-          <UITableRow className="bg-muted/50 hover:bg-muted/50">
-            <TableHead className="text-xs font-semibold text-foreground">
-              PLU Code
+    <Table>
+      <TableHeader>
+        <UITableRow className="bg-muted/50 hover:bg-muted/50">
+          <TableHead className="text-xs font-semibold text-foreground">
+            PLU Code
+          </TableHead>
+          <TableHead className="text-xs font-semibold text-foreground">
+            Product Name
+          </TableHead>
+          {cols.map((col) => (
+            <TableHead
+              key={col.key}
+              className="text-xs font-semibold text-foreground"
+            >
+              {col.header}
             </TableHead>
-            <TableHead className="text-xs font-semibold text-foreground">
-              Product Name
-            </TableHead>
-            <TableHead className="text-xs font-semibold text-foreground">
-              EAN
-            </TableHead>
-            <TableHead className="text-xs font-semibold text-foreground">
-              Cost Price
-            </TableHead>
-            <TableHead className="text-xs font-semibold text-foreground">
-              MRP
-            </TableHead>
-            <TableHead className="text-xs font-semibold text-foreground">
-              Tax %
-            </TableHead>
-            <TableHead className="text-xs font-semibold text-foreground">
-              Differences
-            </TableHead>
-            <TableHead className="w-24" />
-          </UITableRow>
-          {/* Invoice reference row */}
+          ))}
+          <TableHead className="text-xs font-semibold text-foreground">
+            Differences
+          </TableHead>
+          <TableHead className="w-24" />
+        </UITableRow>
+        {/* Invoice reference row */}
+        {showInvoiceRow && (
           <UITableRow className="bg-blue-50/60 dark:bg-blue-950/20 hover:bg-blue-50/60">
             <TableCell className="text-xs text-blue-600 dark:text-blue-400 font-semibold py-1.5 italic">
               Invoice
             </TableCell>
             <TableCell className="text-xs font-mono py-1.5 text-blue-700 dark:text-blue-300">
               {String(
-                item.sku_desc ??
+                item["sku_description"] ??
+                  item.sku_desc ??
                   item.product_name ??
-                  item["sku_description"] ??
                   "—",
               )}
             </TableCell>
-            <TableCell className="text-xs font-mono py-1.5 text-blue-700 dark:text-blue-300">
-              {String(item.ean_code ?? "—")}
-            </TableCell>
-            <TableCell className="text-xs font-mono py-1.5 text-blue-700 dark:text-blue-300">
-              {String(item.cost_price ?? "—")}
-            </TableCell>
-            <TableCell className="text-xs font-mono py-1.5 text-blue-700 dark:text-blue-300">
-              {String(item.mrp ?? "—")}
-            </TableCell>
-            <TableCell className="text-xs font-mono py-1.5 text-blue-700 dark:text-blue-300">
-              {String(item.tax_pct ?? item["gst_percent"] ?? "—")}
-            </TableCell>
+            {cols.map((col) => (
+              <TableCell
+                key={col.key}
+                className="text-xs font-mono py-1.5 text-blue-700 dark:text-blue-300"
+              >
+                {col.invoice?.(item)}
+              </TableCell>
+            ))}
             <TableCell className="py-1.5" />
             <TableCell className="py-1.5" />
           </UITableRow>
-        </TableHeader>
-        <TableBody>
-          {options.map((opt) => {
-            const { discrepancies: optDiffs } = computeLocalValidation(
-              item,
-              opt,
-            );
-            const diffFields = new Set(optDiffs.map((d) => d.field));
-            const cellCls = (field: string) =>
-              diffFields.has(field)
+        )}
+      </TableHeader>
+      <TableBody>
+        {options.map((opt) => {
+          const { discrepancies: optDiffs } = computeLocalValidation(item, opt);
+          const diffFields = new Set(optDiffs.map((d) => d.field));
+          // A column with nothing to compare against stays neutral — only the
+          // fields a discrepancy can name are coloured.
+          const cellCls = (field?: string) =>
+            !field
+              ? ""
+              : diffFields.has(field)
                 ? "text-destructive font-semibold"
                 : "text-green-700 dark:text-green-400";
-            const isRecommended = opt.plu_code === recommendedPlu;
-            const isActive = opt.plu_code === activePlu;
-            return (
-              <UITableRow
-                key={opt.plu_code}
-                className={
-                  isActive
-                    ? "bg-violet-50 dark:bg-violet-950/30 hover:bg-violet-50"
-                    : isRecommended
-                      ? "bg-amber-50/70 dark:bg-amber-950/20 hover:bg-amber-50/70"
-                      : "hover:bg-muted/30"
-                }
-              >
-                <TableCell className="text-sm font-mono py-2 whitespace-nowrap">
-                  <span className="flex items-center gap-1.5">
-                    {opt.plu_code}
-                    {isRecommended && (
-                      <Badge
-                        variant="outline"
-                        className="text-amber-700 dark:text-amber-400 border-amber-300 bg-amber-50 dark:bg-amber-950/20 text-[10px] px-1.5 py-0 gap-0.5"
-                      >
-                        <Sparkles className="w-2.5 h-2.5" />
-                        Recommended
-                      </Badge>
-                    )}
-                  </span>
-                </TableCell>
-                <TableCell className={`text-sm py-2 ${cellCls("sku_desc")}`}>
-                  {opt.sku_desc ?? "—"}
-                </TableCell>
-                <TableCell className="text-sm font-mono py-2">
-                  {opt.ean_code ?? "—"}
-                </TableCell>
-                <TableCell
-                  className={`text-sm font-mono py-2 ${cellCls("cost_price")}`}
-                >
-                  {opt.cost_price ?? "—"}
-                </TableCell>
-                <TableCell className={`text-sm font-mono py-2 ${cellCls("mrp")}`}>
-                  {opt.mrp ?? "—"}
-                </TableCell>
-                <TableCell
-                  className={`text-sm font-mono py-2 ${cellCls("tax_pct")}`}
-                >
-                  {opt.tax_pct ?? "—"}
-                </TableCell>
-                <TableCell className="py-2">
-                  {optDiffs.length === 0 ? (
-                    <span className="flex items-center gap-1 text-xs text-green-600 dark:text-green-400">
-                      <CheckCircle2 className="w-3.5 h-3.5" />
-                      No issues
-                    </span>
-                  ) : (
-                    <span className="flex flex-wrap gap-1">
-                      {optDiffs.map((d) => (
-                        <Badge
-                          key={d.field}
-                          variant="outline"
-                          className="text-destructive border-destructive/30 bg-destructive/5 text-xs px-1.5 py-0"
-                        >
-                          {fieldLabel(d.field)}
-                        </Badge>
-                      ))}
-                    </span>
-                  )}
-                </TableCell>
-                <TableCell className="py-2" onClick={(e) => e.stopPropagation()}>
-                  {isActive ? (
-                    <span className="flex items-center gap-1 text-xs font-medium text-violet-700 dark:text-violet-400">
-                      <CheckCircle2 className="w-3.5 h-3.5" />
-                      Selected
-                    </span>
-                  ) : (
-                    <Button
+          const isRecommended = opt.plu_code === recommendedPlu;
+          const isActive = opt.plu_code === activePlu;
+          return (
+            <UITableRow
+              key={opt.plu_code}
+              className={
+                isActive
+                  ? "bg-violet-50 dark:bg-violet-950/30 hover:bg-violet-50"
+                  : isRecommended
+                    ? "bg-amber-50/70 dark:bg-amber-950/20 hover:bg-amber-50/70"
+                    : "hover:bg-muted/30"
+              }
+            >
+              <TableCell className="text-sm font-mono py-2 whitespace-nowrap">
+                <span className="flex items-center gap-1.5">
+                  {opt.plu_code}
+                  {isRecommended && (
+                    <Badge
                       variant="outline"
-                      size="sm"
-                      className="h-7 text-xs"
-                      onClick={() => onSelect(opt)}
+                      className="text-amber-700 dark:text-amber-400 border-amber-300 bg-amber-50 dark:bg-amber-950/20 text-[10px] px-1.5 py-0 gap-0.5"
                     >
-                      Select
-                    </Button>
+                      <Sparkles className="w-2.5 h-2.5" />
+                      Recommended
+                    </Badge>
                   )}
+                </span>
+              </TableCell>
+              <TableCell className={`text-sm py-2 ${cellCls("sku_description")}`}>
+                {opt.sku_desc ?? "—"}
+              </TableCell>
+              {cols.map((col) => (
+                <TableCell
+                  key={col.key}
+                  className={`text-sm py-2 ${col.mono ? "font-mono " : ""}${cellCls(col.compare)}`}
+                >
+                  {col.value(opt) ?? "—"}
                 </TableCell>
-              </UITableRow>
-            );
-          })}
-        </TableBody>
-      </Table>
-    </div>
+              ))}
+              <TableCell className="py-2">
+                {optDiffs.length === 0 ? (
+                  <span className="flex items-center gap-1 text-xs text-green-600 dark:text-green-400">
+                    <CheckCircle2 className="w-3.5 h-3.5" />
+                    No issues
+                  </span>
+                ) : (
+                  <span className="flex flex-wrap gap-1">
+                    {optDiffs.map((d) => (
+                      <Badge
+                        key={d.field}
+                        variant="outline"
+                        className="text-destructive border-destructive/30 bg-destructive/5 text-xs px-1.5 py-0"
+                      >
+                        {fieldLabel(d.field)}
+                      </Badge>
+                    ))}
+                  </span>
+                )}
+              </TableCell>
+              <TableCell className="py-2" onClick={(e) => e.stopPropagation()}>
+                {isActive ? (
+                  <span className="flex items-center gap-1 text-xs font-medium text-violet-700 dark:text-violet-400">
+                    <CheckCircle2 className="w-3.5 h-3.5" />
+                    Selected
+                  </span>
+                ) : (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-7 text-xs"
+                    onClick={() => onSelect(opt)}
+                  >
+                    Select
+                  </Button>
+                )}
+              </TableCell>
+            </UITableRow>
+          );
+        })}
+      </TableBody>
+    </Table>
   );
 }
 
 // ---------------------------------------------------------------------------
-// Calculation validation — field-name candidates (normalised to lowercase,
-// no spaces/underscores/dots for matching)
+// Calculation validation — field-name candidates. Every consumer matches
+// through normKey(), which lowercases and strips non-alphanumerics, so each
+// entry is stored in that form already: adding a "base_rate" beside "baserate"
+// buys nothing, both collapse to the same key.
 // ---------------------------------------------------------------------------
 
-const BASE_RATE_CANDIDATES = [
-  "baserate",
-  "baseRate",
-  "base_rate",
-  "brate",
-  "b_rate",
-  "basicrate",
-  "basic_rate",
-  "rate",
-  "unitprice",
-  "unit_price",
-];
-const TAX_AMOUNT_CANDIDATES = [
-  "taxamount",
-  "tax_amount",
-  "taxamt",
-  "tax_amt",
-  "gstamount",
-  "gst_amount",
-  "vatamount",
-  "vat_amount",
-];
+const TAX_AMOUNT_CANDIDATES = ["taxamount", "taxamt", "gstamount", "vatamount"];
 const LINE_AMOUNT_CANDIDATES = [
   "amount",
   "netamount",
-  "net_amount",
   "linetotal",
-  "line_total",
   "totalamount",
-  "total_amount",
   "value",
   "netvalue",
-  "net_value",
   "lineamount",
-  "line_amount",
 ];
 // Ordered most-specific first — findGrandTotal walks this list in order and
 // takes the first candidate present, so an unambiguous "grand_total" always
 // beats a generic "total" that may well be a page subtotal.
 const GRAND_TOTAL_CANDIDATES = [
   "grandtotal",
-  "grand_total",
   "grandtotalamount",
-  "grand_total_amount",
   "invoicetotal",
-  "invoice_total",
   "totalinvoicevalue",
-  "total_invoice_value",
   "totalinvoiceamount",
-  "total_invoice_amount",
   "invoicevalue",
-  "invoice_value",
   "invoiceamount",
-  "invoice_amount",
   "amountpayable",
-  "amount_payable",
   "netpayable",
-  "net_payable",
   "payableamount",
-  "payable_amount",
   "billamount",
-  "bill_amount",
   "nettotal",
-  "net_total",
   "grosstotal",
-  "gross_total",
   "finalamount",
-  "final_amount",
   "totalamount",
-  "total_amount",
   "nettaxableamount",
-  "net_taxable_amount",
   "total",
+];
+
+// Per-unit price as printed on the line. This is per invoice UOM — per pack —
+// not per catalog unit, which is why it can never be compared against a cost
+// price without applying the pack size first.
+const UNIT_PRICE_CANDIDATES = [
+  "invoiceprice",
+  "rate",
+  "unitprice",
+  "baserate",
+  "brate",
+  "basicrate",
+];
+// Pre-tax line value. Only unambiguous names live here; a bare "total" is
+// admitted separately and only when the line's structure proves it is pre-tax.
+const TAXABLE_VALUE_CANDIDATES = [
+  "taxablevalue",
+  "taxableamount",
+  "assessablevalue",
+];
+const AMBIGUOUS_TAXABLE_CANDIDATES = ["total", "subtotal", "grossamount"];
+// GST components are whole-line figures by invoice convention, never per unit.
+// Amount-suffixed names are tried first so a bare "cgst" holding a percentage
+// is never summed alongside a real "cgst_amount".
+const GST_SPLIT_AMOUNT_CANDIDATES = [
+  "cgstamount",
+  "cgstamt",
+  "sgstamount",
+  "sgstamt",
+  "igstamount",
+  "igstamt",
+  "utgstamount",
+  "cessamount",
+];
+const GST_SPLIT_BARE_CANDIDATES = ["cgst", "sgst", "igst", "utgst", "cess"];
+const TAX_PCT_CANDIDATES = [
+  "taxpct",
+  "taxpercent",
+  "gstpercent",
+  "gstpct",
+  "gstrate",
+  "taxrate",
 ];
 
 // Strips every non-alphanumeric character, so "Grand Total (INR)",
@@ -671,6 +723,49 @@ function findGrandTotal(
   return null;
 }
 
+// findFieldValue returns whichever key the item happens to list first. Where
+// several candidates could match one slot, priority has to come from the
+// candidate list instead, so an explicit "taxable_value" always beats a
+// generic "total".
+function findFieldOrdered(
+  item: Record<string, unknown>,
+  candidates: string[],
+): { key: string; value: number } | null {
+  const byNorm = new Map<string, { key: string; value: number }>();
+  for (const [k, v] of Object.entries(item)) {
+    if (k === "validation") continue;
+    const n = parseFloat(String(v ?? "").replace(/[,\s]/g, ""));
+    if (isNaN(n)) continue;
+    const nk = normKey(k);
+    if (!byNorm.has(nk)) byNorm.set(nk, { key: k, value: n });
+  }
+  for (const c of candidates) {
+    const hit = byNorm.get(normKey(c));
+    if (hit) return hit;
+  }
+  return null;
+}
+
+// Adds up every matching column — a GST total is split across CGST and SGST,
+// so no single field holds it.
+function sumFields(
+  item: Record<string, unknown>,
+  candidates: string[],
+): { keys: string[]; value: number } | null {
+  const norm = new Set(candidates.map(normKey));
+  const keys: string[] = [];
+  let total = 0;
+  for (const [k, v] of Object.entries(item)) {
+    if (k === "validation") continue;
+    if (!norm.has(normKey(k))) continue;
+    const n = parseFloat(String(v ?? "").replace(/[,\s]/g, ""));
+    if (isNaN(n)) continue;
+    keys.push(k);
+    total += n;
+  }
+  return keys.length ? { keys, value: parseFloat(total.toFixed(4)) } : null;
+}
+
 interface CalcCheck {
   label: string;
   field: string;
@@ -678,13 +773,14 @@ interface CalcCheck {
   calculated: number;
   actual: number;
   ok: boolean;
+  /** False when the correct value cannot be written back to one column — a GST
+   *  total split across CGST/SGST has no single field to accept it into. */
+  acceptable?: boolean;
 }
 
 interface LineCalcResult {
   idx: number;
-  productName: string;
   checks: CalcCheck[];
-  ok: boolean;
 }
 
 interface CalcValidationResult {
@@ -702,7 +798,6 @@ interface CalcValidationResult {
      *  known to be short and a mismatch is not necessarily a real discrepancy. */
     partial: boolean;
   } | null;
-  allLinesHaveAmount: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -745,7 +840,9 @@ const ValidationResults = ({
   const [editingDiscrepancy, setEditingDiscrepancy] = useState<
     Record<number, Set<string>>
   >({});
-  const [editingNoMatch, setEditingNoMatch] = useState<Set<number>>(new Set());
+  // Rows whose full-field editor is open. Every row can be edited, not just
+  // unmatched ones — a clean match can still carry a mis-read value.
+  const [editingRow, setEditingRow] = useState<Set<number>>(new Set());
   // Phase 2: dismissals and investigation outcomes
   const [dismissedFields, setDismissedFields] = useState<
     Record<number, Set<string>>
@@ -896,9 +993,9 @@ const ValidationResults = ({
       }
       if (acceptedInRow > 0) rowsWithAccepted++;
 
-      const effectivelyValid =
-        (hasSel ? pluSel.discrepancies.length === 0 : v.is_valid) ||
-        remaining === 0;
+      // A selection replaces the backend's verdict entirely: its discrepancies
+      // are the whole story, so `remaining === 0` already covers it.
+      const effectivelyValid = (!hasSel && v.is_valid) || remaining === 0;
       if (effectivelyValid) effectiveValid++;
       else effectiveIssues++;
     }
@@ -911,7 +1008,7 @@ const ValidationResults = ({
       totalAccepted,
       rowsWithAccepted,
     };
-  }, [items, edits, pluSelections, acceptedFields]);
+  }, [items, pluSelections, acceptedFields]);
 
   // ---------------------------------------------------------------------------
   // Calculation validation — runs for every item, reactive to edits.
@@ -935,14 +1032,23 @@ const ValidationResults = ({
         }
       }
 
-      const effectiveCostPrice = parseFloat(
-        String(effectiveItem["cost_price"] ?? ""),
-      );
-      const effectiveTaxPct = parseFloat(
-        String(effectiveItem["tax_pct"] ?? ""),
-      );
+      // A PLU the user picked re-derives the cost against its own pack size,
+      // so it outranks whatever the backend matched. An accepted edit still
+      // outranks both — a value the user typed is the last word.
+      const pluSel = pluSelections[idx];
+      const derivedCost =
+        (pluSel
+          ? pluSel.derived
+          : items[idx].validation?.derived_fields?.cost_price) ?? null;
+      const costEdited = itemAccepted?.has("cost_price") ?? false;
 
-      const baseRateField = findFieldValue(effectiveItem, BASE_RATE_CANDIDATES);
+      const effectiveCostPrice = parseFloat(
+        String(
+          costEdited
+            ? effectiveItem["cost_price"]
+            : (derivedCost?.value ?? effectiveItem["cost_price"] ?? ""),
+        ),
+      );
       const taxAmountField = findFieldValue(
         effectiveItem,
         TAX_AMOUNT_CANDIDATES,
@@ -953,51 +1059,199 @@ const ValidationResults = ({
       );
       const quantity = parseFloat(String(effectiveItem["quantity"] ?? ""));
 
+      // A cost price is per individual unit, while an invoice quantity counts
+      // packs — 5 Pkts of 10 is 50 units. Without the pack size the line total
+      // comes out short by exactly that factor.
+      const uomQtyRaw = derivedCost?.uom_qty ?? num(effectiveItem["uom_qty"]);
+      const packSize =
+        uomQtyRaw !== null && uomQtyRaw !== undefined && uomQtyRaw > 0
+          ? uomQtyRaw
+          : 1;
+      const totalUnits =
+        derivedCost?.total_units != null && derivedCost.total_units > 0
+          ? derivedCost.total_units
+          : quantity * packSize;
+
+      // The cost price on screen is rounded to the paisa. Scaling that rounded
+      // figure by 50 units magnifies the error past any sane tolerance, so the
+      // check multiplies the exact derivation when one is available.
+      const exactCostPrice =
+        !costEdited &&
+        derivedCost?.base_unit_cost !== undefined &&
+        derivedCost?.tax_per_unit !== undefined
+          ? derivedCost.base_unit_cost + derivedCost.tax_per_unit
+          : effectiveCostPrice;
+
       const checks: CalcCheck[] = [];
 
-      // Check 1 — Tax Amount = Base Rate × Tax% / 100
-      if (baseRateField && !isNaN(effectiveTaxPct) && taxAmountField) {
-        const calculated = parseFloat(
-          ((baseRateField.value * effectiveTaxPct) / 100).toFixed(4),
+      // —— Resolve each printed figure on a basis we can name ————————
+      // GST components and taxable/amount columns are whole-line figures by
+      // invoice convention; a unit price is per invoice UOM; a cost price is
+      // per catalog unit. Comparing across bases is what made the old checks
+      // wrong, so every check below works in one stated basis and skips
+      // outright when it cannot establish one. A skipped check is honest; a
+      // false "Calc error" is not.
+      const unitPriceField = findFieldOrdered(
+        effectiveItem,
+        UNIT_PRICE_CANDIDATES,
+      );
+      const gstSplit =
+        sumFields(effectiveItem, GST_SPLIT_AMOUNT_CANDIDATES) ??
+        sumFields(effectiveItem, GST_SPLIT_BARE_CANDIDATES);
+
+      let taxableField = findFieldOrdered(
+        effectiveItem,
+        TAXABLE_VALUE_CANDIDATES,
+      );
+      if (!taxableField) {
+        // A bare "total" is the pre-tax base only when a larger tax-inclusive
+        // amount sits beside it. Equal values mean a nil-rated line or a
+        // tax-inclusive total — neither is safe to treat as taxable.
+        const loose = findFieldOrdered(
+          effectiveItem,
+          AMBIGUOUS_TAXABLE_CANDIDATES,
         );
-        checks.push({
-          label: "Tax Amount",
-          field: taxAmountField.key,
-          formula: `${baseRateField.value} × ${effectiveTaxPct}% ÷ 100`,
-          calculated,
-          actual: taxAmountField.value,
-          ok: Math.abs(calculated - taxAmountField.value) <= 0.02,
-        });
+        if (
+          loose &&
+          lineAmtField &&
+          loose.key !== lineAmtField.key &&
+          lineAmtField.value > loose.value
+        ) {
+          taxableField = loose;
+        }
       }
 
-      // Check 2 — Cost Price = Base Rate + Tax Amount
-      if (baseRateField && taxAmountField && !isNaN(effectiveCostPrice)) {
-        const calculated = parseFloat(
-          (baseRateField.value + taxAmountField.value).toFixed(4),
-        );
-        checks.push({
-          label: "Cost Price",
-          field: "cost_price",
-          formula: `${baseRateField.value} + ${taxAmountField.value}`,
-          calculated,
-          actual: effectiveCostPrice,
-          ok: Math.abs(calculated - effectiveCostPrice) <= 0.02,
-        });
-      }
+      // Line-level mode: the invoice splits its GST out or names a taxable
+      // value, so the whole-line basis is established rather than guessed.
+      const lineLevel = !!gstSplit || !!taxableField;
+      const lineTax = gstSplit
+        ? { value: gstSplit.value, field: null as string | null }
+        : taxAmountField
+          ? { value: taxAmountField.value, field: taxAmountField.key }
+          : null;
 
-      // Check 3 — Line Amount = Cost Price × Qty
-      if (!isNaN(effectiveCostPrice) && !isNaN(quantity) && lineAmtField) {
-        const calculated = parseFloat(
-          (effectiveCostPrice * quantity).toFixed(2),
-        );
-        checks.push({
-          label: "Line Amount",
-          field: lineAmtField.key,
-          formula: `${effectiveCostPrice} × ${quantity}`,
-          calculated,
-          actual: lineAmtField.value,
-          ok: Math.abs(calculated - lineAmtField.value) <= 0.02,
-        });
+      // An invoice names the tax rate all sorts of ways, so this searches the
+      // candidate spellings rather than reading one key. `effectiveItem`
+      // already carries any accepted edit, so a corrected rate is picked up
+      // here too.
+      const taxPctField = findFieldOrdered(effectiveItem, TAX_PCT_CANDIDATES);
+      const linePct = taxPctField?.value ?? NaN;
+
+      const computedTaxable =
+        unitPriceField && !isNaN(quantity)
+          ? unitPriceField.value * quantity
+          : null;
+      const lineTaxable = taxableField?.value ?? computedTaxable;
+
+      if (lineLevel) {
+        // Check 1 — Taxable Value = Unit Price x Qty   (line basis)
+        // Only worth running against a printed column; against our own
+        // computed base it would merely restate itself.
+        if (taxableField && computedTaxable !== null) {
+          const calculated = parseFloat(computedTaxable.toFixed(2));
+          checks.push({
+            label: "Taxable Value",
+            field: taxableField.key,
+            formula: `${trimNum(unitPriceField!.value)} × ${trimNum(quantity)}`,
+            calculated,
+            actual: taxableField.value,
+            ok: Math.abs(calculated - taxableField.value) <= 0.05,
+          });
+        }
+
+        // Check 2 — Tax Amount = Taxable x Tax% / 100   (line basis)
+        if (lineTaxable !== null && !isNaN(linePct) && lineTax) {
+          const calculated = parseFloat(
+            ((lineTaxable * linePct) / 100).toFixed(2),
+          );
+          checks.push({
+            label: "Tax Amount",
+            field: lineTax.field ?? "",
+            formula: `${trimNum(lineTaxable)} × ${trimNum(linePct)}% ÷ 100`,
+            calculated,
+            actual: lineTax.value,
+            ok: Math.abs(calculated - lineTax.value) <= 0.05,
+            acceptable: lineTax.field !== null,
+          });
+        }
+
+        // Check 3 — Line Amount = Taxable + Tax   (line basis)
+        // Stronger than scaling a cost price back up, and free of the rounding
+        // amplification that comes with multiplying a per-unit figure.
+        if (lineTaxable !== null && lineTax && lineAmtField) {
+          const calculated = parseFloat(
+            (lineTaxable + lineTax.value).toFixed(2),
+          );
+          checks.push({
+            label: "Line Amount",
+            field: lineAmtField.key,
+            formula: `${trimNum(lineTaxable)} + ${trimNum(lineTax.value)}`,
+            calculated,
+            actual: lineAmtField.value,
+            ok: Math.abs(calculated - lineAmtField.value) <= 0.05,
+          });
+        }
+
+        // Check 4 — Cost Price = Line Amount / total units   (unit basis)
+        // Skipped when the cost was derived from these very figures, where it
+        // could only ever restate them or report its own rounding.
+        if (
+          !derivedCost &&
+          !isNaN(effectiveCostPrice) &&
+          totalUnits > 0 &&
+          lineAmtField
+        ) {
+          const calculated = parseFloat(
+            (lineAmtField.value / totalUnits).toFixed(2),
+          );
+          checks.push({
+            label: "Cost Price",
+            field: "cost_price",
+            formula:
+              packSize > 1
+                ? `${trimNum(lineAmtField.value)} ÷ (${trimNum(quantity)} × ${trimNum(packSize)})`
+                : `${trimNum(lineAmtField.value)} ÷ ${trimNum(quantity)}`,
+            calculated,
+            actual: effectiveCostPrice,
+            ok: Math.abs(calculated - effectiveCostPrice) <= 0.02,
+          });
+        }
+      } else {
+        // —— Per-unit mode ————————————————
+        // No GST split and no taxable column: the invoice prints rate, tax and
+        // cost side by side, all per unit.
+        //
+        // The tax and cost checks that used to live here compared against a
+        // "base rate" column, but the backend normalises every spelling of it
+        // (rate / b.rate / basic rate / unit price) onto invoice_price before
+        // the item reaches us, so they could never fire.
+
+        // Line Amount = Cost Price x Qty x pack size
+        // With packSize 1 this is the plain cost x qty it has always been.
+        if (
+          !isNaN(effectiveCostPrice) &&
+          !isNaN(quantity) &&
+          totalUnits > 0 &&
+          lineAmtField
+        ) {
+          const calculated = parseFloat(
+            (exactCostPrice * totalUnits).toFixed(2),
+          );
+          // Every unit carries up to half a paisa of rounding, so a flat 0.02
+          // reads a 50-unit line as broken when it is merely rounded.
+          const tolerance = Math.max(0.02, 0.005 * totalUnits);
+          checks.push({
+            label: "Line Amount",
+            field: lineAmtField.key,
+            formula:
+              packSize > 1
+                ? `${trimNum(effectiveCostPrice)} × ${trimNum(quantity)} × ${trimNum(packSize)}`
+                : `${trimNum(effectiveCostPrice)} × ${trimNum(quantity)}`,
+            calculated,
+            actual: lineAmtField.value,
+            ok: Math.abs(calculated - lineAmtField.value) <= tolerance,
+          });
+        }
       }
 
       if (lineAmtField) {
@@ -1007,16 +1261,7 @@ const ValidationResults = ({
         allLinesHaveAmount = false;
       }
 
-      const productName = String(
-        item["product_name"] ?? item["sku_desc"] ?? `Item ${idx + 1}`,
-      );
-
-      lineResults.push({
-        idx,
-        productName,
-        checks,
-        ok: checks.length === 0 || checks.every((c) => c.ok),
-      });
+      lineResults.push({ idx, checks });
     }
 
     // Grand total check. Lines without a recognisable amount column no longer
@@ -1044,9 +1289,8 @@ const ValidationResults = ({
       lineResults,
       lineAmountSum: parseFloat(lineAmountSum.toFixed(2)),
       grandTotalCheck,
-      allLinesHaveAmount,
     };
-  }, [items, edits, acceptedFields, documentScalars]);
+  }, [items, edits, acceptedFields, documentScalars, pluSelections]);
 
   function toggleExpand(idx: number) {
     setExpanded((prev) => {
@@ -1057,9 +1301,21 @@ const ValidationResults = ({
           (acceptedFields[idx]?.size ?? 0) > 0 ||
           (dismissedFields[idx]?.size ?? 0) > 0 ||
           (editingDiscrepancy[idx]?.size ?? 0) > 0 ||
+          editingRow.has(idx) ||
           !!pluSelections[idx] ||
           !!itemOutcomes[idx];
-        if (!hadInteraction) {
+        // Only a row that actually raised something counts as reasoning the
+        // user skipped — clean rows open onto their editor, and reading one
+        // is not a signal that explanations are too long.
+        const v = items[idx]?.validation;
+        const hadReasoning =
+          (v?.discrepancies?.length ?? 0) > 0 ||
+          v?.match_type !== undefined ||
+          (calcResults?.lineResults
+            .find((r) => r.idx === idx)
+            ?.checks.some((c) => !c.ok) ??
+            false);
+        if (!hadInteraction && hadReasoning) {
           track("skipped_reasoning", {
             item_index: idx,
             match_type: items[idx]?.validation?.match_type,
@@ -1192,6 +1448,56 @@ const ValidationResults = ({
     actual: unknown,
   ): string {
     return edits[itemIdx]?.[field] ?? String(actual ?? "");
+  }
+
+  function cancelRowEdit(itemIdx: number) {
+    setEditingRow((prev) => {
+      const next = new Set(prev);
+      next.delete(itemIdx);
+      return next;
+    });
+  }
+
+  // Commits the row editor. `markAll` preserves the unmatched-row behaviour of
+  // stamping every field as accepted; a matched row only marks what the user
+  // actually changed, so a clean match is not repainted green throughout.
+  function saveRowEdits(itemIdx: number, markAll: boolean) {
+    const item = items[itemIdx];
+    const itemEdits = edits[itemIdx] ?? {};
+    const changed = new Set<string>();
+    const accepted = new Set<string>();
+
+    for (const key of fieldKeys) {
+      if (markAll) accepted.add(key);
+      const edited = itemEdits[key];
+      if (edited !== undefined && edited !== String(item[key] ?? "")) {
+        changed.add(key);
+        accepted.add(key);
+      }
+    }
+
+    setAcceptedFields((prev) => ({
+      ...prev,
+      [itemIdx]: new Set([...(prev[itemIdx] ?? []), ...accepted]),
+    }));
+    cancelRowEdit(itemIdx);
+
+    if (changed.size === 0) return;
+    track("field_edit", {
+      fields: [...changed],
+      item_index: itemIdx,
+      match_type: item.validation?.match_type ?? "exact",
+      bulk: true,
+    });
+    for (const field of changed) {
+      recordFieldCorrection(
+        item.validation?.matched_plu ?? null,
+        item.ean_code ?? null,
+        field,
+        itemEdits[field],
+        sourceFilename,
+      );
+    }
   }
 
   function selectPlu(itemIdx: number, opt: PluOption) {
@@ -1351,8 +1657,7 @@ const ValidationResults = ({
 
       // Field values — use accepted edit when available
       const fieldVals = fieldKeys.map((key) => {
-        const editKey = ITEM_KEY_TO_EDIT_KEY[key] ?? key;
-        const accepted = itemEdits?.[editKey];
+        const accepted = itemEdits?.[key];
         return accepted !== undefined ? accepted : String(item[key] ?? "");
       });
 
@@ -1379,10 +1684,6 @@ const ValidationResults = ({
         v.match_type === "multi_plu" && pluSel
           ? pluSel.discrepancies
           : v.discrepancies;
-      const effectiveCorrections =
-        v.match_type === "multi_plu" && pluSel
-          ? pluSel.corrections
-          : v.suggested_corrections;
       const remaining = effectiveDiscrepanciesRaw.filter(
         (d) => !isResolved(d, acceptedFields[idx]),
       );
@@ -1555,7 +1856,6 @@ const ValidationResults = ({
               <TableBody>
                 {items.map((item, idx) => {
                   const v = item.validation;
-                  const itemEdits = edits[idx];
                   const isExpanded = expanded.has(idx);
                   const isFuzzy = v.match_type === "fuzzy_name";
                   const isNoMatch = v.match_type === "no_match";
@@ -1577,7 +1877,7 @@ const ValidationResults = ({
                   // suggestions, or an overridable match) share the picker +
                   // comparison UI.
                   const canSelect =
-                    isMultiPlu || (isNoMatch && hasSuggestions) || hasAlternatives;
+                    isMultiPlu || hasSuggestions || hasAlternatives;
 
                   // Build effective validation values (override after a selection)
                   const effectiveMatchedPlu = hasSelection
@@ -1612,19 +1912,14 @@ const ValidationResults = ({
                   const isEffectivelyValid =
                     !isPending &&
                     !stillUnmatched &&
-                    (hasSelection
-                      ? pluSel.discrepancies.length === 0 ||
-                        effectiveDiscrepancies.length === 0
-                      : v.is_valid || effectiveDiscrepancies.length === 0);
+                    ((!hasSelection && v.is_valid) ||
+                      effectiveDiscrepancies.length === 0);
 
-                  // Cells that still have active discrepancies
-                  // sku_desc and product_name are aliases — highlight both
+                  // Cells that still have active discrepancies. Discrepancy
+                  // fields and item keys share one spelling, so this is a
+                  // straight lookup.
                   const discrepantFields = new Set(
-                    effectiveDiscrepancies.flatMap((d) =>
-                      d.field === "sku_desc"
-                        ? ["sku_desc", "product_name"]
-                        : [d.field],
-                    ),
+                    effectiveDiscrepancies.map((d) => d.field),
                   );
 
                   const itemCalcResult = calcResults?.lineResults.find(
@@ -1633,7 +1928,10 @@ const ValidationResults = ({
                   const hasCalcErrors =
                     itemCalcResult?.checks.some((c) => !c.ok) ?? false;
 
-                  const isExpandable =
+                  // Something the validator wants reviewed. Every row expands
+                  // regardless — a clean match still opens onto its editor —
+                  // but only these carry a finding worth an outcome.
+                  const hasFindings =
                     v.discrepancies.length > 0 ||
                     isFuzzy ||
                     isNoMatch ||
@@ -1645,19 +1943,18 @@ const ValidationResults = ({
                     <Fragment key={idx}>
                       {/* Data row */}
                       <UITableRow
-                        className={`${isExpandable ? "cursor-pointer" : ""} hover:bg-muted/30 ${
+                        className={`cursor-pointer hover:bg-muted/30 ${
                           isExpanded ? "bg-muted/20" : ""
                         }`}
-                        onClick={() => isExpandable && toggleExpand(idx)}
+                        onClick={() => toggleExpand(idx)}
                       >
                         {/* Expand chevron */}
                         <TableCell className="px-2 py-2 w-8">
-                          {isExpandable &&
-                            (isExpanded ? (
-                              <ChevronDown className="w-4 h-4 text-muted-foreground" />
-                            ) : (
-                              <ChevronRight className="w-4 h-4 text-muted-foreground" />
-                            ))}
+                          {isExpanded ? (
+                            <ChevronDown className="w-4 h-4 text-muted-foreground" />
+                          ) : (
+                            <ChevronRight className="w-4 h-4 text-muted-foreground" />
+                          )}
                         </TableCell>
 
                         {/* Row number */}
@@ -1667,12 +1964,11 @@ const ValidationResults = ({
 
                         {/* Dynamic OCR field cells */}
                         {fieldKeys.map((key) => {
-                          const editKey = ITEM_KEY_TO_EDIT_KEY[key] ?? key;
-                          const editedVal = edits[idx]?.[editKey];
+                          const editedVal = edits[idx]?.[key];
                           const displayVal =
                             editedVal !== undefined ? editedVal : item[key];
                           const isAccepted =
-                            acceptedFields[idx]?.has(editKey) ?? false;
+                            acceptedFields[idx]?.has(key) ?? false;
                           // A value we worked out from the invoice's other
                           // columns is labelled here too, not only inside the
                           // expanded comparison — this row is what most users
@@ -1822,7 +2118,8 @@ const ValidationResults = ({
                               <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">
                                 Item {idx + 1} —{" "}
                                 {String(
-                                  item.product_name ??
+                                  item["sku_description"] ??
+                                    item.product_name ??
                                     item.sku_desc ??
                                     "details",
                                 )}
@@ -1838,147 +2135,17 @@ const ValidationResults = ({
                                       the correct one
                                     </p>
                                   </div>
-                                  <Table>
-                                    <TableHeader>
-                                      <UITableRow className="bg-muted/50 hover:bg-muted/50">
-                                        <TableHead className="text-xs font-semibold text-foreground">
-                                          PLU Code
-                                        </TableHead>
-                                        <TableHead className="text-xs font-semibold text-foreground">
-                                          Product Name
-                                        </TableHead>
-                                        <TableHead className="text-xs font-semibold text-foreground">
-                                          Cost Price
-                                        </TableHead>
-                                        <TableHead className="text-xs font-semibold text-foreground">
-                                          MRP
-                                        </TableHead>
-                                        <TableHead className="text-xs font-semibold text-foreground">
-                                          Tax %
-                                        </TableHead>
-                                        <TableHead className="text-xs font-semibold text-foreground">
-                                          Priority
-                                        </TableHead>
-                                        <TableHead className="text-xs font-semibold text-foreground">
-                                          Differences
-                                        </TableHead>
-                                        <TableHead className="w-20" />
-                                      </UITableRow>
-                                      {/* Invoice reference row */}
-                                      <UITableRow className="bg-blue-50/60 dark:bg-blue-950/20 hover:bg-blue-50/60">
-                                        <TableCell className="text-xs text-blue-600 dark:text-blue-400 font-semibold py-1.5 italic">
-                                          Invoice
-                                        </TableCell>
-                                        <TableCell className="text-xs font-mono py-1.5 text-blue-700 dark:text-blue-300">
-                                          {String(
-                                            item.sku_desc ??
-                                              item.product_name ??
-                                              item["sku_description"] ??
-                                              "—",
-                                          )}
-                                        </TableCell>
-                                        <TableCell className="text-xs font-mono py-1.5 text-blue-700 dark:text-blue-300">
-                                          {String(item.cost_price ?? "—")}
-                                        </TableCell>
-                                        <TableCell className="text-xs font-mono py-1.5 text-blue-700 dark:text-blue-300">
-                                          {String(item.mrp ?? "—")}
-                                        </TableCell>
-                                        <TableCell className="text-xs font-mono py-1.5 text-blue-700 dark:text-blue-300">
-                                          {String(
-                                            item.tax_pct ??
-                                              item["gst_percent"] ??
-                                              "—",
-                                          )}
-                                        </TableCell>
-                                        <TableCell className="py-1.5" />
-                                        <TableCell className="py-1.5" />
-                                        <TableCell className="py-1.5" />
-                                      </UITableRow>
-                                    </TableHeader>
-                                    <TableBody>
-                                      {v.plu_options.map((opt) => {
-                                        const { discrepancies: optDiffs } =
-                                          computeLocalValidation(item, opt);
-                                        const diffFields = new Set(
-                                          optDiffs.map((d) => d.field),
-                                        );
-                                        const cellCls = (field: string) =>
-                                          diffFields.has(field)
-                                            ? "text-destructive font-semibold"
-                                            : "text-green-700 dark:text-green-400";
-                                        return (
-                                          <UITableRow
-                                            key={opt.plu_code}
-                                            className="hover:bg-muted/30"
-                                          >
-                                            <TableCell className="text-sm font-mono py-2">
-                                              {opt.plu_code}
-                                            </TableCell>
-                                            <TableCell
-                                              className={`text-sm py-2 ${cellCls("sku_desc")}`}
-                                            >
-                                              {opt.sku_desc ?? "—"}
-                                            </TableCell>
-                                            <TableCell
-                                              className={`text-sm font-mono py-2 ${cellCls("cost_price")}`}
-                                            >
-                                              {opt.cost_price ?? "—"}
-                                            </TableCell>
-                                            <TableCell
-                                              className={`text-sm font-mono py-2 ${cellCls("mrp")}`}
-                                            >
-                                              {opt.mrp ?? "—"}
-                                            </TableCell>
-                                            <TableCell
-                                              className={`text-sm font-mono py-2 ${cellCls("tax_pct")}`}
-                                            >
-                                              {opt.tax_pct ?? "—"}
-                                            </TableCell>
-                                            <TableCell className="text-sm py-2">
-                                              {opt.priority ?? "—"}
-                                            </TableCell>
-                                            <TableCell className="py-2">
-                                              {optDiffs.length === 0 ? (
-                                                <span className="flex items-center gap-1 text-xs text-green-600 dark:text-green-400">
-                                                  <CheckCircle2 className="w-3.5 h-3.5" />
-                                                  No issues
-                                                </span>
-                                              ) : (
-                                                <span className="flex flex-wrap gap-1">
-                                                  {optDiffs.map((d) => (
-                                                    <Badge
-                                                      key={d.field}
-                                                      variant="outline"
-                                                      className="text-destructive border-destructive/30 bg-destructive/5 text-xs px-1.5 py-0"
-                                                    >
-                                                      {fieldLabel(d.field)}
-                                                    </Badge>
-                                                  ))}
-                                                </span>
-                                              )}
-                                            </TableCell>
-                                            <TableCell
-                                              className="py-2"
-                                              onClick={(e) =>
-                                                e.stopPropagation()
-                                              }
-                                            >
-                                              <Button
-                                                variant="outline"
-                                                size="sm"
-                                                className="h-7 text-xs"
-                                                onClick={() =>
-                                                  selectPlu(idx, opt)
-                                                }
-                                              >
-                                                Select
-                                              </Button>
-                                            </TableCell>
-                                          </UITableRow>
-                                        );
-                                      })}
-                                    </TableBody>
-                                  </Table>
+                                  <MatchOptionsTable
+                                    item={item}
+                                    options={v.plu_options}
+                                    columns={[
+                                      "cost_price",
+                                      "mrp",
+                                      "tax_pct",
+                                      "priority",
+                                    ]}
+                                    onSelect={(opt) => selectPlu(idx, opt)}
+                                  />
                                 </div>
                               )}
 
@@ -1992,38 +2159,21 @@ const ValidationResults = ({
                                       {pluSel.plu_code}
                                     </strong>
                                   </span>
-                                  <div className="ml-auto flex items-center gap-1">
-                                    {effectiveDiscrepancies.length > 0 &&
-                                      Object.keys(pluSel.corrections).length >
-                                        0 && (
-                                        <Button
-                                          variant="outline"
-                                          size="sm"
-                                          className="h-6 text-xs gap-1 text-violet-700 border-violet-300 hover:bg-violet-100 dark:hover:bg-violet-900/30"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            applyAllSuggestions(
-                                              idx,
-                                              pluSel.corrections,
-                                            );
-                                          }}
-                                        >
-                                          <Wand2 className="w-3 h-3" />
-                                          Accept all
-                                        </Button>
-                                      )}
-                                    <Button
-                                      variant="ghost"
-                                      size="sm"
-                                      className="h-6 text-xs text-violet-600 hover:text-violet-700"
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        clearPluSelection(idx);
-                                      }}
-                                    >
-                                      Change
-                                    </Button>
-                                  </div>
+                                  {/* "Accept all" lives under the discrepancy
+                                      table below, which now covers a selection
+                                      too — a second copy here acted on the same
+                                      corrections. */}
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    className="ml-auto h-6 text-xs text-violet-600 hover:text-violet-700"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      clearPluSelection(idx);
+                                    }}
+                                  >
+                                    Change
+                                  </Button>
                                 </div>
                               )}
 
@@ -2079,7 +2229,7 @@ const ValidationResults = ({
                                   )}
 
                                   {/* Considered similar products — pickable when the
-                                      EAN wasn't found but name-similar records exist */}
+                                      EAN was not found but name-similar records exist */}
                                   {hasSuggestions && !pluSel && (
                                     <div
                                       className="border border-border rounded-lg overflow-hidden"
@@ -2094,495 +2244,69 @@ const ValidationResults = ({
                                           select the correct match, or leave unmatched
                                         </p>
                                       </div>
-                                      <div className="overflow-x-auto">
-                                        <Table>
-                                          <TableHeader>
-                                            <UITableRow className="bg-muted/50 hover:bg-muted/50">
-                                              <TableHead className="text-xs font-semibold text-foreground">
-                                                PLU Code
-                                              </TableHead>
-                                              <TableHead className="text-xs font-semibold text-foreground">
-                                                Product Name
-                                              </TableHead>
-                                              <TableHead className="text-xs font-semibold text-foreground">
-                                                EAN
-                                              </TableHead>
-                                              <TableHead className="text-xs font-semibold text-foreground">
-                                                MRP
-                                              </TableHead>
-                                              <TableHead className="text-xs font-semibold text-foreground">
-                                                Tax %
-                                              </TableHead>
-                                              <TableHead className="text-xs font-semibold text-foreground">
-                                                Differences
-                                              </TableHead>
-                                              <TableHead className="w-20" />
-                                            </UITableRow>
-                                          </TableHeader>
-                                          <TableBody>
-                                            {noMatchOptions.map((opt) => {
-                                              const { discrepancies: optDiffs } =
-                                                computeLocalValidation(item, opt);
-                                              return (
-                                                <UITableRow
-                                                  key={opt.plu_code}
-                                                  className="hover:bg-muted/30"
-                                                >
-                                                  <TableCell className="text-sm font-mono py-2">
-                                                    {opt.plu_code}
-                                                  </TableCell>
-                                                  <TableCell className="text-sm py-2">
-                                                    {opt.sku_desc ?? "—"}
-                                                  </TableCell>
-                                                  <TableCell className="text-sm font-mono py-2">
-                                                    {opt.ean_code ?? "—"}
-                                                  </TableCell>
-                                                  <TableCell className="text-sm font-mono py-2">
-                                                    {opt.mrp ?? "—"}
-                                                  </TableCell>
-                                                  <TableCell className="text-sm font-mono py-2">
-                                                    {opt.tax_pct ?? "—"}
-                                                  </TableCell>
-                                                  <TableCell className="py-2">
-                                                    {optDiffs.length === 0 ? (
-                                                      <span className="flex items-center gap-1 text-xs text-green-600 dark:text-green-400">
-                                                        <CheckCircle2 className="w-3.5 h-3.5" />
-                                                        No issues
-                                                      </span>
-                                                    ) : (
-                                                      <span className="flex flex-wrap gap-1">
-                                                        {optDiffs.map((d) => (
-                                                          <Badge
-                                                            key={d.field}
-                                                            variant="outline"
-                                                            className="text-destructive border-destructive/30 bg-destructive/5 text-xs px-1.5 py-0"
-                                                          >
-                                                            {fieldLabel(d.field)}
-                                                          </Badge>
-                                                        ))}
-                                                      </span>
-                                                    )}
-                                                  </TableCell>
-                                                  <TableCell className="py-2">
-                                                    <Button
-                                                      variant="outline"
-                                                      size="sm"
-                                                      className="h-7 text-xs"
-                                                      onClick={() =>
-                                                        selectPlu(idx, opt)
-                                                      }
-                                                    >
-                                                      Select
-                                                    </Button>
-                                                  </TableCell>
-                                                </UITableRow>
-                                              );
-                                            })}
-                                          </TableBody>
-                                        </Table>
-                                      </div>
-                                    </div>
-                                  )}
-
-                                  {editingNoMatch.has(idx) ? (
-                                    <div
-                                      className="border border-border rounded-lg overflow-hidden"
-                                      onClick={(e) => e.stopPropagation()}
-                                    >
-                                      <div className="px-3 py-2 bg-muted/50 border-b border-border">
-                                        <p className="text-xs font-semibold text-foreground">
-                                          Edit Row Values
-                                        </p>
-                                      </div>
-                                      <div className="p-3 grid grid-cols-2 gap-3 sm:grid-cols-3">
-                                        {fieldKeys.map((key) => {
-                                          const editKey =
-                                            ITEM_KEY_TO_EDIT_KEY[key] ?? key;
-                                          const currentVal =
-                                            edits[idx]?.[editKey] ??
-                                            String(item[key] ?? "");
-                                          return (
-                                            <div
-                                              key={key}
-                                              className="space-y-1"
-                                            >
-                                              <label className="text-xs font-medium text-muted-foreground">
-                                                {fieldLabel(key)}
-                                              </label>
-                                              <Input
-                                                className="h-7 text-sm"
-                                                value={currentVal}
-                                                onChange={(e) =>
-                                                  setFieldEdit(
-                                                    idx,
-                                                    editKey,
-                                                    e.target.value,
-                                                  )
-                                                }
-                                              />
-                                            </div>
-                                          );
-                                        })}
-                                      </div>
-                                      <div className="px-3 py-2 border-t border-border flex gap-2 justify-end">
-                                        <Button
-                                          variant="ghost"
-                                          size="sm"
-                                          className="h-7 text-xs"
-                                          onClick={() =>
-                                            setEditingNoMatch((prev) => {
-                                              const next = new Set(prev);
-                                              next.delete(idx);
-                                              return next;
-                                            })
-                                          }
-                                        >
-                                          Cancel
-                                        </Button>
-                                        <Button
-                                          variant="default"
-                                          size="sm"
-                                          className="h-7 text-xs gap-1"
-                                          onClick={() => {
-                                            const fields = new Set<string>(
-                                              fieldKeys.map(
-                                                (k) =>
-                                                  ITEM_KEY_TO_EDIT_KEY[k] ?? k,
-                                              ),
-                                            );
-                                            setAcceptedFields((prev) => ({
-                                              ...prev,
-                                              [idx]: new Set([
-                                                ...(prev[idx] ?? []),
-                                                ...fields,
-                                              ]),
-                                            }));
-                                            setEditingNoMatch((prev) => {
-                                              const next = new Set(prev);
-                                              next.delete(idx);
-                                              return next;
-                                            });
-                                          }}
-                                        >
-                                          <CheckCircle2 className="w-3 h-3" />
-                                          Accept Row
-                                        </Button>
-                                      </div>
-                                    </div>
-                                  ) : (
-                                    <div
-                                      className="flex justify-end"
-                                      onClick={(e) => e.stopPropagation()}
-                                    >
-                                      <Button
-                                        variant="outline"
-                                        size="sm"
-                                        className="h-7 text-xs gap-1"
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          setEditingNoMatch(
-                                            (prev) => new Set([...prev, idx]),
-                                          );
-                                        }}
-                                      >
-                                        <Pencil className="w-3 h-3" />
-                                        Edit Row
-                                      </Button>
+                                      <MatchOptionsTable
+                                        item={item}
+                                        options={noMatchOptions}
+                                        columns={["ean", "mrp", "tax_pct"]}
+                                        showInvoiceRow={false}
+                                        onSelect={(opt) => selectPlu(idx, opt)}
+                                      />
                                     </div>
                                   )}
                                 </>
                               )}
 
-                              {/* Selected candidate: full editable comparison for ALL fields */}
-                              {canSelect &&
-                                pluSel &&
-                                (() => {
-                                  const selectedOpt = v.plu_options?.find(
-                                    (o) => o.plu_code === pluSel.plu_code,
-                                  );
-                                  if (!selectedOpt) return null;
+                              {/* A value worked out from the invoice's other
+                                  columns that has nowhere else to appear: the
+                                  invoice printed no such column, so the main
+                                  table has no cell for it, and it agrees with
+                                  the catalog, so no discrepancy row carries it
+                                  either. Deriving a cost price and then not
+                                  showing it is the one thing worse than not
+                                  deriving it. */}
+                              {(() => {
+                                const unshown = Object.entries(
+                                  derivedFields,
+                                ).filter(
+                                  ([field]) =>
+                                    !fieldKeys.includes(field) &&
+                                    !effectiveDiscrepanciesRaw.some(
+                                      (d) => d.field === field,
+                                    ),
+                                );
+                                if (!unshown.length) return null;
+                                return (
+                                  <div className="flex flex-wrap items-center gap-x-4 gap-y-1 rounded-md border border-border bg-muted/30 px-3 py-2">
+                                    {unshown.map(([field, derived]) => (
+                                      <span
+                                        key={field}
+                                        className="inline-flex items-center gap-1.5"
+                                      >
+                                        <span className="text-xs text-muted-foreground">
+                                          {fieldLabel(field)}
+                                        </span>
+                                        <span className="text-sm font-mono font-medium text-foreground">
+                                          {derived.value}
+                                        </span>
+                                        <DerivedBadge derived={derived} />
+                                      </span>
+                                    ))}
+                                  </div>
+                                );
+                              })()}
 
-                                  const comparableFields: Array<{
-                                    field: string;
-                                    label: string;
-                                    invoiceKeys: string[];
-                                    masterVal: string | number | null;
-                                    isNumeric: boolean;
-                                  }> = [
-                                    {
-                                      field: "sku_desc",
-                                      label: "Product Name",
-                                      invoiceKeys: [
-                                        "sku_desc",
-                                        "product_name",
-                                        "sku_description",
-                                      ],
-                                      masterVal: selectedOpt.sku_desc,
-                                      isNumeric: false,
-                                    },
-                                    {
-                                      field: "cost_price",
-                                      label: "Cost Price",
-                                      invoiceKeys: ["cost_price"],
-                                      masterVal: selectedOpt.cost_price,
-                                      isNumeric: true,
-                                    },
-                                    {
-                                      field: "mrp",
-                                      label: "MRP",
-                                      invoiceKeys: ["mrp"],
-                                      masterVal: selectedOpt.mrp,
-                                      isNumeric: true,
-                                    },
-                                    {
-                                      field: "tax_pct",
-                                      label: "Tax %",
-                                      invoiceKeys: ["tax_pct", "gst_percent"],
-                                      masterVal: selectedOpt.tax_pct,
-                                      isNumeric: true,
-                                    },
-                                  ];
+                              {/* The one discrepancy table, whatever raised the
+                                  finding: the backend's own comparison, or the
+                                  local re-comparison against a PLU the user
+                                  picked. Resolved rows are dimmed rather than
+                                  removed.
 
-                                  return (
-                                    <div className="border border-border rounded-lg overflow-hidden">
-                                      <Table>
-                                        <TableHeader>
-                                          <UITableRow className="bg-muted/50 hover:bg-muted/50">
-                                            <TableHead className="text-xs font-semibold text-foreground">
-                                              Field
-                                            </TableHead>
-                                            <TableHead className="text-xs font-semibold text-foreground">
-                                              Master Value
-                                            </TableHead>
-                                            <TableHead className="text-xs font-semibold text-foreground">
-                                              Your Value
-                                            </TableHead>
-                                            <TableHead className="w-32" />
-                                          </UITableRow>
-                                        </TableHeader>
-                                        <TableBody>
-                                          {comparableFields.map(
-                                            ({
-                                              field,
-                                              label,
-                                              invoiceKeys,
-                                              masterVal,
-                                              isNumeric,
-                                            }) => {
-                                              // A derived cost belongs to the
-                                              // selected PLU's pack size, so it
-                                              // takes precedence over anything
-                                              // already on the item.
-                                              const derivedHere =
-                                                field === "cost_price"
-                                                  ? (pluSel.derived ?? null)
-                                                  : null;
-                                              const invoiceRaw =
-                                                derivedHere?.value ??
-                                                invoiceKeys.reduce<unknown>(
-                                                  (acc, k) =>
-                                                    acc !== undefined &&
-                                                    acc !== null &&
-                                                    acc !== ""
-                                                      ? acc
-                                                      : item[k],
-                                                  undefined,
-                                                );
-                                              const masterStr =
-                                                masterVal !== null &&
-                                                masterVal !== undefined
-                                                  ? String(masterVal)
-                                                  : null;
-                                              const currentVal =
-                                                edits[idx]?.[field] ??
-                                                String(invoiceRaw ?? "");
-                                              const isFieldAccepted =
-                                                acceptedFields[idx]?.has(
-                                                  field,
-                                                ) ?? false;
-                                              const isFieldEditing =
-                                                editingDiscrepancy[idx]?.has(
-                                                  field,
-                                                ) ?? false;
-
-                                              const matches =
-                                                masterStr !== null &&
-                                                (() => {
-                                                  if (isNumeric) {
-                                                    const a =
-                                                      parseFloat(currentVal);
-                                                    const b =
-                                                      parseFloat(masterStr);
-                                                    return (
-                                                      !isNaN(a) &&
-                                                      !isNaN(b) &&
-                                                      Math.abs(a - b) <= 0.01
-                                                    );
-                                                  }
-                                                  return (
-                                                    currentVal
-                                                      .trim()
-                                                      .toUpperCase() ===
-                                                    masterStr
-                                                      .trim()
-                                                      .toUpperCase()
-                                                  );
-                                                })();
-
-                                              const isResolved2 =
-                                                isFieldAccepted || matches;
-
-                                              return (
-                                                <UITableRow
-                                                  key={field}
-                                                  className={`hover:bg-muted/30 ${!isResolved2 && masterStr !== null ? "bg-destructive/5" : ""}`}
-                                                >
-                                                  <TableCell className="text-sm font-medium py-2">
-                                                    <span className="flex items-center gap-1.5">
-                                                      {isResolved2 ? (
-                                                        <CheckCircle2 className="w-3.5 h-3.5 text-green-500 shrink-0" />
-                                                      ) : masterStr !== null ? (
-                                                        <XCircle className="w-3.5 h-3.5 text-destructive shrink-0" />
-                                                      ) : null}
-                                                      {label}
-                                                    </span>
-                                                  </TableCell>
-                                                  <TableCell className="text-sm text-muted-foreground py-2 font-mono">
-                                                    {masterStr ?? "—"}
-                                                  </TableCell>
-                                                  <TableCell
-                                                    className="py-2"
-                                                    onClick={(e) =>
-                                                      e.stopPropagation()
-                                                    }
-                                                  >
-                                                    {isFieldEditing ? (
-                                                      <Input
-                                                        className="h-7 text-sm font-mono w-36"
-                                                        value={currentVal}
-                                                        autoFocus
-                                                        onChange={(e) =>
-                                                          setFieldEdit(
-                                                            idx,
-                                                            field,
-                                                            e.target.value,
-                                                          )
-                                                        }
-                                                      />
-                                                    ) : (
-                                                      <span className="inline-flex items-center gap-1.5">
-                                                        <span
-                                                          className={`text-sm font-mono ${isResolved2 ? "text-green-700 dark:text-green-400 font-medium" : ""}`}
-                                                        >
-                                                          {currentVal || "—"}
-                                                        </span>
-                                                        {derivedHere && (
-                                                          <DerivedBadge
-                                                            derived={
-                                                              derivedHere
-                                                            }
-                                                          />
-                                                        )}
-                                                      </span>
-                                                    )}
-                                                  </TableCell>
-                                                  <TableCell
-                                                    className="py-2"
-                                                    onClick={(e) =>
-                                                      e.stopPropagation()
-                                                    }
-                                                  >
-                                                    {isFieldEditing ? (
-                                                      <div className="flex gap-1">
-                                                        <Button
-                                                          variant="default"
-                                                          size="sm"
-                                                          className="h-7 text-xs gap-1"
-                                                          onClick={() =>
-                                                            acceptField(
-                                                              idx,
-                                                              field,
-                                                              currentVal,
-                                                            )
-                                                          }
-                                                        >
-                                                          <CheckCircle2 className="w-3 h-3" />
-                                                          Accept
-                                                        </Button>
-                                                        <Button
-                                                          variant="ghost"
-                                                          size="sm"
-                                                          className="h-7 text-xs"
-                                                          onClick={() =>
-                                                            cancelFieldEdit(
-                                                              idx,
-                                                              field,
-                                                            )
-                                                          }
-                                                        >
-                                                          Cancel
-                                                        </Button>
-                                                      </div>
-                                                    ) : !isResolved2 ? (
-                                                      <div className="flex gap-1">
-                                                        {masterStr !== null && (
-                                                          <Tooltip>
-                                                            <TooltipTrigger
-                                                              asChild
-                                                            >
-                                                              <Button
-                                                                variant="outline"
-                                                                size="sm"
-                                                                className="h-7 text-xs gap-1"
-                                                                onClick={() =>
-                                                                  acceptField(
-                                                                    idx,
-                                                                    field,
-                                                                    masterStr,
-                                                                  )
-                                                                }
-                                                              >
-                                                                <Wand2 className="w-3 h-3" />
-                                                                Accept
-                                                              </Button>
-                                                            </TooltipTrigger>
-                                                            <TooltipContent>
-                                                              Accept master
-                                                              value: {masterStr}
-                                                            </TooltipContent>
-                                                          </Tooltip>
-                                                        )}
-                                                        <Button
-                                                          variant="ghost"
-                                                          size="sm"
-                                                          className="h-7 text-xs gap-1"
-                                                          onClick={() =>
-                                                            openFieldEdit(
-                                                              idx,
-                                                              field,
-                                                            )
-                                                          }
-                                                        >
-                                                          <Pencil className="w-3 h-3" />
-                                                          Edit
-                                                        </Button>
-                                                      </div>
-                                                    ) : null}
-                                                  </TableCell>
-                                                </UITableRow>
-                                              );
-                                            },
-                                          )}
-                                        </TableBody>
-                                      </Table>
-                                    </div>
-                                  );
-                                })()}
-
-                              {/* Discrepancies table for non-multi-PLU items (resolved ones dimmed) */}
-                              {!isNoMatch &&
-                                !isPending &&
-                                !isMultiPlu &&
+                                  A multi-PLU row waiting on a choice has
+                                  nothing to compare against yet, and an
+                                  unmatched row states its case in the no-match
+                                  notice above instead. */}
+                              {!isPending &&
+                                (!isNoMatch || hasSelection) &&
                                 effectiveDiscrepanciesRaw.length > 0 && (
                                   <>
                                     <div className="border border-border rounded-lg overflow-hidden">
@@ -2898,14 +2622,15 @@ const ValidationResults = ({
 
                               {/* Inline calculation checks */}
                               {(() => {
-                                const lr = calcResults?.lineResults.find(
-                                  (r) => r.idx === idx,
-                                );
-                                if (!lr || lr.checks.length === 0) return null;
+                                if (
+                                  !itemCalcResult ||
+                                  itemCalcResult.checks.length === 0
+                                ) {
+                                  return null;
+                                }
 
-                                const failingChecks = lr.checks.filter(
-                                  (c) => !c.ok,
-                                );
+                                const failingChecks =
+                                  itemCalcResult.checks.filter((c) => !c.ok);
                                 const allOk = failingChecks.length === 0;
 
                                 return (
@@ -2978,6 +2703,11 @@ const ValidationResults = ({
                                                 {check.actual}
                                               </TableCell>
                                               <TableCell className="py-2">
+                                                {check.acceptable === false ? (
+                                                  <span className="text-xs text-muted-foreground">
+                                                    Split across columns
+                                                  </span>
+                                                ) : (
                                                 <Tooltip>
                                                   <TooltipTrigger asChild>
                                                     <Button
@@ -3013,6 +2743,7 @@ const ValidationResults = ({
                                                     {check.calculated}
                                                   </TooltipContent>
                                                 </Tooltip>
+                                                )}
                                               </TableCell>
                                             </UITableRow>
                                           ))}
@@ -3023,7 +2754,105 @@ const ValidationResults = ({
                                 );
                               })()}
 
-                              {/* Feedback widget — explicit preference signals */}
+{/* Row editor — open on every row, matched or not. A clean
+                                  match can still hold a mis-read value, so the
+                                  fields stay editable either way. */}
+                              {(() => {
+                                // Nothing else to show in the panel means the
+                                // editor is the point of opening it — skip the
+                                // extra click and render it open.
+                                const editorOpen =
+                                  editingRow.has(idx) || !hasFindings;
+
+                                if (!editorOpen) {
+                                  return (
+                                    <div
+                                      className="flex justify-end"
+                                      onClick={(e) => e.stopPropagation()}
+                                    >
+                                      <Button
+                                        variant="outline"
+                                        size="sm"
+                                        className="h-7 text-xs gap-1"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          setEditingRow(
+                                            (prev) => new Set([...prev, idx]),
+                                          );
+                                        }}
+                                      >
+                                        <Pencil className="w-3 h-3" />
+                                        Edit Row
+                                      </Button>
+                                    </div>
+                                  );
+                                }
+
+                                return (
+                                  <div
+                                    className="border border-border rounded-lg overflow-hidden"
+                                    onClick={(e) => e.stopPropagation()}
+                                  >
+                                    <div className="px-3 py-2 bg-muted/50 border-b border-border">
+                                      <p className="text-xs font-semibold text-foreground">
+                                        Edit Row Values
+                                      </p>
+                                    </div>
+                                    <div className="p-3 grid grid-cols-2 gap-3 sm:grid-cols-3">
+                                      {fieldKeys.map((key) => {
+                                        const currentVal =
+                                          edits[idx]?.[key] ??
+                                          String(item[key] ?? "");
+                                        return (
+                                          <div key={key} className="space-y-1">
+                                            <label className="text-xs font-medium text-muted-foreground">
+                                              {fieldLabel(key)}
+                                            </label>
+                                            <Input
+                                              className="h-7 text-sm"
+                                              value={currentVal}
+                                              onChange={(e) =>
+                                                setFieldEdit(
+                                                  idx,
+                                                  key,
+                                                  e.target.value,
+                                                )
+                                              }
+                                            />
+                                          </div>
+                                        );
+                                      })}
+                                    </div>
+                                    <div className="px-3 py-2 border-t border-border flex gap-2 justify-end">
+                                      {editingRow.has(idx) && (
+                                        <Button
+                                          variant="ghost"
+                                          size="sm"
+                                          className="h-7 text-xs"
+                                          onClick={() => cancelRowEdit(idx)}
+                                        >
+                                          Cancel
+                                        </Button>
+                                      )}
+                                      <Button
+                                        variant="default"
+                                        size="sm"
+                                        className="h-7 text-xs gap-1"
+                                        onClick={() =>
+                                          saveRowEdits(idx, stillUnmatched)
+                                        }
+                                      >
+                                        <CheckCircle2 className="w-3 h-3" />
+                                        {stillUnmatched
+                                          ? "Accept Row"
+                                          : "Save Changes"}
+                                      </Button>
+                                    </div>
+                                  </div>
+                                );
+                              })()}
+
+                                                            {/* Feedback widget — explicit preference signals */}
                               <div
                                 className="flex items-center gap-2 pt-2 border-t border-border"
                                 onClick={(e) => e.stopPropagation()}
@@ -3061,7 +2890,7 @@ const ValidationResults = ({
                               </div>
 
                               {/* Investigation outcome */}
-                              {isExpandable && (
+                              {hasFindings && (
                                 <div
                                   className="flex items-center gap-2 pt-2 border-t border-border"
                                   onClick={(e) => e.stopPropagation()}

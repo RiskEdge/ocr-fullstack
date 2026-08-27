@@ -25,3 +25,5 @@ src/components/ValidationResults.derived.test.tsx
 *.sln
 *.sw?
 .env
+
+src/test/*
