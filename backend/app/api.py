@@ -374,6 +374,8 @@ async def validate_data(
                 "total_items":       len(request.items),
                 "matched_exact":     stats["matched_exact"],
                 "matched_fuzzy":     stats["matched_fuzzy"],
+                # Needs migrations/add_matched_auto_selected_to_validation_runs.sql.
+                "matched_auto_selected": stats["matched_auto_selected"],
                 "matched_multi_plu": stats["matched_multi_plu"],
                 "no_match":          stats["no_match"],
                 "valid_items":       stats["valid_items"],

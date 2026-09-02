@@ -47,6 +47,10 @@ export interface ValidationResult {
   match_note?: string;
   confidence?: "high" | "medium" | "low";
   plu_options?: PluOption[];
+  /** Candidates ranked below plu_options that were still considered for this
+   *  line. Already fetched and scored server-side, so the "show all
+   *  considered" toggle reveals them without another request. */
+  additional_plu_options?: PluOption[];
   /** Gemini's pick among plu_options — highlighted as recommended in the UI. */
   recommended_plu?: string | null;
   discrepancies: Discrepancy[];

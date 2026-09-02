@@ -411,6 +411,7 @@ const DEFAULT_OPTION_COLUMNS: OptionColumn[] = [
 function MatchOptionsTable({
   item,
   options,
+  additionalOptions,
   columns = DEFAULT_OPTION_COLUMNS,
   showInvoiceRow = true,
   recommendedPlu,
@@ -419,13 +420,28 @@ function MatchOptionsTable({
 }: {
   item: ValidatedItem;
   options: PluOption[];
+  /** Candidates ranked below `options`, hidden behind the footer toggle. */
+  additionalOptions?: PluOption[];
   columns?: OptionColumn[];
   showInvoiceRow?: boolean;
   recommendedPlu?: string | null;
   activePlu?: string | null;
-  onSelect: (opt: PluOption) => void;
+  /** `fromAdditional` says the pick came from the revealed tail — the signal
+   *  that tells us the ranking put the right record too low. */
+  onSelect: (opt: PluOption, fromAdditional: boolean) => void;
 }) {
   const cols = columns.map((key) => ({ key, ...OPTION_COLUMNS[key] }));
+  const [showAll, setShowAll] = useState(false);
+  // Kept out of the way by default rather than dropped: a twenty-row table
+  // buries the recommendation it is supposed to support, and the answer is
+  // usually in the first few. When it is not, these rows have already been
+  // fetched and ranked server-side, so reaching them costs nothing — which is
+  // the difference between the user picking the right record and re-uploading
+  // the invoice.
+  const extra = additionalOptions ?? [];
+  const shown = showAll ? [...options, ...extra] : options;
+  // PLU code, product name, the middle columns, differences, the action cell.
+  const colSpan = cols.length + 4;
   return (
     <Table>
       <TableHeader>
@@ -477,7 +493,8 @@ function MatchOptionsTable({
         )}
       </TableHeader>
       <TableBody>
-        {options.map((opt) => {
+        {shown.map((opt, i) => {
+          const fromAdditional = i >= options.length;
           const { discrepancies: optDiffs } = computeLocalValidation(item, opt);
           const diffFields = new Set(optDiffs.map((d) => d.field));
           // A column with nothing to compare against stays neutral — only the
@@ -490,16 +507,18 @@ function MatchOptionsTable({
                 : "text-green-700 dark:text-green-400";
           const isRecommended = opt.plu_code === recommendedPlu;
           const isActive = opt.plu_code === activePlu;
+          const rowBg = isActive
+            ? "bg-violet-50 dark:bg-violet-950/30 hover:bg-violet-50"
+            : isRecommended
+              ? "bg-amber-50/70 dark:bg-amber-950/20 hover:bg-amber-50/70"
+              : "hover:bg-muted/30";
+          // Marks where the shortlist ended, so expanding does not silently
+          // rewrite what the recommendation was.
+          const startsTail = fromAdditional && i === options.length;
           return (
             <UITableRow
               key={opt.plu_code}
-              className={
-                isActive
-                  ? "bg-violet-50 dark:bg-violet-950/30 hover:bg-violet-50"
-                  : isRecommended
-                    ? "bg-amber-50/70 dark:bg-amber-950/20 hover:bg-amber-50/70"
-                    : "hover:bg-muted/30"
-              }
+              className={`${rowBg}${startsTail ? " border-t-2 border-t-border" : ""}`}
             >
               <TableCell className="text-sm font-mono py-2 whitespace-nowrap">
                 <span className="flex items-center gap-1.5">
@@ -557,7 +576,7 @@ function MatchOptionsTable({
                     variant="outline"
                     size="sm"
                     className="h-7 text-xs"
-                    onClick={() => onSelect(opt)}
+                    onClick={() => onSelect(opt, fromAdditional)}
                   >
                     Select
                   </Button>
@@ -567,6 +586,35 @@ function MatchOptionsTable({
           );
         })}
       </TableBody>
+      {extra.length > 0 && (
+        <tfoot>
+          <UITableRow className="hover:bg-transparent border-t border-border">
+            <TableCell colSpan={colSpan} className="py-1.5">
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-7 gap-1 text-xs text-muted-foreground hover:text-foreground"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setShowAll((s) => !s);
+                }}
+              >
+                {showAll ? (
+                  <>
+                    <ChevronDown className="w-3.5 h-3.5 rotate-180" />
+                    Show top {options.length} only
+                  </>
+                ) : (
+                  <>
+                    <ChevronDown className="w-3.5 h-3.5" />
+                    Show all {options.length + extra.length} considered
+                  </>
+                )}
+              </Button>
+            </TableCell>
+          </UITableRow>
+        </tfoot>
+      )}
     </Table>
   );
 }
@@ -1500,7 +1548,11 @@ const ValidationResults = ({
     }
   }
 
-  function selectPlu(itemIdx: number, opt: PluOption) {
+  function selectPlu(
+    itemIdx: number,
+    opt: PluOption,
+    fromAdditional = false,
+  ) {
     const { discrepancies, corrections, derived } = computeLocalValidation(
       items[itemIdx],
       opt,
@@ -1510,10 +1562,18 @@ const ValidationResults = ({
       [itemIdx]: { plu_code: opt.plu_code, discrepancies, corrections, derived },
     }));
 
+    const v = items[itemIdx]?.validation;
     track("plu_selected", {
       plu_code: opt.plu_code,
       item_index: itemIdx,
-      options_count: items[itemIdx]?.validation?.plu_options?.length ?? 0,
+      options_count: v?.plu_options?.length ?? 0,
+      // A pick from the revealed tail means the ranking put the right
+      // record below the shortlist — the one measurement that says whether
+      // recommendation quality still needs work.
+      considered_count:
+        (v?.plu_options?.length ?? 0) +
+        (v?.additional_plu_options?.length ?? 0),
+      from_additional: fromAdditional,
     });
     setEdits((prev) => {
       const next = { ...prev };
@@ -2144,7 +2204,9 @@ const ValidationResults = ({
                                       "tax_pct",
                                       "priority",
                                     ]}
-                                    onSelect={(opt) => selectPlu(idx, opt)}
+                                    onSelect={(opt, tail) =>
+                                      selectPlu(idx, opt, tail)
+                                    }
                                   />
                                 </div>
                               )}
@@ -2203,13 +2265,18 @@ const ValidationResults = ({
                                   <MatchOptionsTable
                                     item={item}
                                     options={altOptions}
+                                    additionalOptions={
+                                      v.additional_plu_options
+                                    }
                                     recommendedPlu={
                                       v.recommended_plu ?? v.matched_plu
                                     }
                                     activePlu={
                                       pluSel?.plu_code ?? v.matched_plu
                                     }
-                                    onSelect={(opt) => selectPlu(idx, opt)}
+                                    onSelect={(opt, tail) =>
+                                      selectPlu(idx, opt, tail)
+                                    }
                                   />
                                 </div>
                               )}
@@ -2247,9 +2314,14 @@ const ValidationResults = ({
                                       <MatchOptionsTable
                                         item={item}
                                         options={noMatchOptions}
+                                        additionalOptions={
+                                          v.additional_plu_options
+                                        }
                                         columns={["ean", "mrp", "tax_pct"]}
                                         showInvoiceRow={false}
-                                        onSelect={(opt) => selectPlu(idx, opt)}
+                                        onSelect={(opt, tail) =>
+                                          selectPlu(idx, opt, tail)
+                                        }
                                       />
                                     </div>
                                   )}

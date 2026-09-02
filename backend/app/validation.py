@@ -56,13 +56,11 @@ async def _call_gemini(label: str, call: Callable[[], Awaitable[dict]]) -> dict:
     validate_items turns those into a per-item fallback.
     """
     async with _get_gemini_semaphore():
-        for attempt in range(_GEMINI_MAX_RETRIES + 1):
+        for attempt in range(_GEMINI_MAX_RETRIES):
             try:
                 return await call()
             except Exception as exc:
-                msg = str(exc).lower()
-                is_rate_limit = any(sig in msg for sig in _RATE_LIMIT_SIGNALS)
-                if not is_rate_limit or attempt == _GEMINI_MAX_RETRIES:
+                if not any(sig in str(exc).lower() for sig in _RATE_LIMIT_SIGNALS):
                     raise
                 wait = 2 ** attempt
                 print(
@@ -70,7 +68,9 @@ async def _call_gemini(label: str, call: Callable[[], Awaitable[dict]]) -> dict:
                     f"(attempt {attempt + 1})"
                 )
                 await asyncio.sleep(wait)
-    raise RuntimeError("unreachable")  # pragma: no cover
+        # Last attempt sits outside the loop so its failure simply propagates.
+        # Folding it in would need a trailing raise the loop can never reach.
+        return await call()
 
 
 def _gemini_dedup_key(kind: str, item: dict, rows: list[dict]) -> tuple:
@@ -129,7 +129,11 @@ _RAW_FIELD_ALIASES: dict[str, str] = {
     "costprice":          "cost_price",
     "mrp":                "mrp",
     "maximumretailprice": "mrp",
-    "saleprice":          "sale_price",
+    # No "saleprice" entry: this table renames a header only so something below
+    # can read it by canonical name, and nothing compares, derives from or
+    # prompts with a sale price. An invoice that prints one keeps its own header
+    # and passes through untouched — _infer_canonical leaves it alone too, since
+    # "sale" is in _NOT_INVOICE_PRICE.
     # GST / Tax — all common invoice labels map to gst_percent
     "tax%":               "gst_percent",
     "taxpct":             "gst_percent",
@@ -317,7 +321,7 @@ def _infer_canonical(raw_key: str) -> Optional[str]:
 # Canonical fields coerced to numbers at normalisation time, so every consumer
 # (local compare, Gemini prompts, the frontend) sees 5.0 rather than "5%".
 _NUMERIC_FIELDS = frozenset({
-    "cost_price", "mrp", "sale_price", "gst_percent",
+    "cost_price", "mrp", "gst_percent",
     # Inputs to derive_cost_price() — parsed here so the derivation works on
     # '₹1,190.40' and '5 %' exactly as it does on plain numbers.
     "invoice_price", "taxable_value", "quantity", "uom_qty",
@@ -567,19 +571,118 @@ def _norm_name(value: object) -> str:
     return " ".join(t for t in re.split(r"[^a-z0-9&]+", str(value or "").lower()) if t)
 
 
-def _exact_name_rows(product_name: str, rows: list[dict]) -> list[dict]:
+def _exact_name_rows(
+    product_name: str, rows: list[dict], item: Optional[dict] = None
+) -> list[dict]:
     """
     Rows describing exactly this product. More than one means the same product
     exists under several PLUs, which the multi-PLU flow already handles.
+
+    An identical name only settles the identification while nothing contradicts
+    it. A row whose GST rate disagrees with the line's is a different product
+    however the description reads — a line taxed at 18% is not the catalog row
+    of the same name taxed at 5% — so it is not allowed to end the cascade
+    here. Dropping it sends the line on to the fuzzy step, which weighs every
+    candidate instead of settling for the one whose name happens to be
+    identical.
+
+    MRP deliberately does NOT gate this. A wrong price on the right product is
+    the discrepancy this tool exists to report, so an exact-name row with a
+    mismatched MRP must still match and be flagged, never be waved away as a
+    different product. `item` is optional so a caller with no line in hand
+    (or no tax printed on it) gets today's behaviour unchanged.
     """
     target = _norm_name(product_name)
     if not target:
         return []
-    return [
+    matches = [
         r for r in rows
         if target in (_norm_name(r.get("sku_description")),
                       _norm_name(r.get("sku_short_description")))
     ]
+    if item is None:
+        return matches
+    return [r for r in matches if _rate_agrees(item, r) is not False]
+
+
+def _rank_key(
+    tokens: list[str],
+    target: str,
+    r: dict,
+    middle: tuple = (),
+    demote_exact: bool = False,
+) -> tuple:
+    """
+    Sort key ordering a catalog row against an invoice product name, best first.
+
+    `middle` is spliced in after the name score and before the description
+    tiebreakers, so a caller holding the invoice line can let the line's own
+    attributes settle the ties the name leaves — without ever letting them
+    outrank the name score itself.
+
+    `demote_exact` surrenders the identical-description shortcut described
+    below, for a caller that has found the row contradicts the line.
+    """
+    score = _best_name_score(tokens, r)
+    names = (_norm_name(r.get("sku_description")),
+             _norm_name(r.get("sku_short_description")))
+    # A description identical to the invoice name is the strongest name
+    # evidence there is, and must never be cut by a trim. Without this an
+    # invoice name that reduces to one common token ("MAGGI 560GM" -> "maggi")
+    # leaves every MAGGI row tied on score, and the exact row can lose its
+    # place to an arbitrary sibling. It ranks above `middle` because it is part
+    # of the name judgement rather than a competitor to it — but only while the
+    # caller has not found the row contradicted; see demote_exact.
+    exact = 0 if target and target in names and not demote_exact else 1
+    # Among equal scores prefer the tighter description: every query word is
+    # present in both, so the one carrying fewer unrelated extra words is the
+    # closer product ("TATA SALT 1KG" over "TATA SALT PLUS IRON+IODINE 1KG").
+    # Only ever a tiebreaker, and now only after `middle` has had its say — on
+    # its own this preference buried correct records whose only fault was a
+    # name more specific than the invoice's.
+    extra = min(
+        (len([w for w in re.split(r"[^a-z0-9&]+", n) if w and w not in tokens])
+         for n in names if n),
+        default=10**6,
+    )
+    return (
+        exact,
+        -score,
+        *middle,
+        extra,
+        r.get("priority") if r.get("priority") is not None else 10**9,
+        str(r.get("plu_code") or ""),
+    )
+
+
+def _rank_candidates(item: dict, rows: list[dict], product_name: str) -> list[dict]:
+    """
+    Re-rank a name search's pooled rows against ONE invoice line, and trim to
+    the _MAX_CANDIDATES that go on to be adjudicated.
+
+    The search behind `rows` is shared by every line printing the same product
+    name, so it can only rank by name. This is where the line's own MRP, tax
+    rate and UOM are applied: below the name score — a row agreeing on tax but
+    not on name is not the product — and above the "tightest description wins"
+    tiebreaker, which is what previously settled these ties and preferred the
+    shortest description over the right record.
+    """
+    tokens = _name_tokens(product_name)
+    target = _norm_name(product_name)
+
+    def key(r: dict) -> tuple:
+        corroboration = _corroboration_key(item, r)
+        # The identical-description shortcut has to yield to a contradiction.
+        # A record named exactly as the invoice reads but taxed at another rate
+        # is a different product, and letting its name alone carry it to the top
+        # is what put unrelated records at the head of the recommendation list.
+        # Contradicted, it drops back to compete on name score like any other
+        # row — which is where corroboration gets to decide.
+        return _rank_key(
+            tokens, target, r, corroboration, demote_exact=2 in corroboration
+        )
+
+    return sorted(rows, key=key)[:_MAX_CANDIDATES]
 
 
 def _corroborated_rows(rows: list[dict], product_name: str) -> list[dict]:
@@ -644,6 +747,10 @@ def _to_plu_option(r: dict) -> dict:
 
 # How many candidates to surface alongside a match the user may want to override.
 _MAX_OPTIONS = 5
+# How many to surface when nothing was matched at all. Deliberately more
+# than _MAX_OPTIONS: with no recommendation to anchor on, the user is
+# scanning the list rather than checking one pick against its runners-up.
+_MAX_NO_MATCH_OPTIONS = 8
 
 # Name-search tunables: how many words of the product name are searched, how
 # many rows each word may contribute, and how many survive ranking.
@@ -676,6 +783,15 @@ _PROBE_POOL = ThreadPoolExecutor(
 
 _KEYWORD_FETCH_LIMIT = 400
 _MAX_CANDIDATES = 20
+# How many rows a name search keeps before the invoice line's own attributes
+# have been weighed. Wider than _MAX_CANDIDATES because the name is the weaker
+# signal: the right row can sit well down a name-only ranking (a specific
+# variant name covers a generic invoice line no better than an unrelated
+# sibling does), and trimming to 20 there discarded it before its tax rate was
+# ever compared. The search is cached per product name while the re-rank runs
+# per line, so this is the pool each line's ranking chooses from — only the
+# _MAX_CANDIDATES that survive that re-rank reach a Gemini prompt.
+_MAX_NAME_POOL = 60
 
 # Exactly the product_catalog columns this module reads — a name search can pull
 # _KEYWORD_FETCH_LIMIT rows per probe and up to nine probes per line, so `*`
@@ -685,7 +801,6 @@ _MAX_CANDIDATES = 20
 # Anything added to this list must be a column the code below actually uses;
 # anything the code starts using must be added here, or it silently reads None.
 _CATALOG_COLUMNS = ",".join((
-    "id",
     "plu_code",
     "sku_code",
     "ean_code",
@@ -732,12 +847,11 @@ def _rank_options(
     candidates: list[dict],
     matched_plu: object,
     alternates: object = None,
-    limit: int = _MAX_OPTIONS,
 ) -> list[dict]:
     """
     Order candidate rows for display: the chosen PLU first, then Gemini's ranked
     alternates, then any remaining candidates in catalog priority order.
-    Returns at most `limit` PluOption dicts.
+    Returns at most _MAX_OPTIONS PluOption dicts.
     """
     by_plu = {str(r.get("plu_code")): r for r in candidates if r.get("plu_code") is not None}
 
@@ -755,14 +869,33 @@ def _rank_options(
             ordered.append(row)
             seen.add(plu)
     for row in candidates:
-        if len(ordered) >= limit:
+        if len(ordered) >= _MAX_OPTIONS:
             break
         plu = str(row.get("plu_code"))
         if plu not in seen:
             ordered.append(row)
             seen.add(plu)
 
-    return [_to_plu_option(r) for r in ordered[:limit]]
+    return [_to_plu_option(r) for r in ordered[:_MAX_OPTIONS]]
+
+
+def _additional_options(candidates: list[dict], shown: list[dict]) -> list[dict]:
+    """
+    The candidates considered for a line that did not make its visible list,
+    in the order they were ranked.
+
+    Sent alongside plu_options so the UI can offer "show all considered"
+    without another request. The visible list stays short because a long one
+    makes the recommendation harder to read, but the rows below it have already
+    been fetched, scored and — where a Gemini call was involved — paid for. If
+    the ranking put the right record sixth, the user should be able to reach it
+    without re-uploading the invoice.
+    """
+    seen = {str(o.get("plu_code")) for o in shown}
+    return [
+        _to_plu_option(r) for r in candidates
+        if str(r.get("plu_code")) not in seen
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -831,6 +964,87 @@ def _gst_rate(item: dict) -> Optional[float]:
 def _fmt_num(val: float) -> str:
     """Trim a computed float for display: 11.904 stays, 10.0 becomes 10."""
     return f"{val:.4f}".rstrip("0").rstrip(".") or "0"
+
+
+# ---------------------------------------------------------------------------
+# Attribute corroboration
+# ---------------------------------------------------------------------------
+# A product name on its own frequently cannot separate catalog rows. An invoice
+# line reading "KNIFE" covers "KNIFE", "SHANKAR KNIFE" and "FOLDABLE FRUIT
+# KNIFE" equally well, so name-coverage scoring ties all three at 1.0 and the
+# tie falls to whichever description is shortest — which is not the same thing
+# as whichever record is right.
+#
+# The invoice prints more than a name, though: MRP, tax rate and UOM are all
+# published per line, and they separate rows the name leaves tied. Each
+# comparison below is deliberately TRI-STATE — agrees / no signal / disagrees —
+# because "no signal" must not read as "disagrees": plenty of invoices omit a
+# tax column or a UOM, and a line that prints nothing has to rank exactly as it
+# does today rather than penalising every candidate equally.
+
+# Statutory GST rates are 0, 5, 12, 18 and 28, so the gap between two real
+# rates is never small; this tolerance only absorbs formatting ("18.00" vs 18).
+_RATE_TOLERANCE = 0.01
+# Two MRPs within a paisa are the same printed price.
+_PRICE_TOLERANCE = 0.01
+
+
+def _num_agrees(a: object, b: object, tol: float) -> Optional[bool]:
+    """
+    Whether two values are the same figure. None when either side carries no
+    number at all — an absent value is not a contradiction.
+    """
+    x, y = _to_float(a), _to_float(b)
+    if x is None or y is None:
+        return None
+    return abs(x - y) <= tol
+
+
+def _mrp_agrees(item: dict, master: dict) -> Optional[bool]:
+    """Whether the invoice's MRP is this catalog row's MRP."""
+    return _num_agrees(item.get("mrp"), master.get("mrp"), _PRICE_TOLERANCE)
+
+
+def _rate_agrees(item: dict, master: dict) -> Optional[bool]:
+    """
+    Whether the invoice's GST rate is this catalog row's. The most decisive of
+    the three signals for identity: a tax rate is a statutory property of what
+    the product IS, so a 5% row and an 18% row are different products however
+    alike their descriptions read.
+    """
+    return _num_agrees(_gst_rate(item), master.get("gst_percent"), _RATE_TOLERANCE)
+
+
+def _uom_agrees(item: dict, master: dict) -> Optional[bool]:
+    """Whether both sides trade the product in the same unit ('Dozen' vs 'PCS')."""
+    inv, cat = _norm_uom(item.get("uom")), _norm_uom(master.get("uom"))
+    if not inv or not cat:
+        return None
+    return inv == cat
+
+
+# Read in this order as sort keys, so earlier signals outweigh later ones. MRP
+# leads because it is the narrowest: rows sharing a name rarely share an exact
+# price, so when the invoice prints one it usually identifies the record
+# outright. Rate and UOM follow as the broader, category-level signals.
+_CORROBORATION_SIGNALS = (_mrp_agrees, _rate_agrees, _uom_agrees)
+
+
+def _corroboration_key(item: dict, master: dict) -> tuple[int, ...]:
+    """
+    How far a catalog row's own attributes back up an invoice line, as sort
+    keys: 0 agrees, 1 no signal, 2 disagrees. Ascending order therefore puts
+    corroborated rows first and contradicted rows last, with rows that say
+    nothing either way in between.
+
+    Every value read here comes off the row and the line themselves — no
+    product, name, rate or unit is named — so this demotes a mismatched row the
+    same way for any SKU in any catalog.
+    """
+    return tuple(
+        1 if (verdict := signal(item, master)) is None else (0 if verdict else 2)
+        for signal in _CORROBORATION_SIGNALS
+    )
 
 
 def derive_cost_price(item: dict, master: dict) -> tuple[Optional[float], Optional[dict]]:
@@ -1002,12 +1216,26 @@ def _row_by_plu(rows: list[dict], plu: object) -> Optional[dict]:
     return None
 
 
-def _reconcile_cost_price(validation: dict, item: dict, master: dict) -> None:
+# A cost price that disagrees with the catalog is what the Gemini prompt calls a
+# clear pricing error, so the discrepancy raised here carries the score that
+# rubric gives one. It is stated rather than left blank because this runs after
+# the threshold filter, and an unscored discrepancy would slip past a filter
+# every other finding has to clear.
+_DERIVED_COST_RISK = 1.0
+
+
+def _reconcile_cost_price(
+    validation: dict, item: dict, master: dict, threshold: float = 0.0
+) -> None:
     """
     Re-decide the cost_price verdict in place, now that the line has a derived
     cost to compare. Gemini saw no cost price at all, so whatever it said about
     the field was said blind: any existing cost_price discrepancy is replaced,
     never stacked on top of.
+
+    `threshold` is the user's effective_risk_threshold, applied here for the
+    same reason it is applied to Gemini's own findings — a user who has tuned
+    low-value flags away should not have this one reappear underneath.
     """
     inv_val    = _to_float(item.get("cost_price"))
     master_val = _to_float(master.get("cost_price"))
@@ -1018,15 +1246,19 @@ def _reconcile_cost_price(validation: dict, item: dict, master: dict) -> None:
     corrections = dict(validation.get("suggested_corrections") or {})
     corrections.pop("cost_price", None)
 
-    if inv_val is not None and master_val is not None and abs(inv_val - master_val) > 0.01:
+    mismatched = (
+        inv_val is not None and master_val is not None and abs(inv_val - master_val) > 0.01
+    )
+    if mismatched and _DERIVED_COST_RISK >= threshold:
         validation["discrepancies"].append({
-            "field":    "cost_price",
-            "expected": master_val,
-            "actual":   inv_val,
+            "field":      "cost_price",
+            "expected":   master_val,
+            "actual":     inv_val,
             "message": (
                 f"Cost Price mismatch: invoice works out to {inv_val}, "
                 f"master has {master_val}."
             ),
+            "risk_score": _DERIVED_COST_RISK,
         })
         corrections["cost_price"] = master_val
 
@@ -1105,14 +1337,18 @@ class ValidationProcessor:
         ean     = item.get("ean_code", "unknown")
         product = item.get("sku_description", "unknown")
 
+        # UOM is carried through because it is an identity signal the invoice
+        # also prints: a record traded by the dozen and one traded per piece are
+        # different records even when both descriptions read the same.
         master_lines = [
             f"  PLU {r['plu_code']} (priority {r.get('priority', '?')}): "
             f"'{r.get('sku_description') or '—'}', "
-            f"Cost={r.get('cost_price')}, MRP={r.get('mrp')}, GST%={r.get('gst_percent')}"
+            f"Cost={r.get('cost_price')}, MRP={r.get('mrp')}, "
+            f"GST%={r.get('gst_percent')}, UOM={r.get('uom') or '—'}"
             for r in master_rows
         ]
         master_json = json.dumps([
-            {k: r.get(k) for k in ("plu_code", "sku_description", "cost_price", "mrp", "gst_percent", "priority")}
+            {k: r.get(k) for k in ("plu_code", "sku_description", "cost_price", "mrp", "gst_percent", "uom", "uom_qty", "priority")}
             for r in master_rows
         ])
 
@@ -1127,14 +1363,19 @@ Invoice line item:
   Product: {product}
   Cost Price: {_fmt(item.get("cost_price"))}
   MRP: {_fmt(item.get("mrp"))}
-  GST%: {_fmt(item.get("gst_percent"))}
+  GST%: {_fmt(_gst_rate(item))}
+  UOM: {_fmt(item.get("uom"))}
 
 Master data records for EAN {ean}:
 {chr(10).join(master_lines)}
 
 Task:
 1. Select the master record whose values are closest to the invoice
-   (prioritise MRP match, then GST%, then Cost Price).
+   (prioritise MRP match, then GST% and UOM together, then Cost Price).
+   A GST% or UOM that disagrees with the invoice is evidence of a DIFFERENT
+   product rather than of a data-entry error: a tax rate is set by what the
+   product is, and the UOM is how it is traded. Prefer a record that agrees
+   on both over one that agrees on neither, even if the second looks tidier.
 2. Compare cost_price, mrp, gst_percent, AND sku_description between the invoice and the chosen record.
    IMPORTANT: If an invoice field says "not provided in invoice", that data was absent
    from the document. Do NOT flag it as a discrepancy — skip it entirely.
@@ -1205,11 +1446,12 @@ Master records (JSON):
             f"  PLU {r['plu_code']} | EAN {r.get('ean_code')} | "
             f"'{r.get('sku_description') or '—'}' | "
             f"short: '{r.get('sku_short_description') or '—'}' | "
-            f"Cost={r.get('cost_price')}, MRP={r.get('mrp')}, GST%={r.get('gst_percent')}"
+            f"Cost={r.get('cost_price')}, MRP={r.get('mrp')}, "
+            f"GST%={r.get('gst_percent')}, UOM={r.get('uom') or '—'}"
             for r in candidates
         ]
         candidates_json = json.dumps([
-            {k: r.get(k) for k in ("plu_code", "ean_code", "sku_description", "sku_short_description", "cost_price", "mrp", "gst_percent", "priority")}
+            {k: r.get(k) for k in ("plu_code", "ean_code", "sku_description", "sku_short_description", "cost_price", "mrp", "gst_percent", "uom", "uom_qty", "priority")}
             for r in candidates
         ])
 
@@ -1224,19 +1466,29 @@ Invoice line item:
   Product: {product}
   Cost Price: {item.get("cost_price")}
   MRP: {item.get("mrp")}
-  GST%: {item.get("gst_percent")}
+  GST%: {_gst_rate(item)}
+  UOM: {item.get("uom")}
 
 Possible master records (matched by product name keyword):
 {chr(10).join(candidates_lines)}
 
 Task:
-1. Choose the master record that most likely represents the same product
-   (use product name similarity, then MRP, then GST% as tiebreakers).
+1. Choose the master record that most likely represents the same product.
+   Weigh product name similarity FIRST, then MRP, then GST% and UOM together.
    Master descriptions are ERP-entered and may be MISSPELT or abbreviated
    ("TENNIES" for "TENNIS"), and the short description drops the brand
    ("COKE 2L" for "COCA COLA 2LTR"). Judge the product identity, not the
    spelling: a misspelt record naming the same product beats a correctly
    spelt record naming a different one.
+   A GST% or UOM that disagrees with the invoice is evidence of a DIFFERENT
+   product rather than of a data-entry error: a tax rate is set by what the
+   product is, and the UOM is how it is traded.
+   When the invoice name is GENERIC and several records contain it, do not
+   default to the record with the shortest or most similar-looking name.
+   A longer, more specific master description is normal ERP naming, not a
+   reason to reject the record: for an invoice line "SOAP" at 18% GST sold by
+   the dozen, a record "HERBAL BATH SOAP 250G" at 18% sold by the dozen is a
+   better match than a record named exactly "SOAP" at 5% sold per piece.
 2. If no record is a reasonable match, set "matched_plu" to null.
 3. Compare cost_price, mrp, gst_percent, AND sku_description between the invoice and the chosen record.
    Compare numeric fields NUMERICALLY — values that differ only in formatting are EQUAL and must
@@ -1347,7 +1599,10 @@ Master records (JSON):
         alongside "COKE 2L") — so an invoice name frequently matches only one
         of the two.
 
-        Returns at most _MAX_CANDIDATES rows, best match first.
+        Ranks by name alone and returns at most _MAX_NAME_POOL rows, best match
+        first. The result is cached per product name, so the invoice line's own
+        attributes cannot be weighed here — _rank_candidates() does that per
+        line and takes the final _MAX_CANDIDATES.
         """
         keywords = _name_keywords(product_name)[:_MAX_SEARCH_KEYWORDS]
         if not keywords:
@@ -1392,7 +1647,7 @@ Master records (JSON):
 
         def absorb(rows: list[dict]) -> None:
             for row in rows:
-                pooled.setdefault(str(row.get("plu_code") or row.get("id")), row)
+                pooled.setdefault(str(row.get("plu_code")), row)
 
         for rows in results:
             absorb(rows)
@@ -1416,36 +1671,10 @@ Master records (JSON):
 
         tokens = _name_tokens(product_name)
         target = _norm_name(product_name)
-
-        def sort_key(r: dict) -> tuple:
-            score = _best_name_score(tokens, r)
-            names = (_norm_name(r.get("sku_description")),
-                     _norm_name(r.get("sku_short_description")))
-            # A description identical to the invoice name is the answer and must
-            # never be cut by the _MAX_CANDIDATES trim. Without this an invoice
-            # name that reduces to one common token ("MAGGI 560GM" -> "maggi")
-            # leaves every MAGGI row tied on score, and the exact row can lose
-            # its place to an arbitrary sibling.
-            exact = 0 if target and target in names else 1
-            # Among equal scores prefer the tighter description: every query
-            # word is present in both, so the one carrying fewer unrelated
-            # extra words is the closer product ("TATA SALT 1KG" over
-            # "TATA SALT PLUS IRON+IODINE 1KG"). Only ever a tiebreaker.
-            extra = min(
-                (len([w for w in re.split(r"[^a-z0-9&]+", n) if w and w not in tokens])
-                 for n in names if n),
-                default=10**6,
-            )
-            return (
-                exact,
-                -score,
-                extra,
-                r.get("priority") if r.get("priority") is not None else 10**9,
-                str(r.get("plu_code") or ""),
-            )
-
-        ranked = sorted(pooled.values(), key=sort_key)
-        return ranked[:_MAX_CANDIDATES]
+        ranked = sorted(
+            pooled.values(), key=lambda r: _rank_key(tokens, target, r)
+        )
+        return ranked[:_MAX_NAME_POOL]
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -1618,8 +1847,14 @@ Master records (JSON):
 
             # ── 3. Still nothing: an identical product name is a match ───
             if not master_rows:
-                candidates = name_cache.get(_norm_name(product_name), [])
-                exact_rows = _exact_name_rows(product_name, candidates)
+                # The search was shared across every line printing this name;
+                # this line's MRP, tax rate and UOM decide the order now.
+                candidates = _rank_candidates(
+                    item,
+                    name_cache.get(_norm_name(product_name), []),
+                    product_name,
+                )
+                exact_rows = _exact_name_rows(product_name, candidates, item)
                 if exact_rows:
                     master_rows  = exact_rows
                     match_source = "name_exact"
@@ -1688,6 +1923,19 @@ Master records (JSON):
                 continue
 
             # ── Multiple PLUs ────────────────────────────────────────────
+            # Ordered by how far each row's own attributes back up this line,
+            # then by catalog priority as before. One ordering then serves all
+            # three consumers below: the row a clean local compare settles on,
+            # the head of the picker the user sees, and the row the auto-select
+            # fallback takes when Gemini is unreachable.
+            master_rows = sorted(
+                master_rows,
+                key=lambda r: (
+                    _corroboration_key(item, r),
+                    r.get("priority") if r.get("priority") is not None else 10**9,
+                    str(r.get("plu_code") or ""),
+                ),
+            )
             # Derivation is per row: uom_qty belongs to the PLU, so each
             # candidate implies its own unit cost and must be compared against
             # the one it implies.
@@ -1764,26 +2012,45 @@ Master records (JSON):
                 item = items[result_idx]
                 if isinstance(output, Exception):
                     print(f"[validate-data] Gemini failed for index {result_idx}: {output}")
-                    ean = _ean_str(item.get("ean_code"))
-                    master_rows_fb = master_lookup.get(ean or "", [])
-                    if master_rows_fb:
-                        priced, derived = with_derived_cost(item, master_rows_fb[0])
-                        results[result_idx] = {
-                            **priced,
-                            "validation": {
-                                **local_compare(priced, master_rows_fb[0]),
-                                "match_type": "auto_selected",
-                                **_derived_fields(derived),
-                            },
+                    ean   = _ean_str(item.get("ean_code"))
+                    cands = queued_candidates.get(result_idx, [])
+                    # What a failed call can fall back to depends on which queue
+                    # the line came from, which is what match_type_override
+                    # records — not on whether its EAN is in the catalog. Every
+                    # queued line failed the EAN lookup or it would never have
+                    # been queued, so re-reading that lookup here only ever
+                    # found rows for one of the two paths, and discarded the
+                    # candidates already in hand for the other.
+                    if match_type_override and cands:
+                        # Auto-select: every candidate is a confident match for
+                        # this line and Gemini was only ranking between them.
+                        # They arrive ordered by how far each row's MRP, tax
+                        # rate and UOM back up the line, so the first is the
+                        # pick that ordering already recommends.
+                        matched_auto += 1
+                        priced, derived = with_derived_cost(item, cands[0])
+                        fallback = {
+                            **local_compare(priced, cands[0]),
+                            "match_type": match_type_override,
+                            **_derived_fields(derived),
                         }
+                        # Surface the rest so the priority pick can be overridden,
+                        # the same way a successful auto-selection does.
+                        if len(cands) > 1:
+                            shown = _rank_options(cands, cands[0].get("plu_code"))
+                            fallback["plu_options"]    = shown
+                            fallback["recommended_plu"] = cands[0].get("plu_code")
+                            extra = _additional_options(cands, shown)
+                            if extra:
+                                fallback["additional_plu_options"] = extra
+                        results[result_idx] = {**priced, "validation": fallback}
                     else:
-                        # The call failed — that is not the same as the product
-                        # being absent, and saying so would send the user off
-                        # correcting a catalog that is fine. Report the failure
-                        # and hand back the candidates the search did find, so
-                        # the line stays resolvable by hand.
+                        # Fuzzy: the candidates are unadjudicated name-search
+                        # hits — picking one here would be the guess Gemini was
+                        # called to avoid. Report the failure instead, and say
+                        # it was a failure: claiming the product is absent would
+                        # send the user off correcting a catalog that is fine.
                         no_match_count += 1
-                        cands = queued_candidates.get(result_idx, [])
                         failure = {
                             "matched_plu":           None,
                             "match_type":            "no_match",
@@ -1804,7 +2071,13 @@ Master records (JSON):
                             "suggested_corrections": {},
                         }
                         if cands:
-                            failure["plu_options"] = [_to_plu_option(c) for c in cands[:8]]
+                            shown = [
+                                _to_plu_option(c) for c in cands[:_MAX_NO_MATCH_OPTIONS]
+                            ]
+                            failure["plu_options"] = shown
+                            extra = _additional_options(cands, shown)
+                            if extra:
+                                failure["additional_plu_options"] = extra
                         results[result_idx] = {**item, "validation": failure}
                 else:
                     validation = dict(output)
@@ -1826,7 +2099,7 @@ Master records (JSON):
                         item, derived = with_derived_cost(item, matched_row)
                         if derived:
                             validation.update(_derived_fields(derived))
-                            _reconcile_cost_price(validation, item, matched_row)
+                            _reconcile_cost_price(validation, item, matched_row, threshold)
 
                     # An item is only valid if a real master record was matched
                     # AND no discrepancies survive the risk threshold. When
@@ -1848,6 +2121,11 @@ Master records (JSON):
                         if len(options) > 1:
                             validation["plu_options"]    = options
                             validation["recommended_plu"] = validation.get("matched_plu")
+                            extra = _additional_options(
+                                queued_candidates.get(result_idx, []), options
+                            )
+                            if extra:
+                                validation["additional_plu_options"] = extra
                     validation.pop("alternate_plus", None)
 
                     if match_type_override:
@@ -1862,7 +2140,13 @@ Master records (JSON):
                         # still pick one manually ("considered similar products").
                         cands = queued_candidates.get(result_idx, [])
                         if cands:
-                            validation["plu_options"] = [_to_plu_option(c) for c in cands[:8]]
+                            shown = [
+                                _to_plu_option(c) for c in cands[:_MAX_NO_MATCH_OPTIONS]
+                            ]
+                            validation["plu_options"] = shown
+                            extra = _additional_options(cands, shown)
+                            if extra:
+                                validation["additional_plu_options"] = extra
                         # The frontend shows the unmatched explanation from
                         # discrepancies[0].message (match_note is only rendered
                         # for fuzzy_name). Ensure a message survives: carry over
