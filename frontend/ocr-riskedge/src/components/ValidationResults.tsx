@@ -642,20 +642,32 @@ const LINE_AMOUNT_CANDIDATES = [
 const GRAND_TOTAL_CANDIDATES = [
   "grandtotal",
   "grandtotalamount",
+  "invoicegrandtotal",
   "invoicetotal",
   "totalinvoicevalue",
   "totalinvoiceamount",
   "invoicevalue",
   "invoiceamount",
+  "totalamountpayable",
+  "netamountpayable",
   "amountpayable",
   "netpayable",
   "payableamount",
+  "totalpayable",
+  "amountdue",
+  "totaldue",
   "billamount",
+  "totalbillamount",
   "nettotal",
   "grosstotal",
+  "roundedtotal",
   "finalamount",
+  "finaltotal",
   "totalamount",
+  "totalnetamount",
+  "netamount",
   "nettaxableamount",
+  "totalvalue",
   "total",
 ];
 
@@ -704,6 +716,36 @@ const TAX_PCT_CANDIDATES = [
 // Strips every non-alphanumeric character, so "Grand Total (INR)",
 // "grand-total" and "grand_total" all collapse to the same key. Kept in sync
 // with the normKey used for line-item table detection in Index.tsx.
+// A printed money figure carries decoration a bare parseFloat chokes on: a
+// currency symbol or code in front ("Rs. 1,200.04", "INR 1,200.04"), the Indian
+// "/-" suffix, thousands separators. parseFloat("₹1200.04") is NaN, which used
+// to make the field invisible to every finder below — the grand total simply
+// vanished from the UI rather than reporting a mismatch.
+//
+// Deliberately strict about what counts as a number: the decoration is stripped
+// and what remains must be the whole value. A loose "first number in the
+// string" rule would read "Invoice No: INV-2024-01" as a numeric field and let
+// junk into the grand-total search.
+const CURRENCY_NOISE_RE =
+  /[\u20b9$\u20ac\u00a3\u00a5]|\b(?:inr|rs|usd|eur|gbp|aed|rupees?|only)\b\.?|\/-/gi;
+
+function parseAmount(v: unknown): number {
+  if (typeof v === "number") return v;
+  const raw = String(v ?? "");
+  if (!raw.trim()) return NaN;
+  let s = raw.replace(CURRENCY_NOISE_RE, "").replace(/[,\s]/g, "");
+  // Accounting negatives: (1,200.04) means −1200.04.
+  let sign = 1;
+  const paren = s.match(/^\((.*)\)$/);
+  if (paren) {
+    sign = -1;
+    s = paren[1];
+  }
+  if (!/^[+-]?\d*\.?\d+$/.test(s)) return NaN;
+  const n = parseFloat(s);
+  return isNaN(n) ? NaN : sign * n;
+}
+
 function normKey(k: string): string {
   return k.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
@@ -728,9 +770,7 @@ function findFieldValue(
   for (const [k, v] of Object.entries(item)) {
     if (k === "validation") continue;
     if (normCandidates.has(normKey(k))) {
-      // Thousands separators are common in OCR output — parseFloat would
-      // silently truncate "1,234.56" to 1 and wreck the line-amount sum.
-      const n = parseFloat(String(v ?? "").replace(/[,\s]/g, ""));
+      const n = parseAmount(v);
       if (!isNaN(n)) return { key: k, value: n };
     }
   }
@@ -747,7 +787,7 @@ function findGrandTotal(
   const byNorm = new Map<string, { key: string; value: number }>();
   const numeric: Array<{ key: string; norm: string; value: number }> = [];
   for (const [k, v] of Object.entries(scalars)) {
-    const n = parseFloat(String(v ?? "").replace(/[,\s]/g, ""));
+    const n = parseAmount(v);
     if (isNaN(n)) continue;
     const norm = normKey(k);
     numeric.push({ key: k, norm, value: n });
@@ -782,7 +822,7 @@ function findFieldOrdered(
   const byNorm = new Map<string, { key: string; value: number }>();
   for (const [k, v] of Object.entries(item)) {
     if (k === "validation") continue;
-    const n = parseFloat(String(v ?? "").replace(/[,\s]/g, ""));
+    const n = parseAmount(v);
     if (isNaN(n)) continue;
     const nk = normKey(k);
     if (!byNorm.has(nk)) byNorm.set(nk, { key: k, value: n });
@@ -806,7 +846,7 @@ function sumFields(
   for (const [k, v] of Object.entries(item)) {
     if (k === "validation") continue;
     if (!norm.has(normKey(k))) continue;
-    const n = parseFloat(String(v ?? "").replace(/[,\s]/g, ""));
+    const n = parseAmount(v);
     if (isNaN(n)) continue;
     keys.push(k);
     total += n;
@@ -835,8 +875,9 @@ interface CalcValidationResult {
   lineResults: LineCalcResult[];
   lineAmountSum: number;
   grandTotalCheck: {
-    field: string;
-    documentTotal: number;
+    /** null when the document has no recognisable invoice-total field. */
+    field: string | null;
+    documentTotal: number | null;
     ok: boolean;
     /** Lines that contributed an amount to lineAmountSum. */
     linesCounted: number;
@@ -1318,19 +1359,19 @@ const ValidationResults = ({
     // is reported as partial so a shortfall isn't read as a real discrepancy.
     let grandTotalCheck: CalcValidationResult["grandTotalCheck"] = null;
     if (documentScalars && linesWithAmount > 0) {
+      // Built even when no total field is found: hiding the panel outright made
+      // an undetected header indistinguishable from a clean match, so the line
+      // sum is still shown and the missing side is named.
       const gtField = findGrandTotal(documentScalars);
-      if (gtField) {
-        const sumRounded = parseFloat(lineAmountSum.toFixed(2));
-        const partial = !allLinesHaveAmount;
-        grandTotalCheck = {
-          field: gtField.key,
-          documentTotal: gtField.value,
-          ok: Math.abs(sumRounded - gtField.value) <= 0.05,
-          linesCounted: linesWithAmount,
-          linesTotal: lineResults.length,
-          partial,
-        };
-      }
+      const sumRounded = parseFloat(lineAmountSum.toFixed(2));
+      grandTotalCheck = {
+        field: gtField?.key ?? null,
+        documentTotal: gtField?.value ?? null,
+        ok: gtField ? Math.abs(sumRounded - gtField.value) <= 0.05 : false,
+        linesCounted: linesWithAmount,
+        linesTotal: lineResults.length,
+        partial: !allLinesHaveAmount,
+      };
     }
 
     return {
@@ -3029,16 +3070,25 @@ const ValidationResults = ({
         </div>
       </div>
 
-      {/* Grand Total — always shown when a grand total field is detected */}
+      {/* Grand Total — shown whenever any line carried an amount, even if the
+          document's own total could not be located. */}
       {calcResults?.grandTotalCheck && (
         <div className="border border-border rounded-lg overflow-hidden my-4">
           <div className="px-3 py-2 bg-muted/50 border-b border-border flex items-center gap-3">
             <Calculator className="w-4 h-4 text-foreground" />
             <p className="text-xs font-semibold text-foreground">Grand Total</p>
             <span className="text-xs text-muted-foreground font-mono">
-              {calcResults.grandTotalCheck.field}
+              {calcResults.grandTotalCheck.field ?? "—"}
             </span>
-            {calcResults.grandTotalCheck.ok ? (
+            {calcResults.grandTotalCheck.documentTotal === null ? (
+              <Badge
+                variant="outline"
+                className="ml-auto gap-1 text-xs text-muted-foreground"
+              >
+                <AlertCircle className="w-3 h-3" />
+                No invoice total found
+              </Badge>
+            ) : calcResults.grandTotalCheck.ok ? (
               <Badge className="ml-auto bg-green-500/10 text-green-600 dark:text-green-400 border-green-500/20 gap-1 text-xs">
                 <CheckCircle2 className="w-3 h-3" />
                 Matches line sum
@@ -3072,12 +3122,19 @@ const ValidationResults = ({
                 Invoice grand total
               </span>
               <span
-                className={`font-mono font-semibold ${calcResults.grandTotalCheck.ok ? "" : "text-destructive"}`}
+                className={`font-mono font-semibold ${
+                  calcResults.grandTotalCheck.documentTotal === null
+                    ? "text-muted-foreground"
+                    : calcResults.grandTotalCheck.ok
+                      ? ""
+                      : "text-destructive"
+                }`}
               >
-                {calcResults.grandTotalCheck.documentTotal}
+                {calcResults.grandTotalCheck.documentTotal ?? "not detected"}
               </span>
             </div>
-            {!calcResults.grandTotalCheck.ok && (
+            {!calcResults.grandTotalCheck.ok &&
+              calcResults.grandTotalCheck.documentTotal !== null && (
               <div className="flex flex-col gap-0.5">
                 <span className="text-xs text-muted-foreground">
                   Difference
@@ -3091,9 +3148,17 @@ const ValidationResults = ({
                   ).toFixed(2)}
                 </span>
               </div>
-            )}
+              )}
           </div>
-          {calcResults.grandTotalCheck.partial && (
+          {calcResults.grandTotalCheck.documentTotal === null && (
+            <p className="px-4 pb-3 text-xs text-muted-foreground">
+              No invoice-total field was recognised in the extracted document
+              data, so there is nothing to compare the line sum against. Check
+              the Extracted tab for the header the invoice actually uses.
+            </p>
+          )}
+          {calcResults.grandTotalCheck.partial &&
+            calcResults.grandTotalCheck.documentTotal !== null && (
             <p className="px-4 pb-3 text-xs text-muted-foreground">
               {calcResults.grandTotalCheck.linesTotal -
                 calcResults.grandTotalCheck.linesCounted}{" "}

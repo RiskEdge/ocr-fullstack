@@ -21,4 +21,6 @@ seed_data/
 backend/docs/
 .venv
 Master_format.xlsx
+backend/seed_scripts/gen_demo_catalog_payload.py
+backend/seed_scripts/gen_demo_invoices.py
 
