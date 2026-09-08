@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 from pydantic import BaseModel
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile, Depends, status
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from passlib.context import CryptContext
@@ -15,7 +15,7 @@ import os
 dotenv.load_dotenv()
 
 from app.ocr import OCRProcessor
-from app.validation import ValidationProcessor
+from app.validation import ValidationProcessor, search_catalog
 from app.auth_utils import create_access_token, get_current_user, TokenData
 from app.db import get_supabase
 from app.behavior import router as behavior_router
@@ -333,6 +333,27 @@ async def process_invoice_stream(
 class ValidateDataRequest(BaseModel):
     items: list[dict]
     source_filename: str | None = None
+
+
+@app.get("/v1/catalog/search")
+async def catalog_search(
+    q: str = Query("", max_length=120),
+    limit: int = Query(15, ge=1, le=50),
+    current_user: TokenData = Depends(get_current_user),
+):
+    """
+    Typeahead over the caller's product catalog, for matching an invoice line
+    the automatic validation could not. Returns PluOption rows, best first.
+    Free — no Gemini call, no credit.
+    """
+    try:
+        options = await asyncio.to_thread(
+            search_catalog, q, current_user.company_id, limit
+        )
+    except Exception as e:
+        print(f"[catalog-search] failed for {q!r}: {e}")
+        raise HTTPException(status_code=500, detail="Catalog search failed.")
+    return {"options": options}
 
 
 @app.post("/v1/validate-data")

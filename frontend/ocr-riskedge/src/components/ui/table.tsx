@@ -2,18 +2,41 @@ import * as React from "react";
 
 import { cn } from "@/lib/utils";
 
-const Table = React.forwardRef<HTMLTableElement, React.HTMLAttributes<HTMLTableElement>>(
-  ({ className, ...props }, ref) => (
-    <div className="relative w-full overflow-auto">
-      <table ref={ref} className={cn("w-full caption-bottom text-sm", className)} {...props} />
-    </div>
-  ),
-);
+const Table = React.forwardRef<
+  HTMLTableElement,
+  React.HTMLAttributes<HTMLTableElement> & {
+    /** Overrides the wrapper div's default `overflow-auto`. A sticky
+     *  <thead> resolves its top-0 offset against the NEAREST ancestor with
+     *  non-visible overflow — even one that never itself scrolls, because
+     *  content exactly fills it. This default wrapper is exactly such an
+     *  ancestor, so it silently defeats `sticky` on every table unless a
+     *  caller wanting a sticky header opts out with `wrapperClassName="overflow-visible"`,
+     *  deferring both scroll axes to whichever real ancestor scrolls. */
+    wrapperClassName?: string;
+  }
+>(({ className, wrapperClassName, ...props }, ref) => (
+  <div className={cn("relative w-full overflow-auto", wrapperClassName)}>
+    <table ref={ref} className={cn("w-full caption-bottom text-sm", className)} {...props} />
+  </div>
+));
 Table.displayName = "Table";
 
-const TableHeader = React.forwardRef<HTMLTableSectionElement, React.HTMLAttributes<HTMLTableSectionElement>>(
-  ({ className, ...props }, ref) => <thead ref={ref} className={cn("[&_tr]:border-b", className)} {...props} />,
-);
+const TableHeader = React.forwardRef<
+  HTMLTableSectionElement,
+  React.HTMLAttributes<HTMLTableSectionElement> & {
+    /** Pins the header to the top of the nearest scrolling ancestor while its
+     *  body scrolls underneath. Opt-in per table — a nested table sharing the
+     *  same scroll region as an already-sticky outer table would otherwise
+     *  fight it for the same top-0 position. */
+    sticky?: boolean;
+  }
+>(({ className, sticky, ...props }, ref) => (
+  <thead
+    ref={ref}
+    className={cn("[&_tr]:border-b", sticky && "sticky top-0 z-10 bg-muted", className)}
+    {...props}
+  />
+));
 TableHeader.displayName = "TableHeader";
 
 const TableBody = React.forwardRef<HTMLTableSectionElement, React.HTMLAttributes<HTMLTableSectionElement>>(

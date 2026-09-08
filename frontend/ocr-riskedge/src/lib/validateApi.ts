@@ -25,10 +25,20 @@ export interface PluOption {
 /** How a value the invoice never printed was worked out. */
 export interface DerivedField {
   value: number;
-  source: "tax_amounts" | "gst_rate";
+  /**
+   * How the value was reached: tax from printed amounts, tax from the GST
+   * rate, or a printed cost price with the line's discount taken off.
+   */
+  source: "tax_amounts" | "gst_rate" | "printed_discount";
   formula: string;
   unit_price?: number;
   price_source?: string;
+  /** Present only when a discount was applied. */
+  gross_unit_price?: number | null;
+  discount_pct?: number | null;
+  discount_amount?: number | null;
+  scheme_amount?: number | null;
+  net_unit_price?: number | null;
   uom?: string | null;
   uom_qty?: number | null;
   quantity?: number | null;
@@ -72,6 +82,32 @@ export type ValidatedItem = {
 
 export interface ValidationRunResult {
   validated_items: ValidatedItem[];
+}
+
+/**
+ * Typeahead over the company's product catalog — for matching a line the
+ * automatic validation could not. Reads the JWT from localStorage like the
+ * profile wrappers do, so a component deep in the tree needs no token prop.
+ * Pass an AbortSignal so a superseded keystroke's request is dropped.
+ */
+export async function searchCatalog(
+  query: string,
+  signal?: AbortSignal,
+  limit = 15,
+): Promise<PluOption[]> {
+  let token: string | null = null;
+  try {
+    token = localStorage.getItem("ocr_access_token");
+  } catch {
+    token = null;
+  }
+  if (!token) return [];
+  const response = await api.get("/v1/catalog/search", {
+    params: { q: query, limit },
+    headers: { Authorization: `Bearer ${token}` },
+    signal,
+  });
+  return ((response.data as { options?: PluOption[] }).options ?? []);
 }
 
 export async function validateItems(

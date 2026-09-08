@@ -178,6 +178,13 @@ _RAW_FIELD_ALIASES: dict[str, str] = {
     # Quantity (not validated, just passed through)
     "qty":                "quantity",
     "quantity":           "quantity",
+    "pcs":                "quantity",
+    "pieces":             "quantity",
+    "nos":                "quantity",
+    "noofpcs":            "quantity",
+    "qtypcs":             "quantity",
+    "qtyinpcs":           "quantity",
+    "qtynos":             "quantity",
     # Pack size — the number of individual units inside one invoiced UOM.
     # The catalog is the authority on it, but an invoice that prints its own
     # value lets a line be reconciled even when the catalog's is missing.
@@ -201,6 +208,47 @@ _RAW_FIELD_ALIASES: dict[str, str] = {
     "unitprice":          "invoice_price",
     "unitrate":           "invoice_price",
     "price":              "invoice_price",
+    # An invoice that prints the rate both ways: only the pre-tax one is the
+    # unit price the derivation adds tax to. The inclusive one is kept under
+    # its own key so it never wins by column order.
+    "rateexcl":           "invoice_price",
+    "rateexc":            "invoice_price",
+    "rateexclusive":      "invoice_price",
+    "rateexclgst":        "invoice_price",
+    "rateexcgst":         "invoice_price",
+    "rateexcltax":        "invoice_price",
+    "rateexcludinggst":   "invoice_price",
+    "rateexcludingtax":   "invoice_price",
+    "rateinc":            "invoice_price_incl",
+    "rateincl":           "invoice_price_incl",
+    "rateinclusive":      "invoice_price_incl",
+    "rateincgst":         "invoice_price_incl",
+    "rateinclgst":        "invoice_price_incl",
+    "rateincltax":        "invoice_price_incl",
+    "rateinctax":         "invoice_price_incl",
+    "rateincludinggst":   "invoice_price_incl",
+    "rateincludingtax":   "invoice_price_incl",
+    # Discounts — see _infer_discount(), which reads the raw header ahead of
+    # this table because _norm_key() strips the '%' that tells a percentage
+    # from an amount. These spellings survive normalisation unambiguously.
+    "discountpct":        "discount_pct",
+    "discountpercent":    "discount_pct",
+    "discountpercentage": "discount_pct",
+    "discpct":            "discount_pct",
+    "discpercent":        "discount_pct",
+    "discountrate":       "discount_pct",
+    "cashdiscount":       "discount_pct",
+    "cashdiscountpct":    "discount_pct",
+    "cd":                 "discount_pct",
+    "cdpct":              "discount_pct",
+    "discountamount":     "discount_amount",
+    "discountamt":        "discount_amount",
+    "discamount":         "discount_amount",
+    "discamt":            "discount_amount",
+    "schemeamount":       "scheme_amount",
+    "schemeamt":          "scheme_amount",
+    "scheme":             "scheme_amount",
+    "schemes":            "scheme_amount",
     # Line totals before tax — the fallback when no unit rate is printed.
     "taxablevalue":       "taxable_value",
     "taxableamount":      "taxable_value",
@@ -271,6 +319,36 @@ def _infer_tax_component(raw_key: str) -> Optional[str]:
     return None
 
 
+# A vendor's discount lowers what the line actually costs, and the catalog's
+# cost price is that net figure — so a discounted line only reconciles once
+# the discount is taken off. Invoices print it three ways, sometimes side by
+# side: a percentage ("Disc. %", "C.D%"), a rupee amount ("Disc Amount") and
+# a scheme amount ("Scheme Amount", "Schemes").
+_DISCOUNT_TOKENS = ("disc", "scheme", "rebate")
+# "C.D%" / "CD %" — cash discount, always a percentage on Indian invoices.
+_CASH_DISCOUNT_RE = re.compile(r"^c\.?\s*d\.?\s*(?:%|percent|pct|rate)?$")
+
+
+def _infer_discount(raw_key: str) -> Optional[str]:
+    """
+    Classify a discount column as a percentage, an amount or a scheme amount.
+
+    Runs on the raw header for the same reason _infer_tax_component does: the
+    '%' in 'Disc. %' is the only thing separating it from a 'Disc' amount, and
+    _norm_key() throws it away. A bare 'Disc'/'Discount' with neither a rate
+    nor an amount token is read as a rupee amount.
+    """
+    k = raw_key.strip().lower()
+    if _CASH_DISCOUNT_RE.match(k):
+        return "discount_pct"
+    if not any(t in k for t in _DISCOUNT_TOKENS):
+        return None
+    is_rate = any(t in k for t in _RATE_TOKENS)
+    if "scheme" in k:
+        return "discount_pct" if is_rate else "scheme_amount"
+    return "discount_pct" if is_rate else "discount_amount"
+
+
 def _infer_canonical(raw_key: str) -> Optional[str]:
     """
     Map unseen header spellings to canonical fields:
@@ -308,6 +386,9 @@ def _infer_canonical(raw_key: str) -> Optional[str]:
             return None
         if "cost" in k:
             return "cost_price"
+        # 'Rate (Incl. GST)' already carries the tax the derivation would add.
+        if re.search(r"\binc", k):
+            return "invoice_price_incl"
         return "invoice_price"
     if any(t in k for t in _NOT_NAME):
         return None
@@ -324,9 +405,10 @@ _NUMERIC_FIELDS = frozenset({
     "cost_price", "mrp", "gst_percent",
     # Inputs to derive_cost_price() — parsed here so the derivation works on
     # '₹1,190.40' and '5 %' exactly as it does on plain numbers.
-    "invoice_price", "taxable_value", "quantity", "uom_qty",
+    "invoice_price", "invoice_price_incl", "taxable_value", "quantity", "uom_qty",
     "sgst_amount", "cgst_amount", "igst_amount", "gst_amount",
     "sgst_pct", "cgst_pct",
+    "discount_pct", "discount_amount", "scheme_amount",
 })
 
 _CURRENCY_RE = re.compile(r"^(?:rs\.?|inr|usd|₹|\$)\s*", re.IGNORECASE)
@@ -430,6 +512,7 @@ def normalize_item(raw: dict) -> dict:
     for k, v in raw.items():
         canonical = (
             _infer_tax_component(k)
+            or _infer_discount(k)
             or _FIELD_ALIASES.get(_norm_key(k))
             or _infer_canonical(k)
             or k
@@ -966,6 +1049,73 @@ def _fmt_num(val: float) -> str:
     return f"{val:.4f}".rstrip("0").rstrip(".") or "0"
 
 
+def _line_discount(item: dict) -> Optional[dict]:
+    """
+    The discounts printed on a line — {"pct", "amount", "scheme"}, each None
+    when absent or zero. None when the line carries no discount at all, so an
+    undiscounted invoice takes exactly the path it always has.
+    """
+    def positive(field: str) -> Optional[float]:
+        v = _to_float(item.get(field))
+        return v if v is not None and v > 0 else None
+
+    disc = {
+        "pct":    positive("discount_pct"),
+        "amount": positive("discount_amount"),
+        "scheme": positive("scheme_amount"),
+    }
+    return disc if any(v is not None for v in disc.values()) else None
+
+
+def _net_unit_price(
+    unit_price: float, units: Optional[float], disc: dict
+) -> Optional[float]:
+    """
+    `unit_price` with the line's discounts taken off.
+
+    Rupee discounts (scheme, disc amount) are printed per line, so they are
+    shared out over `units` — the number of things `unit_price` prices — and
+    come off first; the percentage then applies to what remains, which is the
+    order Indian trade invoices compute it in. None when an amount is printed
+    but there is nothing to share it over.
+    """
+    net = unit_price
+    per_line = (disc["amount"] or 0.0) + (disc["scheme"] or 0.0)
+    if per_line:
+        if units is None or units < _MIN_DERIVE_INPUT:
+            return None
+        net -= per_line / units
+    if disc["pct"]:
+        net *= 1.0 - disc["pct"] / 100.0
+    return net
+
+
+def _discount_terms(disc: dict, units: Optional[float]) -> list[str]:
+    """The discount legs of a formula string: ['20 / 5 scheme', '5%']."""
+    terms: list[str] = []
+    units_str = _fmt_num(units) if units is not None else "qty"
+    if disc["scheme"]:
+        terms.append(f"{_fmt_num(disc['scheme'])} / {units_str} scheme")
+    if disc["amount"]:
+        terms.append(f"{_fmt_num(disc['amount'])} / {units_str} disc")
+    if disc["pct"]:
+        terms.append(f"{_fmt_num(disc['pct'])}%")
+    return terms
+
+
+def _discount_breakdown(disc: Optional[dict], gross: float, net: float) -> dict:
+    """The discount keys of a derived-cost breakdown; empty when none applied."""
+    if not disc:
+        return {}
+    return {
+        "gross_unit_price": round(gross, 4),
+        "discount_pct":     disc["pct"],
+        "discount_amount":  disc["amount"],
+        "scheme_amount":    disc["scheme"],
+        "net_unit_price":   round(net, 4),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Attribute corroboration
 # ---------------------------------------------------------------------------
@@ -1063,35 +1213,63 @@ def derive_cost_price(item: dict, master: dict) -> tuple[Optional[float], Option
     amounts; the two routes are algebraically the same, since the printed
     SGST + CGST is itself qty * price * rate.
 
+    A discount on the line comes off the rate before anything else, since the
+    catalog's cost is net of it:
+
+        (119.04 - 5%) / 10 + tax                     113.09 / 10 = 11.309
+
+    A printed taxable value is already net of every discount, so on a
+    discounted line it is preferred over re-deriving the net from the rate.
+
     Returns (value, breakdown) — (None, None) whenever an input is missing,
     non-positive, or the units do not line up. A cost price the invoice *did*
-    print is never overwritten.
+    print is never overwritten — except to take a printed discount off it,
+    see _discount_printed_cost().
     """
     if _to_float(item.get("cost_price")) is not None:
-        return None, None
+        return _discount_printed_cost(item, master)
     if not _uom_compatible(item, master):
         return None, None
 
-    uom_qty = _to_float(master.get("uom_qty"))
-    if uom_qty is None:
-        uom_qty = _to_float(item.get("uom_qty"))
-    # A catalog that does not unpack the UOM sells the invoiced unit itself.
-    if uom_qty is None:
-        uom_qty = 1.0
+    uom_qty = _catalog_uom_qty(item, master)
     if uom_qty < _MIN_DERIVE_INPUT:
         return None, None
 
     quantity = _to_float(item.get("quantity"))
+    disc     = _line_discount(item)
 
     # Unit price as printed, else recovered from the line total before tax.
     unit_price = _to_float(item.get("invoice_price"))
+    taxable    = _to_float(item.get("taxable_value"))
     price_note = "invoice price"
-    if unit_price is None:
-        taxable = _to_float(item.get("taxable_value"))
+    price_str  = None
+    if unit_price is None or (disc and taxable is not None):
         if taxable is None or quantity is None or quantity < _MIN_DERIVE_INPUT:
             return None, None
         unit_price = taxable / quantity
         price_note = "taxable value / qty"
+        if disc:
+            price_note += " (net of discount)"
+            price_str   = f"{_fmt_num(taxable)} / {_fmt_num(quantity)}"
+    if unit_price < _MIN_DERIVE_INPUT:
+        return None, None
+
+    # The pre-discount rate, for the breakdown: the printed one when the net
+    # came from the taxable value instead.
+    gross_unit_price = _to_float(item.get("invoice_price")) or unit_price
+    if disc and price_str is None:
+        # Rupee discounts are per line; the rate prices one invoiced UOM, so
+        # they are shared over the invoiced quantity.
+        net = _net_unit_price(unit_price, quantity, disc)
+        if net is None:
+            return None, None
+        unit_price = net
+        price_str  = (
+            f"({_fmt_num(gross_unit_price)} - "
+            f"{' - '.join(_discount_terms(disc, quantity))})"
+        )
+    if price_str is None:
+        price_str = _fmt_num(unit_price)
     if unit_price < _MIN_DERIVE_INPUT:
         return None, None
 
@@ -1120,6 +1298,7 @@ def derive_cost_price(item: dict, master: dict) -> tuple[Optional[float], Option
         "source":         source,
         "unit_price":     round(unit_price, 4),
         "price_source":   price_note,
+        **_discount_breakdown(disc, gross_unit_price, unit_price),
         "uom_qty":        uom_qty,
         "uom":            master.get("uom") or item.get("uom"),
         "quantity":       quantity,
@@ -1128,7 +1307,71 @@ def derive_cost_price(item: dict, master: dict) -> tuple[Optional[float], Option
         "total_units":    total_units,
         "tax_per_unit":   round(tax_per_unit, 4),
         "formula": (
-            f"{_fmt_num(unit_price)} / {_fmt_num(uom_qty)} + {tax_formula} "
+            f"{price_str} / {_fmt_num(uom_qty)} + {tax_formula} "
+            f"= {cost_price:.2f}"
+        ),
+    }
+    return cost_price, breakdown
+
+
+def _catalog_uom_qty(item: dict, master: dict) -> float:
+    """Pack size: the catalog's, else the invoice's, else one unit per UOM."""
+    uom_qty = _to_float(master.get("uom_qty"))
+    if uom_qty is None:
+        uom_qty = _to_float(item.get("uom_qty"))
+    # A catalog that does not unpack the UOM sells the invoiced unit itself.
+    return 1.0 if uom_qty is None else uom_qty
+
+
+def _discount_printed_cost(
+    item: dict, master: dict
+) -> tuple[Optional[float], Optional[dict]]:
+    """
+    A cost price the invoice printed, with the line's discount taken off.
+
+    The printed figure is the pre-discount price the same way a rate is
+    (Format: "Cost Price ... Disc. % ... Amount"), while the catalog's cost is
+    net — comparing them as printed flags every discounted line. The figure is
+    per catalog unit already, so no pack-size split; rupee discounts are shared
+    over every unit on the line (qty x pack size).
+
+    (None, None) when the line carries no discount, leaving the printed value
+    exactly as it was.
+    """
+    disc = _line_discount(item)
+    if not disc:
+        return None, None
+    printed = _to_float(item.get("cost_price"))
+    if printed is None or printed < _MIN_DERIVE_INPUT:
+        return None, None
+
+    uom_qty     = _catalog_uom_qty(item, master)
+    quantity    = _to_float(item.get("quantity"))
+    total_units = (
+        quantity * uom_qty
+        if quantity is not None and uom_qty >= _MIN_DERIVE_INPUT
+        else None
+    )
+    net = _net_unit_price(printed, total_units, disc)
+    if net is None:
+        return None, None
+    cost_price = round(net, _COST_PRECISION)
+    if cost_price <= 0:
+        return None, None
+
+    breakdown = {
+        "value":        cost_price,
+        "source":       "printed_discount",
+        "unit_price":   round(printed, 4),
+        "price_source": "printed cost price",
+        **_discount_breakdown(disc, printed, net),
+        "uom_qty":      uom_qty,
+        "uom":          master.get("uom") or item.get("uom"),
+        "quantity":     quantity,
+        "total_units":  total_units,
+        "formula": (
+            f"{_fmt_num(printed)} - "
+            f"{' - '.join(_discount_terms(disc, total_units))} "
             f"= {cost_price:.2f}"
         ),
     }
@@ -1151,7 +1394,9 @@ def with_derived_cost(
         # printed one is supposed to skip this path silently. Named inputs make
         # an unrecognised column header a one-line diagnosis instead of a
         # guessing game about why a line came back blank.
-        if log and _to_float(item.get("cost_price")) is None:
+        # A printed cost on a discounted line was also expected to change.
+        wanted = _to_float(item.get("cost_price")) is None or _line_discount(item)
+        if log and wanted:
             print(
                 f"[validate-data] cost price not derived — plu={master.get('plu_code')} "
                 f"reason={_derive_blocker(item, master)} keys={sorted(item.keys())}"
@@ -1162,17 +1407,22 @@ def with_derived_cost(
 
 def _derive_blocker(item: dict, master: dict) -> str:
     """Which input stopped derive_cost_price() — for the log line above."""
+    quantity = _to_float(item.get("quantity"))
+    disc     = _line_discount(item)
+    if disc and (disc["amount"] or disc["scheme"]):
+        if quantity is None or quantity < _MIN_DERIVE_INPUT:
+            return "discount/scheme amount printed but quantity missing"
+    if _to_float(item.get("cost_price")) is not None:
+        return "printed cost price non-positive after discount"
+
     if not _uom_compatible(item, master):
         return (
             f"uom mismatch (invoice {item.get('uom')!r} vs catalog {master.get('uom')!r})"
         )
-    uom_qty = _to_float(master.get("uom_qty"))
-    if uom_qty is None:
-        uom_qty = _to_float(item.get("uom_qty"))
-    if uom_qty is not None and uom_qty < _MIN_DERIVE_INPUT:
+    uom_qty = _catalog_uom_qty(item, master)
+    if uom_qty < _MIN_DERIVE_INPUT:
         return f"uom_qty is {uom_qty}"
 
-    quantity = _to_float(item.get("quantity"))
     if _to_float(item.get("invoice_price")) is None:
         if _to_float(item.get("taxable_value")) is None:
             return "no unit price and no taxable value on the line"
@@ -1180,6 +1430,8 @@ def _derive_blocker(item: dict, master: dict) -> str:
             return "taxable value present but quantity missing"
     if _tax_total(item) is None and _gst_rate(item) is None:
         return "no tax amount and no gst rate on the line"
+    if disc and disc["pct"] and disc["pct"] >= 100:
+        return "discount is 100% or more"
     return "inputs present but non-positive"
 
 
@@ -1311,6 +1563,115 @@ def local_compare(item: dict, master: dict) -> dict:
         "discrepancies":         discrepancies,
         "suggested_corrections": corrections,
     }
+
+
+# ---------------------------------------------------------------------------
+# Interactive catalog search
+# ---------------------------------------------------------------------------
+# What the user reaches for when a line came back unmatched: type part of a
+# product name or a code and pick the record. Unlike the automatic name search
+# above this runs on every keystroke, so it is one round-trip and the ranking
+# rewards word *prefixes* — "coc" is on its way to "COCA COLA", not a typo.
+
+_SEARCH_FETCH_LIMIT = 200
+_SEARCH_MAX_RESULTS = 15
+_SEARCH_MIN_CHARS   = 2
+# Digit-only tokens at least this long are also probed against the code
+# columns; shorter ones are pack sizes ("2L", "500").
+_SEARCH_CODE_MIN_LEN = 3
+
+
+def _search_tokens(query: str) -> list[str]:
+    """Lower-cased tokens of a search box query, with the characters PostgREST
+    or ILIKE would misread stripped out. Every token is kept — a size like
+    "500" is a legitimate thing to narrow a search by."""
+    return [
+        tok.lower()
+        for tok in re.split(r"[^A-Za-z0-9&]+", query.strip())
+        if tok
+    ]
+
+
+def _search_score(tokens: list[str], description: object) -> float:
+    """
+    Typeahead relevance: 1.0 per token found as a whole word, 0.9 as the start
+    of a word (the user is still typing it), 0.25 buried inside one, averaged
+    over the query. Row order therefore follows what was typed rather than
+    the catalog's alphabetical order.
+    """
+    desc = str(description or "").lower()
+    if not tokens or not desc:
+        return 0.0
+    words = [w for w in re.split(r"[^a-z0-9&]+", desc) if w]
+    score = 0.0
+    for tok in tokens:
+        if tok in words:
+            score += 1.0
+        elif any(w.startswith(tok) for w in words):
+            score += 0.9
+        elif tok in desc:
+            score += 0.25
+    return score / len(tokens)
+
+
+def _search_filter(tokens: list[str]) -> str:
+    """
+    PostgREST `or=` body matching every token, in any order, within one
+    description column — or a code column starting with a digit-only token.
+    """
+    def all_words(col: str) -> str:
+        return "and(" + ",".join(f"{col}.ilike.%{t}%" for t in tokens) + ")"
+
+    clauses = [all_words("sku_description"), all_words("sku_short_description")]
+    for tok in tokens:
+        if tok.isdigit() and len(tok) >= _SEARCH_CODE_MIN_LEN:
+            for col in ("plu_code", "sku_code", "ean_code"):
+                clauses.append(f"{col}.ilike.{tok}%")
+    return ",".join(clauses)
+
+
+def search_catalog(query: str, company_id: Optional[str], limit: int = _SEARCH_MAX_RESULTS) -> list[dict]:
+    """
+    Catalog rows for a search box query, best match first, as PluOptions.
+
+    Scoped to the caller's company like every other catalog read here; an
+    empty company id returns nothing rather than everyone's catalog.
+    """
+    if not company_id:
+        return []
+    tokens = _search_tokens(query)
+    if not tokens or len("".join(tokens)) < _SEARCH_MIN_CHARS:
+        return []
+
+    rows = (
+        get_supabase()
+        .table("product_catalog")
+        .select(_CATALOG_COLUMNS)
+        .eq("company_id", company_id)
+        .or_(_search_filter(tokens))
+        .order("priority")
+        .order("plu_code")
+        .limit(_SEARCH_FETCH_LIMIT)
+        .execute()
+        .data
+    ) or []
+
+    def key(r: dict) -> tuple:
+        by_name = max(
+            _search_score(tokens, r.get("sku_description")),
+            _search_score(tokens, r.get("sku_short_description")),
+        )
+        # A code the user typed the start of is as good as a name hit.
+        by_code = 1.0 if any(
+            str(r.get(c) or "").startswith(t)
+            for t in tokens if t.isdigit() and len(t) >= _SEARCH_CODE_MIN_LEN
+            for c in ("plu_code", "sku_code", "ean_code")
+        ) else 0.0
+        priority = r.get("priority") if r.get("priority") is not None else 10**9
+        return (-max(by_name, by_code), priority, str(r.get("sku_description") or ""))
+
+    ranked = sorted(rows, key=key)
+    return [_to_plu_option(r) for r in ranked[:limit]]
 
 
 # ---------------------------------------------------------------------------
@@ -2165,6 +2526,24 @@ Master records (JSON):
                     else:
                         matched_fuzzy += 1
                     results[result_idx] = {**item, "validation": validation}
+
+        # A printed cost price is discounted as part of the per-row derivation,
+        # which only runs for lines that reached a catalog row. The discount is
+        # a fact of the invoice line, not of the match, so the lines that did
+        # not — unmatched, or waiting on a PLU pick — get it here. Otherwise
+        # their line-amount check and the CSV carry the pre-discount figure,
+        # and the check reads the vendor's discount as an arithmetic error.
+        for i, r in enumerate(results):
+            if not r or "derived_fields" in r.get("validation", {}):
+                continue
+            value, breakdown = _discount_printed_cost(r, {})
+            if value is None:
+                continue
+            results[i] = {
+                **r,
+                "cost_price": value,
+                "validation": {**r["validation"], **_derived_fields(breakdown)},
+            }
 
         _unresolved = {"no_match", "multi_plu"}
         valid_items       = sum(1 for r in results if r and r.get("validation", {}).get("is_valid"))

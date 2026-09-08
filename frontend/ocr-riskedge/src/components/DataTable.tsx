@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import {
   Table,
   TableBody,
@@ -7,7 +8,7 @@ import {
   TableRow as UITableRow,
 } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
-import { CheckCircle2, AlertCircle } from "lucide-react";
+import { CheckCircle2, AlertCircle, ChevronDown, ChevronRight } from "lucide-react";
 
 export interface ExtractedData {
   kind: "data";
@@ -107,6 +108,28 @@ function partitionRows(rows: TableRow[]): RenderPart[] {
 }
 
 // ---------------------------------------------------------------------------
+// Section collapse: a flattened, depth-tagged row list is a tree in
+// disguise — collapsing a section hides every row nested under it (deeper
+// depth) until a row at its own depth or shallower closes the range. One
+// pass with a single "currently hiding below this depth" marker is enough:
+// hidden ranges from a flat depth-first walk never overlap, they only nest.
+// ---------------------------------------------------------------------------
+
+function sectionVisibility(rows: TableRow[], collapsed: Set<number>): boolean[] {
+  let hideBelowDepth: number | null = null;
+  return rows.map((row, i) => {
+    if (hideBelowDepth !== null && row.depth <= hideBelowDepth) {
+      hideBelowDepth = null;
+    }
+    const visible = hideBelowDepth === null;
+    if (visible && row.kind === "section" && collapsed.has(i)) {
+      hideBelowDepth = row.depth;
+    }
+    return visible;
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
 
@@ -115,6 +138,35 @@ interface DataTableProps {
 }
 
 const DataTable = ({ data }: DataTableProps) => {
+  // Keyed by each section row's index within the main part, and by array
+  // field name — both stable for a given extraction, reset when a different
+  // document's data replaces it.
+  const [collapsedSections, setCollapsedSections] = useState<Set<number>>(new Set());
+  const [collapsedArrays, setCollapsedArrays] = useState<Set<string>>(new Set());
+
+  useEffect(() => {
+    setCollapsedSections(new Set());
+    setCollapsedArrays(new Set());
+  }, [data]);
+
+  const toggleSection = (index: number) => {
+    setCollapsedSections((prev) => {
+      const next = new Set(prev);
+      if (next.has(index)) next.delete(index);
+      else next.add(index);
+      return next;
+    });
+  };
+
+  const toggleArray = (name: string) => {
+    setCollapsedArrays((prev) => {
+      const next = new Set(prev);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
+      return next;
+    });
+  };
+
   if (data.length === 0) {
     return (
       <div className="h-full flex flex-col items-center justify-center text-muted-foreground">
@@ -164,11 +216,12 @@ const DataTable = ({ data }: DataTableProps) => {
       {parts.map((part, partIdx) => {
         // ── Main table (scalar + nested-object fields) ─────────────────────
         if (part.kind === "main") {
+          const visible = sectionVisibility(part.rows, collapsedSections);
           let rowNum = 0;
           return (
-            <div key={`main-${partIdx}`} className="border border-border rounded-lg overflow-hidden">
-              <Table>
-                <TableHeader>
+            <div key={`main-${partIdx}`} className="border border-border rounded-lg">
+              <Table wrapperClassName="overflow-visible">
+                <TableHeader sticky>
                   <UITableRow className="bg-muted/50 hover:bg-muted/50">
                     <TableHead className="font-semibold text-foreground w-12">#</TableHead>
                     <TableHead className="font-semibold text-foreground">Field</TableHead>
@@ -177,15 +230,26 @@ const DataTable = ({ data }: DataTableProps) => {
                 </TableHeader>
                 <TableBody>
                   {part.rows.map((row, index) => {
+                    if (!visible[index]) return null;
+
                     if (row.kind === "section") {
+                      const isCollapsed = collapsedSections.has(index);
                       return (
-                        <tr key={`section-${index}`} className="border-b border-border bg-muted/20">
+                        <tr
+                          key={`section-${index}`}
+                          className="border-b border-border bg-muted/20 cursor-pointer hover:bg-muted/40"
+                          onClick={() => toggleSection(index)}
+                        >
                           <td colSpan={3} className="px-4 py-1.5">
                             <div
-                              className="flex items-center gap-2 text-xs font-semibold text-muted-foreground uppercase tracking-wider"
+                              className="flex items-center gap-1.5 text-xs font-semibold text-muted-foreground uppercase tracking-wider"
                               style={{ paddingLeft: row.depth * 12 }}
                             >
-                              <div className="flex-1 h-px bg-border" />
+                              {isCollapsed ? (
+                                <ChevronRight className="w-3 h-3 shrink-0" />
+                              ) : (
+                                <ChevronDown className="w-3 h-3 shrink-0" />
+                              )}
                               <span>{row.label}</span>
                               <div className="flex-1 h-px bg-border" />
                             </div>
@@ -211,29 +275,46 @@ const DataTable = ({ data }: DataTableProps) => {
         }
 
         // ── Array table (one per array field, e.g. Line Items) ─────────────
+        const isCollapsed = collapsedArrays.has(part.name);
         return (
           <div key={`array-${part.name}-${partIdx}`} className="space-y-1.5">
-            <p className="text-sm font-semibold text-foreground px-0.5">{part.name}</p>
-            <div className="border border-border rounded-lg overflow-hidden">
-              <Table>
-                <TableHeader>
-                  <UITableRow className="bg-muted/50 hover:bg-muted/50">
-                    {part.columns.map((col) => (
-                      <TableHead key={col} className="font-semibold text-foreground">{col}</TableHead>
-                    ))}
-                  </UITableRow>
-                </TableHeader>
-                <TableBody>
-                  {part.items.map((item, rowIdx) => (
-                    <UITableRow key={rowIdx} className="hover:bg-muted/30">
+            <button
+              type="button"
+              onClick={() => toggleArray(part.name)}
+              className="flex items-center gap-1.5 text-sm font-semibold text-foreground px-0.5 w-full text-left"
+            >
+              {isCollapsed ? (
+                <ChevronRight className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
+              ) : (
+                <ChevronDown className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
+              )}
+              {part.name}
+              <span className="text-xs font-normal text-muted-foreground">
+                ({part.items.length})
+              </span>
+            </button>
+            {!isCollapsed && (
+              <div className="border border-border rounded-lg">
+                <Table wrapperClassName="overflow-visible">
+                  <TableHeader sticky>
+                    <UITableRow className="bg-muted/50 hover:bg-muted/50">
                       {part.columns.map((col) => (
-                        <TableCell key={col} className="text-foreground">{item[col] ?? ""}</TableCell>
+                        <TableHead key={col} className="font-semibold text-foreground">{col}</TableHead>
                       ))}
                     </UITableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            </div>
+                  </TableHeader>
+                  <TableBody>
+                    {part.items.map((item, rowIdx) => (
+                      <UITableRow key={rowIdx} className="hover:bg-muted/30">
+                        {part.columns.map((col) => (
+                          <TableCell key={col} className="text-foreground">{item[col] ?? ""}</TableCell>
+                        ))}
+                      </UITableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
+            )}
           </div>
         );
       })}

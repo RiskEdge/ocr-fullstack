@@ -21,6 +21,7 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import CatalogSearch from "@/components/CatalogSearch";
 import {
   Tooltip,
   TooltipContent,
@@ -41,6 +42,7 @@ import {
   Pencil,
   Calculator,
   Sparkles,
+  Search,
 } from "lucide-react";
 import type {
   ValidatedItem,
@@ -73,6 +75,10 @@ const FIELD_LABELS: Record<string, string> = {
   gst_amount: "GST Amount",
   uom: "UOM",
   uom_qty: "UOM Qty",
+  invoice_price_incl: "Rate (Incl. Tax)",
+  discount_pct: "Disc %",
+  discount_amount: "Disc Amount",
+  scheme_amount: "Scheme Amount",
 };
 
 // The item keys a comparison field can arrive under. The backend normalises
@@ -135,6 +141,94 @@ function normUom(val: unknown): string {
   return letters.endsWith("ES") ? letters.slice(0, -2) : letters.replace(/S$/, "");
 }
 
+// Discount columns as the backend normalises them, plus the raw spellings an
+// older cached run may still carry. A bare "disc"/"discount" is an amount,
+// matching the backend's reading of a header with neither a % nor "amount".
+const DISCOUNT_PCT_CANDIDATES = [
+  "discount_pct",
+  "discountpct",
+  "discpct",
+  "discountpercent",
+  "discpercent",
+  "discountrate",
+  "cd",
+  "cdpct",
+  "cashdiscount",
+  "cashdiscountpct",
+];
+const DISCOUNT_AMOUNT_CANDIDATES = [
+  "discount_amount",
+  "discountamount",
+  "discountamt",
+  "discamount",
+  "discamt",
+  "discount",
+  "disc",
+];
+const SCHEME_AMOUNT_CANDIDATES = [
+  "scheme_amount",
+  "schemeamount",
+  "schemeamt",
+  "scheme",
+  "schemes",
+];
+
+interface LineDiscount {
+  pct: number | null;
+  amount: number | null;
+  scheme: number | null;
+}
+
+/**
+ * The discounts printed on a line, or null when it carries none — so an
+ * undiscounted line takes exactly the path it always has. Mirrors the
+ * backend's _line_discount().
+ */
+function lineDiscount(item: Record<string, unknown>): LineDiscount | null {
+  const positive = (candidates: string[]): number | null => {
+    const hit = findFieldOrdered(item, candidates);
+    return hit && hit.value > 0 ? hit.value : null;
+  };
+  const disc: LineDiscount = {
+    pct: positive(DISCOUNT_PCT_CANDIDATES),
+    amount: positive(DISCOUNT_AMOUNT_CANDIDATES),
+    scheme: positive(SCHEME_AMOUNT_CANDIDATES),
+  };
+  return disc.pct !== null || disc.amount !== null || disc.scheme !== null
+    ? disc
+    : null;
+}
+
+/**
+ * `unitPrice` with the line's discounts taken off. Rupee discounts are printed
+ * per line and shared over `units`; they come off first, then the percentage
+ * applies to the remainder. Null when an amount is printed but there is
+ * nothing to share it over.
+ */
+function netUnitPrice(
+  unitPrice: number,
+  units: number | null,
+  disc: LineDiscount,
+): number | null {
+  let net = unitPrice;
+  const perLine = (disc.amount ?? 0) + (disc.scheme ?? 0);
+  if (perLine > 0) {
+    if (units === null || units <= 0) return null;
+    net -= perLine / units;
+  }
+  if (disc.pct) net *= 1 - disc.pct / 100;
+  return net;
+}
+
+function discountTerms(disc: LineDiscount, units: number | null): string[] {
+  const u = units !== null ? trimNum(units) : "qty";
+  const terms: string[] = [];
+  if (disc.scheme) terms.push(`${trimNum(disc.scheme)} / ${u} scheme`);
+  if (disc.amount) terms.push(`${trimNum(disc.amount)} / ${u} disc`);
+  if (disc.pct) terms.push(`${trimNum(disc.pct)}%`);
+  return terms;
+}
+
 /**
  * Client-side mirror of the backend's derive_cost_price().
  *
@@ -142,7 +236,8 @@ function normUom(val: unknown): string {
  * locally against a different catalog row — and uom_qty belongs to the row, so
  * the cost the invoice implies changes with the pick.
  *
- *   base cost per unit = invoice price / uom_qty
+ *   net unit price     = invoice price less the line's discount
+ *   base cost per unit = net unit price / uom_qty
  *   tax per unit       = line tax / (qty * uom_qty)   (or base * gst%)
  */
 function deriveCostPrice(
@@ -152,8 +247,14 @@ function deriveCostPrice(
   // A cost_price the backend derived belongs to the PLU *it* matched, so it
   // must not block re-derivation against the row the user picked instead —
   // only a figure the invoice actually printed does.
-  const wasDerived = !!item.validation?.derived_fields?.cost_price;
-  if (!wasDerived && num(item["cost_price"]) !== null) return null;
+  const backendDerived = item.validation?.derived_fields?.cost_price;
+  // A printed cost price with its discount taken off does not depend on the
+  // catalog row, so the backend's figure stands for every pick.
+  if (backendDerived?.source === "printed_discount") return backendDerived;
+  const printedCost = num(item["cost_price"]);
+  if (!backendDerived && printedCost !== null) {
+    return discountPrintedCost(item, master, printedCost);
+  }
 
   const invUom = normUom(item["uom"]);
   const masterUom = normUom(master.uom);
@@ -165,13 +266,28 @@ function deriveCostPrice(
   if (uomQty <= 0) return null;
 
   const quantity = num(item["quantity"]);
+  const disc = lineDiscount(item);
 
   let unitPrice = num(item["invoice_price"]);
-  if (unitPrice === null) {
-    const taxable = num(item["taxable_value"]);
+  const taxable = num(item["taxable_value"]);
+  let priceStr: string | null = null;
+  // A printed taxable value is already net of every discount, so on a
+  // discounted line it beats re-deriving the net from the rate.
+  if (unitPrice === null || (disc && taxable !== null)) {
     if (taxable === null || quantity === null || quantity <= 0) return null;
     unitPrice = taxable / quantity;
+    if (disc) priceStr = `${trimNum(taxable)} / ${trimNum(quantity)}`;
   }
+  if (unitPrice <= 0) return null;
+
+  const grossUnitPrice = num(item["invoice_price"]) ?? unitPrice;
+  if (disc && priceStr === null) {
+    const net = netUnitPrice(unitPrice, quantity, disc);
+    if (net === null) return null;
+    unitPrice = net;
+    priceStr = `(${trimNum(grossUnitPrice)} - ${discountTerms(disc, quantity).join(" - ")})`;
+  }
+  if (priceStr === null) priceStr = trimNum(unitPrice);
   if (unitPrice <= 0) return null;
 
   const baseUnitCost = unitPrice / uomQty;
@@ -216,13 +332,72 @@ function deriveCostPrice(
     value,
     source,
     unit_price: unitPrice,
+    ...(disc
+      ? {
+          gross_unit_price: grossUnitPrice,
+          discount_pct: disc.pct,
+          discount_amount: disc.amount,
+          scheme_amount: disc.scheme,
+          net_unit_price: unitPrice,
+        }
+      : {}),
     uom: master.uom ?? (item["uom"] as string | null),
     uom_qty: uomQty,
     base_unit_cost: baseUnitCost,
     total_units: totalUnits,
     tax_per_unit: taxPerUnit,
-    formula: `${trimNum(unitPrice)} / ${trimNum(uomQty)} + ${taxFormula} = ${value.toFixed(2)}`,
+    formula: `${priceStr} / ${trimNum(uomQty)} + ${taxFormula} = ${value.toFixed(2)}`,
   };
+}
+
+/**
+ * Mirror of the backend's _discount_printed_cost(): a cost price the invoice
+ * printed, less the line's discount. The figure is per catalog unit already,
+ * so rupee discounts are shared over every unit on the line. Null when the
+ * line carries no discount — the printed value then stands as it is.
+ */
+function discountPrintedCost(
+  item: ValidatedItem,
+  master: PluOption,
+  printed: number,
+): DerivedField | null {
+  const disc = lineDiscount(item);
+  if (!disc || printed <= 0) return null;
+  const uomQty = num(master.uom_qty) ?? num(item["uom_qty"]) ?? 1;
+  const quantity = num(item["quantity"]);
+  const totalUnits =
+    quantity !== null && uomQty > 0 ? quantity * uomQty : null;
+  const net = netUnitPrice(printed, totalUnits, disc);
+  if (net === null) return null;
+  const value = Math.round(net * 100) / 100;
+  if (value <= 0) return null;
+  return {
+    value,
+    source: "printed_discount",
+    unit_price: printed,
+    price_source: "printed cost price",
+    gross_unit_price: printed,
+    discount_pct: disc.pct,
+    discount_amount: disc.amount,
+    scheme_amount: disc.scheme,
+    net_unit_price: net,
+    uom: master.uom ?? (item["uom"] as string | null),
+    uom_qty: uomQty,
+    quantity,
+    total_units: totalUnits,
+    formula: `${trimNum(printed)} - ${discountTerms(disc, totalUnits).join(" - ")} = ${value.toFixed(2)}`,
+  };
+}
+
+/** "10% + scheme 20 + disc 30", for the derived badge. */
+function discountSummary(derived: DerivedField): string | null {
+  const parts: string[] = [];
+  if (derived.discount_pct) parts.push(`${trimNum(derived.discount_pct)}%`);
+  if (derived.scheme_amount)
+    parts.push(`scheme ${trimNum(derived.scheme_amount)}`);
+  if (derived.discount_amount)
+    parts.push(`disc ${trimNum(derived.discount_amount)}`);
+  return parts.length ? parts.join(" + ") : null;
 }
 
 function trimNum(val: number): string {
@@ -236,6 +411,8 @@ function trimNum(val: number): string {
  */
 function DerivedBadge({ derived }: { derived: DerivedField }) {
   const unitLabel = derived.uom ? ` per ${derived.uom}` : "";
+  const discount = discountSummary(derived);
+  const printedDiscount = derived.source === "printed_discount";
   return (
     <Tooltip>
       <TooltipTrigger asChild>
@@ -245,15 +422,27 @@ function DerivedBadge({ derived }: { derived: DerivedField }) {
         </span>
       </TooltipTrigger>
       <TooltipContent className="max-w-xs">
-        <p className="font-medium">Not printed on the invoice</p>
-        <p className="font-mono text-xs mt-1">{derived.formula}</p>
-        <p className="text-xs mt-1 opacity-80">
-          {`${trimNum(derived.unit_price ?? 0)}${unitLabel}`}
-          {derived.uom_qty ? ` ÷ ${trimNum(derived.uom_qty)} units` : ""}
-          {derived.source === "tax_amounts"
-            ? ", plus the line's GST spread over every unit."
-            : ", plus GST at the line's rate."}
+        <p className="font-medium">
+          {printedDiscount
+            ? "Printed cost price less the line's discount"
+            : "Not printed on the invoice"}
         </p>
+        <p className="font-mono text-xs mt-1">{derived.formula}</p>
+        {discount && (
+          <p className="text-xs mt-1 opacity-80">
+            {`Discount ${discount} taken off ${trimNum(derived.gross_unit_price ?? derived.unit_price ?? 0)}`}
+            {` → ${trimNum(derived.net_unit_price ?? derived.unit_price ?? 0)}${unitLabel}.`}
+          </p>
+        )}
+        {!printedDiscount && (
+          <p className="text-xs mt-1 opacity-80">
+            {`${trimNum(derived.unit_price ?? 0)}${unitLabel}`}
+            {derived.uom_qty ? ` ÷ ${trimNum(derived.uom_qty)} units` : ""}
+            {derived.source === "tax_amounts"
+              ? ", plus the line's GST spread over every unit."
+              : ", plus GST at the line's rate."}
+          </p>
+        )}
       </TooltipContent>
     </Tooltip>
   );
@@ -1171,6 +1360,25 @@ const ValidationResults = ({
           ? derivedCost.base_unit_cost + derivedCost.tax_per_unit
           : effectiveCostPrice;
 
+      // A discount changes what every line figure is based on: the taxable
+      // value is the discounted base, a "Gross Amount" is the pre-discount
+      // one, and a printed cost price is the pre-discount unit cost.
+      const disc = lineDiscount(effectiveItem);
+
+      // The cost the line amount is built on. A printed cost that reached us
+      // undiscounted — a run from before the backend did this, or one the
+      // user has not edited — is discounted here, so the vendor's discount is
+      // never reported back to them as an arithmetic error.
+      let checkCost = exactCostPrice;
+      let costLabel = trimNum(effectiveCostPrice);
+      if (!derivedCost && !costEdited && disc && !isNaN(effectiveCostPrice)) {
+        const net = netUnitPrice(effectiveCostPrice, totalUnits, disc);
+        if (net !== null) {
+          checkCost = net;
+          costLabel = `(${trimNum(effectiveCostPrice)} − ${discountTerms(disc, totalUnits).join(" − ")})`;
+        }
+      }
+
       const checks: CalcCheck[] = [];
 
       // —— Resolve each printed figure on a basis we can name ————————
@@ -1192,7 +1400,10 @@ const ValidationResults = ({
         effectiveItem,
         TAXABLE_VALUE_CANDIDATES,
       );
-      if (!taxableField) {
+      // On a discounted line the loose candidates are gross figures, not the
+      // taxable base — computing it from the discounted rate is the honest
+      // basis there.
+      if (!taxableField && !disc) {
         // A bare "total" is the pre-tax base only when a larger tax-inclusive
         // amount sits beside it. Equal values mean a nil-rated line or a
         // tax-inclusive total — neither is safe to treat as taxable.
@@ -1226,14 +1437,32 @@ const ValidationResults = ({
       const taxPctField = findFieldOrdered(effectiveItem, TAX_PCT_CANDIDATES);
       const linePct = taxPctField?.value ?? NaN;
 
-      const computedTaxable =
-        unitPriceField && !isNaN(quantity)
-          ? unitPriceField.value * quantity
-          : null;
+      // Unit price x qty, less the line's discount when it prints one —
+      // scheme and discount amounts first, then the percentage on the
+      // remainder, the order the invoice itself computes it in.
+      let computedTaxable: number | null = null;
+      let taxableFormula = "";
+      if (unitPriceField && !isNaN(quantity)) {
+        const gross = unitPriceField.value * quantity;
+        taxableFormula = `${trimNum(unitPriceField.value)} × ${trimNum(quantity)}`;
+        if (disc) {
+          const net = netUnitPrice(gross, 1, disc);
+          if (net !== null) {
+            computedTaxable = net;
+            const legs: string[] = [];
+            if (disc.scheme) legs.push(`${trimNum(disc.scheme)} scheme`);
+            if (disc.amount) legs.push(`${trimNum(disc.amount)} disc`);
+            if (disc.pct) legs.push(`${trimNum(disc.pct)}%`);
+            taxableFormula = `(${taxableFormula} − ${legs.join(" − ")})`;
+          }
+        } else {
+          computedTaxable = gross;
+        }
+      }
       const lineTaxable = taxableField?.value ?? computedTaxable;
 
       if (lineLevel) {
-        // Check 1 — Taxable Value = Unit Price x Qty   (line basis)
+        // Check 1 — Taxable Value = Unit Price x Qty (less discount)   (line basis)
         // Only worth running against a printed column; against our own
         // computed base it would merely restate itself.
         if (taxableField && computedTaxable !== null) {
@@ -1241,7 +1470,7 @@ const ValidationResults = ({
           checks.push({
             label: "Taxable Value",
             field: taxableField.key,
-            formula: `${trimNum(unitPriceField!.value)} × ${trimNum(quantity)}`,
+            formula: taxableFormula,
             calculated,
             actual: taxableField.value,
             ok: Math.abs(calculated - taxableField.value) <= 0.05,
@@ -1283,9 +1512,10 @@ const ValidationResults = ({
 
         // Check 4 — Cost Price = Line Amount / total units   (unit basis)
         // Skipped when the cost was derived from these very figures, where it
-        // could only ever restate them or report its own rounding.
+        // could only ever restate them or report its own rounding. A printed
+        // cost with its discount taken off was not, so it is still checked.
         if (
-          !derivedCost &&
+          (!derivedCost || derivedCost.source === "printed_discount") &&
           !isNaN(effectiveCostPrice) &&
           totalUnits > 0 &&
           lineAmtField
@@ -1301,8 +1531,8 @@ const ValidationResults = ({
                 ? `${trimNum(lineAmtField.value)} ÷ (${trimNum(quantity)} × ${trimNum(packSize)})`
                 : `${trimNum(lineAmtField.value)} ÷ ${trimNum(quantity)}`,
             calculated,
-            actual: effectiveCostPrice,
-            ok: Math.abs(calculated - effectiveCostPrice) <= 0.02,
+            actual: parseFloat(checkCost.toFixed(2)),
+            ok: Math.abs(calculated - checkCost) <= 0.02,
           });
         }
       } else {
@@ -1324,22 +1554,48 @@ const ValidationResults = ({
           lineAmtField
         ) {
           const calculated = parseFloat(
-            (exactCostPrice * totalUnits).toFixed(2),
+            (checkCost * totalUnits).toFixed(2),
           );
           // Every unit carries up to half a paisa of rounding, so a flat 0.02
           // reads a 50-unit line as broken when it is merely rounded.
           const tolerance = Math.max(0.02, 0.005 * totalUnits);
-          checks.push({
-            label: "Line Amount",
-            field: lineAmtField.key,
-            formula:
-              packSize > 1
-                ? `${trimNum(effectiveCostPrice)} × ${trimNum(quantity)} × ${trimNum(packSize)}`
-                : `${trimNum(effectiveCostPrice)} × ${trimNum(quantity)}`,
-            calculated,
-            actual: lineAmtField.value,
-            ok: Math.abs(calculated - lineAmtField.value) <= tolerance,
-          });
+          const inclusiveOk =
+            Math.abs(calculated - lineAmtField.value) <= tolerance;
+
+          // An invoice that prints a rate and a GST% but no tax amount often
+          // totals the line before tax and charges the GST in the summary —
+          // so the printed amount is rate x qty less discount, not cost x
+          // units. That basis is tried when the tax-inclusive one fails,
+          // rather than reporting a consistent invoice as broken.
+          const preTax =
+            computedTaxable !== null
+              ? parseFloat(computedTaxable.toFixed(2))
+              : null;
+          const preTaxOk =
+            preTax !== null && Math.abs(preTax - lineAmtField.value) <= 0.05;
+
+          if (!inclusiveOk && preTaxOk) {
+            checks.push({
+              label: "Line Amount",
+              field: lineAmtField.key,
+              formula: taxableFormula,
+              calculated: preTax!,
+              actual: lineAmtField.value,
+              ok: true,
+            });
+          } else {
+            checks.push({
+              label: "Line Amount",
+              field: lineAmtField.key,
+              formula:
+                packSize > 1
+                  ? `${costLabel} × ${trimNum(quantity)} × ${trimNum(packSize)}`
+                  : `${costLabel} × ${trimNum(quantity)}`,
+              calculated,
+              actual: lineAmtField.value,
+              ok: inclusiveOk,
+            });
+          }
         }
       }
 
@@ -1593,6 +1849,7 @@ const ValidationResults = ({
     itemIdx: number,
     opt: PluOption,
     fromAdditional = false,
+    fromSearch = false,
   ) {
     const { discrepancies, corrections, derived } = computeLocalValidation(
       items[itemIdx],
@@ -1615,6 +1872,9 @@ const ValidationResults = ({
         (v?.plu_options?.length ?? 0) +
         (v?.additional_plu_options?.length ?? 0),
       from_additional: fromAdditional,
+      // Typed into the catalogue box rather than picked from what we
+      // offered — the measure of how often the offer was no use at all.
+      from_search: fromSearch,
     });
     setEdits((prev) => {
       const next = { ...prev };
@@ -1762,11 +2022,10 @@ const ValidationResults = ({
         return accepted !== undefined ? accepted : String(item[key] ?? "");
       });
 
-      // Matched PLU
+      // Matched PLU — a pick from any picker or the catalogue search wins.
       const matchedPlu =
-        v.match_type === "multi_plu"
-          ? (pluSel?.plu_code ?? "")
-          : (v.matched_plu ?? "");
+        pluSel?.plu_code ??
+        (v.match_type === "multi_plu" ? "" : (v.matched_plu ?? ""));
 
       // Match type label
       const matchTypeLabel =
@@ -1782,16 +2041,14 @@ const ValidationResults = ({
 
       // Remaining unresolved discrepancies
       const effectiveDiscrepanciesRaw =
-        v.match_type === "multi_plu" && pluSel
-          ? pluSel.discrepancies
-          : v.discrepancies;
+        pluSel ? pluSel.discrepancies : v.discrepancies;
       const remaining = effectiveDiscrepanciesRaw.filter(
         (d) => !isResolved(d, acceptedFields[idx]),
       );
 
       // Status label
       let status: string;
-      if (v.match_type === "no_match") status = "Unmatched";
+      if (v.match_type === "no_match" && !pluSel) status = "Unmatched";
       else if (v.match_type === "multi_plu" && !pluSel)
         status = "Pending Selection";
       else if (remaining.length === 0) status = "Valid";
@@ -1925,10 +2182,9 @@ const ValidationResults = ({
         </div>
 
         {/* Main table */}
-        <div className="border border-border rounded-lg overflow-hidden">
-          <div className="overflow-x-auto">
-            <Table>
-              <TableHeader>
+        <div className="border border-border rounded-lg">
+          <Table wrapperClassName="overflow-visible">
+            <TableHeader sticky>
                 <UITableRow className="bg-muted/50 hover:bg-muted/50">
                   <TableHead className="w-8 px-2" />
                   <TableHead className="w-8 text-xs font-semibold text-foreground">
@@ -1976,9 +2232,12 @@ const ValidationResults = ({
                   const hasAlternatives = altOptions.length > 1;
                   // Rows that support candidate selection (multi-PLU, no_match with
                   // suggestions, or an overridable match) share the picker +
-                  // comparison UI.
+                  // comparison UI. Every one of them, plus a bare no-match, can
+                  // also be resolved from the catalogue search box below.
+                  const canSearch =
+                    isNoMatch || isMultiPlu || isFuzzy || isAutoSelected;
                   const canSelect =
-                    isMultiPlu || hasSuggestions || hasAlternatives;
+                    isMultiPlu || hasSuggestions || hasAlternatives || canSearch;
 
                   // Build effective validation values (override after a selection)
                   const effectiveMatchedPlu = hasSelection
@@ -2367,6 +2626,29 @@ const ValidationResults = ({
                                     </div>
                                   )}
                                 </>
+                              )}
+
+                              {/* Catalogue search — the way out when nothing
+                                  above is the right record, or nothing was
+                                  offered at all. A pick lands in selectPlu()
+                                  exactly like one from the tables. */}
+                              {canSearch && !pluSel && (
+                                <div
+                                  className="space-y-1.5"
+                                  data-testid="catalog-search"
+                                >
+                                  <p className="text-xs font-semibold text-foreground flex items-center gap-1.5">
+                                    <Search className="w-3.5 h-3.5 text-muted-foreground" />
+                                    {isNoMatch && !hasSuggestions
+                                      ? "Search the catalogue to match this line"
+                                      : "Not the right product? Search the catalogue"}
+                                  </p>
+                                  <CatalogSearch
+                                    onSelect={(opt) =>
+                                      selectPlu(idx, opt, false, true)
+                                    }
+                                  />
+                                </div>
                               )}
 
                               {/* A value worked out from the invoice's other
@@ -3066,7 +3348,6 @@ const ValidationResults = ({
                 })}
               </TableBody>
             </Table>
-          </div>
         </div>
       </div>
 
