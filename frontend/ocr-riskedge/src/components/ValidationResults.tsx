@@ -1292,6 +1292,11 @@ interface Reconciliation {
  * discount already inside the computed subtotal) is set against the summary
  * discounts first; only what the lines did not already carry comes off as a
  * rung.
+ *
+ * The ladder's Subtotal rung normally uses that computed line subtotal, but
+ * swaps in the invoice's own printed Subtotal field whenever it agrees with
+ * the printed line amounts (see `printedLineSum` below) — see the rung's
+ * construction for why.
  */
 function reconcileGrandTotal(
   computedSubtotal: number,
@@ -1299,13 +1304,34 @@ function reconcileGrandTotal(
   summary: SummaryFigures,
   documentTotal: number | null,
   subtotalDiscountApplied = 0,
+  printedLineSum: number | null = null,
 ): Reconciliation {
+  // Our own subtotal sums each line's (more precise) taxable value and
+  // rounds once at the end; the invoice instead rounds each line amount
+  // first and adds those up. The two can land a paisa apart purely from
+  // that rounding order, with no real discrepancy involved. When the
+  // invoice's own printed Subtotal field agrees with what its own printed
+  // line amounts add up to, that pair is internally consistent and is what
+  // the invoice's arithmetic actually used — so it's used as the ladder's
+  // base instead of the recomputed figure, keeping the expected total in
+  // exact sync with the invoice rather than reproducing the drift.
+  const printedSubtotalConfirmed =
+    summary.printedSubtotal !== null &&
+    printedLineSum !== null &&
+    Math.round(summary.printedSubtotal.value * 100) ===
+      Math.round(printedLineSum * 100);
+  const subtotalForLadder = printedSubtotalConfirmed
+    ? (printedLineSum as number)
+    : computedSubtotal;
+
   const steps: ReconciliationStep[] = [
     {
       label: "Subtotal",
-      fields: [],
-      amount: computedSubtotal,
-      note: `taxable value summed over ${linesIncluded} line${linesIncluded === 1 ? "" : "s"}`,
+      fields: printedSubtotalConfirmed ? [summary.printedSubtotal!.key] : [],
+      amount: subtotalForLadder,
+      note: printedSubtotalConfirmed
+        ? "matches the invoice's own printed subtotal; used as-is instead of the recomputed value to stay in sync with the invoice's arithmetic"
+        : `taxable value summed over ${linesIncluded} line${linesIncluded === 1 ? "" : "s"}`,
     },
   ];
   for (const c of summary.charges)
@@ -2077,6 +2103,7 @@ const ValidationResults = ({
         summary,
         documentTotal,
         subtotalDiscountApplied,
+        linesWithAmount > 0 ? sumRounded : null,
       );
       grandTotalCheck = {
         field: gtField?.key ?? null,
