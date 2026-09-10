@@ -113,6 +113,21 @@ function fieldLabel(field: string): string {
   );
 }
 
+// Columns whose values are identifiers, not quantities: plu_code, sku_code,
+// ean_code, item_code, hsn_code, barcode, or a bare plu / sku / ean.
+const CODE_COLUMN_RE = /^(?:.*_)?(?:code|plu|sku|ean|hsn|upc|gtin|barcode)$/i;
+
+/**
+ * A digit-only code written to CSV as a bare number loses its leading zeros
+ * the moment Excel opens the file ("00565701" becomes 565701, and a 13-digit
+ * EAN becomes 8.9E+12). Wrapping it as the formula ="00565701" is the CSV
+ * convention every spreadsheet honours: the cell evaluates to the exact
+ * text, digits intact. Anything not purely numeric is left as-is.
+ */
+export function csvTextCell(value: string): string {
+  return /^\d+$/.test(value) ? `="${value}"` : value;
+}
+
 function formatCellValue(val: unknown): string {
   if (val === null || val === undefined) return "—";
   if (Array.isArray(val)) return val.map((v) => String(v ?? "")).join(", ");
@@ -966,16 +981,25 @@ function findFieldValue(
   return null;
 }
 
-// Find a grand-total field in the document-level scalar map. Candidates are
-// tried in priority order rather than taking whichever key the document
-// happens to list first, so the most specific name present always wins.
-function findGrandTotal(
+interface ScalarHit {
+  key: string;
+  value: number;
+}
+
+// Every numeric document-level scalar, indexed by normalised key. Currency and
+// unit suffixes ride along on plenty of OCR'd headers — "Total Amount (INR)",
+// "grand_total_rs" — so the stripped form is registered as an alias, but only
+// after every exact name is in, so a key that matches on its own is never
+// displaced by another key's alias. `excludeKey` keeps the field already taken
+// as the grand total from being read a second time as a summary figure.
+function indexScalars(
   scalars: Record<string, unknown>,
-): { key: string; value: number } | null {
-  // Normalised key → original key + parsed value, for every numeric scalar.
-  const byNorm = new Map<string, { key: string; value: number }>();
+  excludeKey: string | null = null,
+): Map<string, ScalarHit> {
+  const byNorm = new Map<string, ScalarHit>();
   const numeric: Array<{ key: string; norm: string; value: number }> = [];
   for (const [k, v] of Object.entries(scalars)) {
+    if (k === excludeKey) continue;
     const n = parseAmount(v);
     if (isNaN(n)) continue;
     const norm = normKey(k);
@@ -983,21 +1007,353 @@ function findGrandTotal(
     // first occurrence of a name wins
     if (!byNorm.has(norm)) byNorm.set(norm, { key: k, value: n });
   }
-  // Second pass: currency/unit suffixes ride along on plenty of OCR'd headers
-  // — "Total Amount (INR)", "grand_total_rs". Register the stripped form as an
-  // alias, but only after every exact name is in, so a key that matches on its
-  // own is never displaced by another key's alias.
   for (const { key, norm, value } of numeric) {
     const denoised = stripCurrencySuffix(norm);
     if (denoised !== norm && !byNorm.has(denoised)) {
       byNorm.set(denoised, { key, value });
     }
   }
-  for (const candidate of GRAND_TOTAL_CANDIDATES) {
-    const hit = byNorm.get(normKey(candidate));
+  return byNorm;
+}
+
+// First candidate present, in candidate order — so the most specific name
+// wins rather than whichever key the document happens to list first.
+function pickOrdered(
+  index: Map<string, ScalarHit>,
+  candidates: string[],
+): ScalarHit | null {
+  for (const candidate of candidates) {
+    const hit = index.get(normKey(candidate));
     if (hit) return hit;
   }
   return null;
+}
+
+// Find a grand-total field in the document-level scalar map. Candidates are
+// tried in priority order rather than taking whichever key the document
+// happens to list first, so the most specific name present always wins.
+function findGrandTotal(
+  scalars: Record<string, unknown>,
+): { key: string; value: number } | null {
+  return pickOrdered(indexScalars(scalars), GRAND_TOTAL_CANDIDATES);
+}
+
+// ---------------------------------------------------------------------------
+// Invoice summary figures — what sits between the computed line subtotal and
+// the grand total: document-level charges, discount, tax and round-off
+// printed in the summary block. Each family below yields at most one figure,
+// most specific spelling first, so "freight" and "freight_charges" on the
+// same document are never both added.
+// ---------------------------------------------------------------------------
+
+const SUMMARY_CHARGE_FAMILIES: Array<{ label: string; candidates: string[] }> = [
+  {
+    label: "Freight",
+    candidates: ["freightcharges", "freightcharge", "freightamount", "freight"],
+  },
+  {
+    label: "Shipping / delivery",
+    candidates: [
+      "shippingcharges",
+      "shippingcharge",
+      "shipping",
+      "deliverycharges",
+      "deliverycharge",
+      "transportcharges",
+      "transportationcharges",
+      "cartage",
+    ],
+  },
+  {
+    label: "Packing / forwarding",
+    candidates: [
+      "packingandforwarding",
+      "packingforwarding",
+      "forwardingcharges",
+      "packingcharges",
+      "packingcharge",
+      "packing",
+    ],
+  },
+  { label: "Insurance", candidates: ["insurancecharges", "insurance"] },
+  {
+    label: "Handling",
+    candidates: [
+      "handlingcharges",
+      "handlingcharge",
+      "loadingcharges",
+      "unloadingcharges",
+    ],
+  },
+  {
+    label: "Other charges",
+    candidates: [
+      "othercharges",
+      "othercharge",
+      "misccharges",
+      "miscellaneouscharges",
+      "additionalcharges",
+      "extracharges",
+      "servicecharges",
+      "servicecharge",
+    ],
+  },
+  { label: "TCS", candidates: ["tcsamount", "tcs"] },
+];
+
+// A total-discount figure already covers every kind, so when one is printed
+// the individual families are not read on top of it.
+const SUMMARY_TOTAL_DISCOUNT_CANDIDATES = [
+  "totaldiscount",
+  "totaldiscountamount",
+  "invoicediscount",
+  "billdiscount",
+];
+const SUMMARY_DISCOUNT_FAMILIES: Array<{ label: string; candidates: string[] }> = [
+  {
+    label: "Discount",
+    candidates: ["discountamount", "discountamt", "discount", "lessdiscount"],
+  },
+  {
+    label: "Cash / trade discount",
+    candidates: [
+      "cashdiscountamount",
+      "cashdiscount",
+      "tradediscount",
+      "specialdiscount",
+      "additionaldiscount",
+    ],
+  },
+  {
+    label: "Scheme",
+    candidates: ["schemediscount", "schemeamount", "scheme"],
+  },
+];
+const SUMMARY_ROUND_OFF_CANDIDATES = [
+  "roundoffamount",
+  "roundoffadjustment",
+  "roundingadjustment",
+  "roundoffvalue",
+  "roundoffdifference",
+  "roundingamount",
+  "roundoff",
+  "roundedoff",
+  "roundingoff",
+  "rounding",
+];
+// One figure that already totals the tax, tried before the components so a
+// document printing both is never counted twice.
+const SUMMARY_TAX_TOTAL_CANDIDATES = [
+  "totaltaxamount",
+  "totaltax",
+  "taxtotal",
+  "totalgstamount",
+  "totalgst",
+  "gsttotal",
+  "gstamount",
+  "taxamount",
+];
+const SUMMARY_TAX_SPLIT_CANDIDATES = [
+  "cgsttotal",
+  "sgsttotal",
+  "igsttotal",
+  "totalcgst",
+  "totalsgst",
+  "totaligst",
+  "cgstamount",
+  "sgstamount",
+  "igstamount",
+  "utgstamount",
+  "cessamount",
+];
+// Bare GST names at document level are the summary amounts on most invoices,
+// but they are tried only when no amount-suffixed key exists, as at line level.
+const SUMMARY_TAX_BARE_CANDIDATES = ["cgst", "sgst", "igst", "utgst", "cess"];
+const SUMMARY_SUBTOTAL_CANDIDATES = [
+  "subtotal",
+  "subtotalamount",
+  "totaltaxablevalue",
+  "totaltaxableamount",
+  "taxablevalue",
+  "taxableamount",
+  "totalbeforetax",
+  "amountbeforetax",
+  "totalbasicamount",
+  "basicamount",
+  "basicvalue",
+  "totalbasic",
+];
+
+interface SummaryFigures {
+  charges: Array<ScalarHit & { label: string }>;
+  discounts: Array<ScalarHit & { label: string }>;
+  roundOff: ScalarHit | null;
+  taxTotal: { keys: string[]; value: number } | null;
+  /** The invoice's own printed "Subtotal" line, kept only as a cross-check —
+   *  the reconciliation is built from the computed line subtotal instead,
+   *  since many invoices never print this field at all. */
+  printedSubtotal: ScalarHit | null;
+}
+
+function sumHits(
+  index: Map<string, ScalarHit>,
+  candidates: string[],
+): { keys: string[]; value: number } | null {
+  const keys: string[] = [];
+  let total = 0;
+  for (const c of candidates) {
+    const hit = index.get(normKey(c));
+    if (!hit || keys.includes(hit.key)) continue;
+    keys.push(hit.key);
+    total += hit.value;
+  }
+  return keys.length ? { keys, value: parseFloat(total.toFixed(4)) } : null;
+}
+
+function findSummaryFigures(
+  scalars: Record<string, unknown>,
+  grandTotalKey: string | null,
+): SummaryFigures {
+  const index = indexScalars(scalars, grandTotalKey);
+  const charges: SummaryFigures["charges"] = [];
+  for (const fam of SUMMARY_CHARGE_FAMILIES) {
+    const hit = pickOrdered(index, fam.candidates);
+    if (hit && hit.value !== 0) charges.push({ ...hit, label: fam.label });
+  }
+  const discounts: SummaryFigures["discounts"] = [];
+  const totalDiscount = pickOrdered(index, SUMMARY_TOTAL_DISCOUNT_CANDIDATES);
+  if (totalDiscount) {
+    if (totalDiscount.value !== 0)
+      discounts.push({ ...totalDiscount, label: "Total discount" });
+  } else {
+    for (const fam of SUMMARY_DISCOUNT_FAMILIES) {
+      const hit = pickOrdered(index, fam.candidates);
+      if (hit && hit.value !== 0) discounts.push({ ...hit, label: fam.label });
+    }
+  }
+  const taxSingle = pickOrdered(index, SUMMARY_TAX_TOTAL_CANDIDATES);
+  const taxTotal = taxSingle
+    ? { keys: [taxSingle.key], value: taxSingle.value }
+    : (sumHits(index, SUMMARY_TAX_SPLIT_CANDIDATES) ??
+      sumHits(index, SUMMARY_TAX_BARE_CANDIDATES));
+  return {
+    charges,
+    discounts,
+    roundOff: pickOrdered(index, SUMMARY_ROUND_OFF_CANDIDATES),
+    taxTotal,
+    printedSubtotal: pickOrdered(index, SUMMARY_SUBTOTAL_CANDIDATES),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Grand-total reconciliation
+// ---------------------------------------------------------------------------
+
+const GRAND_TOTAL_TOLERANCE = 0.05;
+
+/** One rung of the ladder from the validated product total to the invoice total. */
+interface ReconciliationStep {
+  label: string;
+  /** Field(s) the figure was read from; empty for a computed rung. */
+  fields: string[];
+  /** Signed contribution to the expected grand total. */
+  amount: number;
+  note?: string;
+}
+
+/** A summary discount, or the part of one, the line cost prices already carry. */
+interface CoveredDiscount {
+  label: string;
+  key: string;
+  value: number;
+  covered: number;
+}
+
+interface Reconciliation {
+  steps: ReconciliationStep[];
+  expected: number;
+  ok: boolean;
+  coveredDiscounts: CoveredDiscount[];
+}
+
+/**
+ * Builds the ladder: the computed line subtotal, plus summary charges, less
+ * summary discount, plus the tax printed in the invoice summary, plus
+ * round-off — and compares it with the invoice's printed grand total.
+ *
+ * Subtotal + Tax = Grand Total is the whole rule; nothing here is inferred
+ * or tried as a fallback variant, so a mismatch always means the figures
+ * genuinely disagree rather than a guess that happened not to land.
+ *
+ * The computed subtotal is already net of every discount applied line by
+ * line (each line's own scheme/amount/percentage, taken off before its tax).
+ * An invoice that prints that same discount again as one summary figure must
+ * not have it taken off twice, so `subtotalDiscountApplied` (the rupee
+ * discount already inside the computed subtotal) is set against the summary
+ * discounts first; only what the lines did not already carry comes off as a
+ * rung.
+ */
+function reconcileGrandTotal(
+  computedSubtotal: number,
+  linesIncluded: number,
+  summary: SummaryFigures,
+  documentTotal: number | null,
+  subtotalDiscountApplied = 0,
+): Reconciliation {
+  const steps: ReconciliationStep[] = [
+    {
+      label: "Subtotal",
+      fields: [],
+      amount: computedSubtotal,
+      note: `taxable value summed over ${linesIncluded} line${linesIncluded === 1 ? "" : "s"}`,
+    },
+  ];
+  for (const c of summary.charges)
+    steps.push({ label: c.label, fields: [c.key], amount: c.value });
+
+  const coveredDiscounts: CoveredDiscount[] = [];
+  let pool = Math.max(0, subtotalDiscountApplied);
+  for (const d of summary.discounts) {
+    const covered = Math.min(d.value, pool);
+    pool -= covered;
+    const remainder = parseFloat((d.value - covered).toFixed(2));
+    if (covered > 0)
+      coveredDiscounts.push({ label: d.label, key: d.key, value: d.value, covered });
+    if (remainder <= GRAND_TOTAL_TOLERANCE) continue;
+    steps.push({
+      label: d.label,
+      fields: [d.key],
+      amount: -remainder,
+      note:
+        covered > 0
+          ? `${covered.toFixed(2)} of ${d.value.toFixed(2)} already reflected in the line taxable values`
+          : undefined,
+    });
+  }
+
+  if (summary.taxTotal) {
+    steps.push({
+      label: "Total tax",
+      fields: summary.taxTotal.keys,
+      amount: summary.taxTotal.value,
+    });
+  }
+
+  if (summary.roundOff) {
+    steps.push({
+      label: "Round off",
+      fields: [summary.roundOff.key],
+      amount: summary.roundOff.value,
+    });
+  }
+
+  const expected = parseFloat(
+    steps.reduce((acc, st) => acc + st.amount, 0).toFixed(2),
+  );
+  const ok =
+    documentTotal !== null &&
+    Math.abs(expected - documentTotal) <= GRAND_TOTAL_TOLERANCE;
+  return { steps, expected, ok, coveredDiscounts };
 }
 
 // findFieldValue returns whichever key the item happens to list first. Where
@@ -1060,6 +1416,19 @@ interface LineCalcResult {
   checks: CalcCheck[];
 }
 
+/** One line item's contribution to the computed subtotal. */
+interface SubtotalLineContribution {
+  idx: number;
+  name: string;
+  /** Taxable value this line contributed; null when it could not be
+   *  established at all (no tax fields and no line amount). */
+  taxable: number | null;
+  /** How the taxable value was established, most reliable first. */
+  taxableSource: "printed" | "computed" | "back_out" | "line_amount" | "none";
+  tax: number | null;
+  lineAmount: number | null;
+}
+
 interface CalcValidationResult {
   lineResults: LineCalcResult[];
   lineAmountSum: number;
@@ -1067,7 +1436,11 @@ interface CalcValidationResult {
     /** null when the document has no recognisable invoice-total field. */
     field: string | null;
     documentTotal: number | null;
+    /** Whether Subtotal + Tax (+ any summary charges/discount/round-off)
+     *  meets the invoice total. */
     ok: boolean;
+    /** Whether the printed line amounts alone meet it — a cross-check. */
+    lineSumOk: boolean;
     /** Lines that contributed an amount to lineAmountSum. */
     linesCounted: number;
     /** Total lines on the invoice. */
@@ -1075,6 +1448,24 @@ interface CalcValidationResult {
     /** True when some line had no recognisable amount column, so the sum is
      *  known to be short and a mismatch is not necessarily a real discrepancy. */
     partial: boolean;
+    /** Σ taxable value over every line, each on its own tax rate. */
+    subtotal: number;
+    /** Lines that contributed a taxable value to `subtotal`. */
+    subtotalLinesIncluded: number;
+    /** True when some line's taxable value could not be established at all. */
+    subtotalPartial: boolean;
+    contributions: SubtotalLineContribution[];
+    /** The ladder from the computed subtotal to the invoice total. */
+    steps: ReconciliationStep[];
+    expectedTotal: number;
+    /** Rupee discount already netted out of `subtotal` line by line. */
+    subtotalDiscountApplied: number;
+    /** Summary discounts, or parts of them, not taken off again for that reason. */
+    coveredDiscounts: CoveredDiscount[];
+    /** The invoice's own printed "Subtotal" field, shown as a cross-check. */
+    printedSubtotal: ScalarHit | null;
+    /** Tax total read from the invoice summary. */
+    taxTotal: { keys: string[]; value: number } | null;
   } | null;
 }
 
@@ -1121,6 +1512,8 @@ const ValidationResults = ({
   // Rows whose full-field editor is open. Every row can be edited, not just
   // unmatched ones — a clean match can still carry a mis-read value.
   const [editingRow, setEditingRow] = useState<Set<number>>(new Set());
+  // Row-by-row breakdown under the Grand Total panel.
+  const [showTotalBreakdown, setShowTotalBreakdown] = useState(false);
   // Phase 2: dismissals and investigation outcomes
   const [dismissedFields, setDismissedFields] = useState<
     Record<number, Set<string>>
@@ -1293,9 +1686,14 @@ const ValidationResults = ({
   // ---------------------------------------------------------------------------
   const calcResults = useMemo((): CalcValidationResult | null => {
     const lineResults: LineCalcResult[] = [];
+    const subtotalContributions: SubtotalLineContribution[] = [];
     let lineAmountSum = 0;
     let allLinesHaveAmount = true;
     let linesWithAmount = 0;
+    let subtotalSum = 0;
+    let linesWithSubtotal = 0;
+    let subtotalPartial = false;
+    let subtotalDiscountApplied = 0;
 
     for (let idx = 0; idx < items.length; idx++) {
       const item = items[idx] as Record<string, unknown>;
@@ -1371,10 +1769,12 @@ const ValidationResults = ({
       // never reported back to them as an arithmetic error.
       let checkCost = exactCostPrice;
       let costLabel = trimNum(effectiveCostPrice);
+      let locallyDiscountedCost: number | null = null;
       if (!derivedCost && !costEdited && disc && !isNaN(effectiveCostPrice)) {
         const net = netUnitPrice(effectiveCostPrice, totalUnits, disc);
         if (net !== null) {
           checkCost = net;
+          locallyDiscountedCost = net;
           costLabel = `(${trimNum(effectiveCostPrice)} − ${discountTerms(disc, totalUnits).join(" − ")})`;
         }
       }
@@ -1606,27 +2006,98 @@ const ValidationResults = ({
         allLinesHaveAmount = false;
       }
 
+      // —— Subtotal — this line's taxable value ————————————————
+      // Each line stands on its own tax rate rather than a blended one:
+      // `lineTaxable` (printed taxable-value column, or unit price × qty
+      // less the line's own discount) is the pre-tax base. Only when neither
+      // is on hand does this fall back to backing the tax out of the printed
+      // line amount, or — with no tax information at all — treating the
+      // whole line amount as its own taxable base.
+      let subtotalBasis: number | null = lineTaxable;
+      let taxableSource: SubtotalLineContribution["taxableSource"] =
+        subtotalBasis !== null ? (taxableField ? "printed" : "computed") : "none";
+      if (subtotalBasis === null && lineAmtField && lineTax) {
+        subtotalBasis = parseFloat(
+          (lineAmtField.value - lineTax.value).toFixed(2),
+        );
+        taxableSource = "back_out";
+      } else if (subtotalBasis === null && lineAmtField && !lineTax) {
+        subtotalBasis = lineAmtField.value;
+        taxableSource = "line_amount";
+      }
+
+      if (subtotalBasis !== null) {
+        subtotalSum += subtotalBasis;
+        linesWithSubtotal += 1;
+        // The rupee discount this line already carries, so a summary
+        // discount that merely restates the line discounts is not taken off
+        // again.
+        if (disc && computedTaxable !== null && unitPriceField && !isNaN(quantity)) {
+          const gross = unitPriceField.value * quantity;
+          subtotalDiscountApplied += Math.max(0, gross - computedTaxable);
+        }
+      } else {
+        subtotalPartial = true;
+      }
+
+      subtotalContributions.push({
+        idx,
+        name: String(
+          effectiveItem["sku_description"] ??
+            effectiveItem["product_name"] ??
+            effectiveItem["description"] ??
+            `Row ${idx + 1}`,
+        ),
+        taxable: subtotalBasis,
+        taxableSource,
+        tax: lineTax?.value ?? null,
+        lineAmount: lineAmtField?.value ?? null,
+      });
+
       lineResults.push({ idx, checks });
     }
 
-    // Grand total check. Lines without a recognisable amount column no longer
-    // suppress the whole check — a single scheme/free row used to hide it for
-    // the entire invoice. The sum covers whatever lines did carry an amount and
-    // is reported as partial so a shortfall isn't read as a real discrepancy.
+    // Grand total check. Subtotal (computed from the line items, each on its
+    // own tax rate) + Tax (read from the invoice summary) is reconciled
+    // against the invoice's printed grand total; the printed line sum is
+    // kept alongside as a cross-check. Built even when no total field is
+    // found: hiding the panel outright made an undetected header
+    // indistinguishable from a clean match, so the figures are still shown
+    // and the missing side is named.
     let grandTotalCheck: CalcValidationResult["grandTotalCheck"] = null;
-    if (documentScalars && linesWithAmount > 0) {
-      // Built even when no total field is found: hiding the panel outright made
-      // an undetected header indistinguishable from a clean match, so the line
-      // sum is still shown and the missing side is named.
+    if (documentScalars && items.length > 0) {
       const gtField = findGrandTotal(documentScalars);
+      const documentTotal = gtField?.value ?? null;
       const sumRounded = parseFloat(lineAmountSum.toFixed(2));
+      const computedSubtotal = parseFloat(subtotalSum.toFixed(2));
+      const summary = findSummaryFigures(documentScalars, gtField?.key ?? null);
+      const recon = reconcileGrandTotal(
+        computedSubtotal,
+        linesWithSubtotal,
+        summary,
+        documentTotal,
+        subtotalDiscountApplied,
+      );
       grandTotalCheck = {
         field: gtField?.key ?? null,
-        documentTotal: gtField?.value ?? null,
-        ok: gtField ? Math.abs(sumRounded - gtField.value) <= 0.05 : false,
+        documentTotal,
+        ok: recon.ok,
+        lineSumOk:
+          documentTotal !== null &&
+          Math.abs(sumRounded - documentTotal) <= GRAND_TOTAL_TOLERANCE,
         linesCounted: linesWithAmount,
         linesTotal: lineResults.length,
         partial: !allLinesHaveAmount,
+        subtotal: computedSubtotal,
+        subtotalLinesIncluded: linesWithSubtotal,
+        subtotalPartial,
+        contributions: subtotalContributions,
+        steps: recon.steps,
+        expectedTotal: recon.expected,
+        subtotalDiscountApplied: parseFloat(subtotalDiscountApplied.toFixed(2)),
+        coveredDiscounts: recon.coveredDiscounts,
+        printedSubtotal: summary.printedSubtotal,
+        taxTotal: summary.taxTotal,
       };
     }
 
@@ -2002,9 +2473,32 @@ const ValidationResults = ({
     recordInvestigation(flagType, outcome, sourceFilename);
   }
 
+  // Values worked out rather than read off the invoice, for one row. A PLU
+  // the user picked re-derives the cost locally against its own pack size,
+  // so its derivation outranks whatever the backend attached. The table
+  // cells and the CSV must both read from here — the export once read only
+  // the raw item and so wrote a blank where the screen showed a derived cost.
+  function effectiveDerivedFields(idx: number): Record<string, DerivedField> {
+    const pluSel = pluSelections[idx];
+    if (pluSel) return pluSel.derived ? { cost_price: pluSel.derived } : {};
+    return items[idx]?.validation?.derived_fields ?? {};
+  }
+
   function downloadValidationCsv() {
+    // Derived fields the invoice printed no column for (a cost price worked
+    // out from pack size and tax) get their own columns, or the export would
+    // have nowhere to put them.
+    const derivedOnlyKeys: string[] = [];
+    items.forEach((_, idx) => {
+      for (const key of Object.keys(effectiveDerivedFields(idx))) {
+        if (!fieldKeys.includes(key) && !derivedOnlyKeys.includes(key))
+          derivedOnlyKeys.push(key);
+      }
+    });
+    const exportKeys = [...fieldKeys, ...derivedOnlyKeys];
+
     const headers = [
-      ...fieldKeys.map(fieldLabel),
+      ...exportKeys.map(fieldLabel),
       "Matched PLU",
       "Match Type",
       "Status",
@@ -2016,16 +2510,27 @@ const ValidationResults = ({
       const pluSel = pluSelections[idx];
       const itemEdits = edits[idx];
 
-      // Field values — use accepted edit when available
-      const fieldVals = fieldKeys.map((key) => {
-        const accepted = itemEdits?.[key];
-        return accepted !== undefined ? accepted : String(item[key] ?? "");
+      // Field values — same precedence as the table cell: a user edit wins,
+      // then a value derived for this row, then whatever the invoice printed.
+      const derivedFields = effectiveDerivedFields(idx);
+      const fieldVals = exportKeys.map((key) => {
+        const raw = (() => {
+          const edited = itemEdits?.[key];
+          if (edited !== undefined) return edited;
+          const isAccepted = acceptedFields[idx]?.has(key) ?? false;
+          const derived = !isAccepted ? derivedFields[key] : undefined;
+          if (derived) return String(derived.value);
+          return String(item[key] ?? "");
+        })();
+        // Identifier columns must survive Excel with every digit intact.
+        return CODE_COLUMN_RE.test(key) ? csvTextCell(raw) : raw;
       });
 
       // Matched PLU — a pick from any picker or the catalogue search wins.
-      const matchedPlu =
+      const matchedPlu = csvTextCell(
         pluSel?.plu_code ??
-        (v.match_type === "multi_plu" ? "" : (v.matched_plu ?? ""));
+          (v.match_type === "multi_plu" ? "" : (v.matched_plu ?? "")),
+      );
 
       // Match type label
       const matchTypeLabel =
@@ -2068,12 +2573,37 @@ const ValidationResults = ({
       ];
     });
 
+    // Grand Total breakdown — appended after the line items so the export
+    // carries the same reconciliation shown on screen, not just the rows.
+    const gt = calcResults?.grandTotalCheck;
+    const totalRows: string[][] = [];
+    if (gt) {
+      const money = (n: number) => n.toFixed(2);
+      totalRows.push([]);
+      totalRows.push(["Grand Total Breakdown"]);
+      for (const st of gt.steps) {
+        totalRows.push([
+          st.label + (st.fields.length > 0 ? ` (${st.fields.join(" + ")})` : ""),
+          money(st.amount),
+        ]);
+      }
+      totalRows.push(["Expected Grand Total", money(gt.expectedTotal)]);
+      totalRows.push([
+        "Invoice Grand Total" + (gt.field ? ` (${gt.field})` : ""),
+        gt.documentTotal !== null ? money(gt.documentTotal) : "Not detected",
+      ]);
+      totalRows.push([
+        "Match",
+        gt.documentTotal === null ? "N/A" : gt.ok ? "Match" : "Mismatch",
+      ]);
+    }
+
     const escape = (s: string) =>
       s.includes(",") || s.includes('"') || s.includes("\n")
         ? `"${s.replace(/"/g, '""')}"`
         : s;
 
-    const csv = [headers, ...rows]
+    const csv = [headers, ...rows, ...totalRows]
       .map((row) => row.map((cell) => escape(String(cell ?? ""))).join(","))
       .join("\n");
 
@@ -2254,12 +2784,7 @@ const ValidationResults = ({
                   // Values worked out rather than read off the invoice. A
                   // selection re-derives locally, since the pack size that
                   // produces the cost belongs to the chosen PLU.
-                  const derivedFields: Record<string, DerivedField> =
-                    hasSelection
-                      ? pluSel.derived
-                        ? { cost_price: pluSel.derived }
-                        : {}
-                      : (v.derived_fields ?? {});
+                  const derivedFields = effectiveDerivedFields(idx);
 
                   // Remaining unresolved discrepancies
                   const effectiveDiscrepancies =
@@ -3351,105 +3876,258 @@ const ValidationResults = ({
         </div>
       </div>
 
-      {/* Grand Total — shown whenever any line carried an amount, even if the
-          document's own total could not be located. */}
-      {calcResults?.grandTotalCheck && (
-        <div className="border border-border rounded-lg overflow-hidden my-4">
-          <div className="px-3 py-2 bg-muted/50 border-b border-border flex items-center gap-3">
-            <Calculator className="w-4 h-4 text-foreground" />
-            <p className="text-xs font-semibold text-foreground">Grand Total</p>
-            <span className="text-xs text-muted-foreground font-mono">
-              {calcResults.grandTotalCheck.field ?? "—"}
-            </span>
-            {calcResults.grandTotalCheck.documentTotal === null ? (
-              <Badge
-                variant="outline"
-                className="ml-auto gap-1 text-xs text-muted-foreground"
-              >
-                <AlertCircle className="w-3 h-3" />
-                No invoice total found
-              </Badge>
-            ) : calcResults.grandTotalCheck.ok ? (
-              <Badge className="ml-auto bg-green-500/10 text-green-600 dark:text-green-400 border-green-500/20 gap-1 text-xs">
-                <CheckCircle2 className="w-3 h-3" />
-                Matches line sum
-              </Badge>
-            ) : calcResults.grandTotalCheck.partial ? (
-              // Some lines had no amount column, so the sum is short by
-              // construction — flag it as incomplete, not as a discrepancy.
-              <Badge className="ml-auto bg-yellow-500/10 text-yellow-700 dark:text-yellow-400 border-yellow-500/20 gap-1 text-xs">
-                <AlertCircle className="w-3 h-3" />
-                Partial — {calcResults.grandTotalCheck.linesCounted} of{" "}
-                {calcResults.grandTotalCheck.linesTotal} lines
-              </Badge>
-            ) : (
-              <Badge className="ml-auto bg-destructive/10 text-destructive border-destructive/20 gap-1 text-xs">
-                <XCircle className="w-3 h-3" />
-                Mismatch
-              </Badge>
-            )}
-          </div>
-          <div className="px-4 py-3 flex items-center gap-6 text-sm">
-            <div className="flex flex-col gap-0.5">
-              <span className="text-xs text-muted-foreground">
-                Sum of line amounts
-              </span>
-              <span className="font-mono font-semibold text-green-700 dark:text-green-400">
-                {calcResults.lineAmountSum}
-              </span>
-            </div>
-            <div className="flex flex-col gap-0.5">
-              <span className="text-xs text-muted-foreground">
-                Invoice grand total
-              </span>
-              <span
-                className={`font-mono font-semibold ${
-                  calcResults.grandTotalCheck.documentTotal === null
-                    ? "text-muted-foreground"
-                    : calcResults.grandTotalCheck.ok
-                      ? ""
-                      : "text-destructive"
-                }`}
-              >
-                {calcResults.grandTotalCheck.documentTotal ?? "not detected"}
-              </span>
-            </div>
-            {!calcResults.grandTotalCheck.ok &&
-              calcResults.grandTotalCheck.documentTotal !== null && (
-              <div className="flex flex-col gap-0.5">
-                <span className="text-xs text-muted-foreground">
-                  Difference
+      {/* Grand Total — Subtotal (computed from the line items, each on its
+          own tax rate) plus the Tax printed in the invoice summary,
+          reconciled against the invoice's grand total, with every step of
+          the arithmetic on show. Recomputed on each edit, PLU pick and
+          accepted correction. */}
+      {calcResults?.grandTotalCheck &&
+        (() => {
+          const gt = calcResults.grandTotalCheck;
+          const money = (n: number) => n.toFixed(2);
+          const difference =
+            gt.documentTotal === null
+              ? null
+              : parseFloat((gt.expectedTotal - gt.documentTotal).toFixed(2));
+          const summaryParts: string[] = [];
+          if (gt.printedSubtotal)
+            summaryParts.push(
+              `printed subtotal ${money(gt.printedSubtotal.value)} (${gt.printedSubtotal.key})`,
+            );
+          if (gt.taxTotal)
+            summaryParts.push(`tax ${money(gt.taxTotal.value)} (${gt.taxTotal.keys.join(" + ")})`);
+          const taxableSourceLabel: Record<
+            SubtotalLineContribution["taxableSource"],
+            string
+          > = {
+            printed: "printed",
+            computed: "rate × qty",
+            back_out: "backed out of amount",
+            line_amount: "line amount",
+            none: "—",
+          };
+          return (
+            <div className="border border-border rounded-lg overflow-hidden my-4">
+              <div className="px-3 py-2 bg-muted/50 border-b border-border flex items-center gap-3">
+                <Calculator className="w-4 h-4 text-foreground" />
+                <p className="text-xs font-semibold text-foreground">Grand Total</p>
+                <span className="text-xs text-muted-foreground font-mono">
+                  {gt.field ?? "—"}
                 </span>
-                <span
-                  className={`font-mono font-semibold ${calcResults.grandTotalCheck.partial ? "text-yellow-700 dark:text-yellow-400" : "text-destructive"}`}
-                >
-                  {Math.abs(
-                    calcResults.lineAmountSum -
-                      calcResults.grandTotalCheck.documentTotal,
-                  ).toFixed(2)}
-                </span>
+                {gt.documentTotal === null ? (
+                  <Badge
+                    variant="outline"
+                    className="ml-auto gap-1 text-xs text-muted-foreground"
+                  >
+                    <AlertCircle className="w-3 h-3" />
+                    No invoice total found
+                  </Badge>
+                ) : gt.ok ? (
+                  <Badge className="ml-auto bg-green-500/10 text-green-600 dark:text-green-400 border-green-500/20 gap-1 text-xs">
+                    <CheckCircle2 className="w-3 h-3" />
+                    Matches invoice total
+                  </Badge>
+                ) : gt.subtotalPartial ? (
+                  // Some line's taxable value could not be established, so
+                  // the subtotal is known to be incomplete — flag it as
+                  // such rather than as a firm discrepancy.
+                  <Badge className="ml-auto bg-yellow-500/10 text-yellow-700 dark:text-yellow-400 border-yellow-500/20 gap-1 text-xs">
+                    <AlertCircle className="w-3 h-3" />
+                    Subtotal incomplete — {gt.subtotalLinesIncluded} of {gt.linesTotal} lines
+                  </Badge>
+                ) : (
+                  <Badge className="ml-auto bg-destructive/10 text-destructive border-destructive/20 gap-1 text-xs">
+                    <XCircle className="w-3 h-3" />
+                    Mismatch
+                  </Badge>
+                )}
               </div>
-              )}
-          </div>
-          {calcResults.grandTotalCheck.documentTotal === null && (
-            <p className="px-4 pb-3 text-xs text-muted-foreground">
-              No invoice-total field was recognised in the extracted document
-              data, so there is nothing to compare the line sum against. Check
-              the Extracted tab for the header the invoice actually uses.
-            </p>
-          )}
-          {calcResults.grandTotalCheck.partial &&
-            calcResults.grandTotalCheck.documentTotal !== null && (
-            <p className="px-4 pb-3 text-xs text-muted-foreground">
-              {calcResults.grandTotalCheck.linesTotal -
-                calcResults.grandTotalCheck.linesCounted}{" "}
-              line item(s) had no recognisable amount column and are not
-              included in the sum, so a difference here may not be a real
-              discrepancy.
-            </p>
-          )}
-        </div>
-      )}
+
+              {/* The ladder from the computed subtotal to the invoice total. */}
+              <div className="px-4 py-3 overflow-x-auto">
+                <table className="w-full text-sm">
+                  <tbody>
+                    {gt.steps.map((st, i) => (
+                      <tr key={i} className="border-b border-border/50">
+                        <td className="py-1.5 pr-2 w-5 font-mono text-muted-foreground">
+                          {i === 0 ? "" : st.amount < 0 ? "−" : "+"}
+                        </td>
+                        <td className="py-1.5 pr-3">
+                          <span>{st.label}</span>
+                          {st.fields.length > 0 && (
+                            <span className="ml-2 font-mono text-xs text-muted-foreground">
+                              {st.fields.join(" + ")}
+                            </span>
+                          )}
+                          {st.note && (
+                            <span className="ml-2 text-xs text-muted-foreground">
+                              ({st.note})
+                            </span>
+                          )}
+                        </td>
+                        <td className="py-1.5 text-right font-mono whitespace-nowrap">
+                          {money(Math.abs(st.amount))}
+                        </td>
+                      </tr>
+                    ))}
+                    <tr className="border-b border-border">
+                      <td className="py-1.5 pr-2 font-mono text-muted-foreground">
+                        =
+                      </td>
+                      <td className="py-1.5 pr-3 font-semibold">
+                        Expected grand total
+                      </td>
+                      <td className="py-1.5 text-right font-mono font-semibold whitespace-nowrap text-green-700 dark:text-green-400">
+                        {money(gt.expectedTotal)}
+                      </td>
+                    </tr>
+                    <tr>
+                      <td />
+                      <td className="py-1.5 pr-3 font-semibold">
+                        Invoice grand total
+                      </td>
+                      <td
+                        className={`py-1.5 text-right font-mono font-semibold whitespace-nowrap ${
+                          gt.documentTotal === null
+                            ? "text-muted-foreground"
+                            : gt.ok
+                              ? ""
+                              : "text-destructive"
+                        }`}
+                      >
+                        {gt.documentTotal === null
+                          ? "not detected"
+                          : money(gt.documentTotal)}
+                      </td>
+                    </tr>
+                    {difference !== null && !gt.ok && (
+                      <tr>
+                        <td />
+                        <td className="py-1.5 pr-3 font-semibold">Difference</td>
+                        <td
+                          className={`py-1.5 text-right font-mono font-semibold whitespace-nowrap ${
+                            gt.subtotalPartial
+                              ? "text-yellow-700 dark:text-yellow-400"
+                              : "text-destructive"
+                          }`}
+                        >
+                          {money(Math.abs(difference))}
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+
+                <div className="mt-3 space-y-1 text-xs text-muted-foreground">
+                  <p>
+                    Subtotal computed from {gt.subtotalLinesIncluded} of{" "}
+                    {gt.linesTotal} line{gt.linesTotal === 1 ? "" : "s"}
+                    {gt.subtotalPartial &&
+                      `; ${gt.linesTotal - gt.subtotalLinesIncluded} line${
+                        gt.linesTotal - gt.subtotalLinesIncluded === 1 ? "" : "s"
+                      } had no tax fields or line amount to work from`}
+                    .
+                  </p>
+                  {gt.linesCounted > 0 && (
+                    <p>
+                      Printed line amounts sum to{" "}
+                      <span className="font-mono">{money(calcResults.lineAmountSum)}</span>
+                      {gt.partial &&
+                        ` (${gt.linesCounted} of ${gt.linesTotal} lines)`}
+                      {gt.documentTotal !== null &&
+                        (gt.lineSumOk
+                          ? ", which matches the invoice total."
+                          : ", which does not match the invoice total on its own.")}
+                    </p>
+                  )}
+                  {gt.coveredDiscounts.length > 0 && (
+                    <p>
+                      {gt.coveredDiscounts
+                        .map((d) =>
+                          d.covered >= d.value - GRAND_TOTAL_TOLERANCE
+                            ? `The summary ${d.label.toLowerCase()} of ${money(d.value)} (${d.key}) is already reflected in the line taxable values, so it is not deducted again`
+                            : `${money(d.covered)} of the summary ${d.label.toLowerCase()} ${money(d.value)} (${d.key}) is already reflected in the line taxable values`,
+                        )
+                        .join(". ")}
+                      .
+                    </p>
+                  )}
+                  {summaryParts.length > 0 && (
+                    <p>
+                      Invoice summary cross-check: {summaryParts.join(", ")}.
+                    </p>
+                  )}
+                  {gt.documentTotal === null && (
+                    <p>
+                      No invoice-total field was recognised in the extracted
+                      document data, so there is nothing to compare against.
+                      Check the Extracted tab for the header the invoice
+                      actually uses.
+                    </p>
+                  )}
+                </div>
+
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="mt-2 h-7 gap-1 text-xs text-muted-foreground hover:text-foreground"
+                  onClick={() => setShowTotalBreakdown((v) => !v)}
+                >
+                  <ChevronDown
+                    className={`w-3.5 h-3.5 ${showTotalBreakdown ? "rotate-180" : ""}`}
+                  />
+                  {showTotalBreakdown ? "Hide line breakdown" : "Show line breakdown"}
+                </Button>
+
+                {showTotalBreakdown && (
+                  <div className="mt-2 overflow-x-auto">
+                    <table className="w-full text-xs">
+                      <thead>
+                        <tr className="border-b border-border text-muted-foreground">
+                          <th className="py-1 pr-2 text-left font-medium">#</th>
+                          <th className="py-1 pr-2 text-left font-medium">Product</th>
+                          <th className="py-1 pr-2 text-right font-medium">Taxable value</th>
+                          <th className="py-1 pr-2 text-right font-medium">Tax</th>
+                          <th className="py-1 pr-2 text-right font-medium">Line amount</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {gt.contributions.map((c) => (
+                          <tr key={c.idx} className="border-b border-border/50">
+                            <td className="py-1 pr-2 font-mono">{c.idx + 1}</td>
+                            <td className="py-1 pr-2 max-w-[18rem] truncate">{c.name}</td>
+                            <td className="py-1 pr-2 text-right font-mono whitespace-nowrap">
+                              {c.taxable !== null ? money(c.taxable) : "—"}
+                              <span className="ml-1 font-sans text-muted-foreground">
+                                {taxableSourceLabel[c.taxableSource]}
+                              </span>
+                            </td>
+                            <td className="py-1 pr-2 text-right font-mono whitespace-nowrap">
+                              {c.tax !== null ? money(c.tax) : "—"}
+                            </td>
+                            <td className="py-1 pr-2 text-right font-mono whitespace-nowrap">
+                              {c.lineAmount !== null ? money(c.lineAmount) : "—"}
+                            </td>
+                          </tr>
+                        ))}
+                        <tr>
+                          <td colSpan={2} className="py-1 pr-2 text-right font-semibold">
+                            Subtotal
+                          </td>
+                          <td className="py-1 pr-2 text-right font-mono font-semibold whitespace-nowrap">
+                            {money(gt.subtotal)}
+                          </td>
+                          <td />
+                          <td />
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            </div>
+          );
+        })()}
     </TooltipProvider>
   );
 };

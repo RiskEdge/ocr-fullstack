@@ -27,3 +27,4 @@ src/components/ValidationResults.derived.test.tsx
 .env
 
 src/test/*
+tsconfig.app.tsbuildinfo

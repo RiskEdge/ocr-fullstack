@@ -108,6 +108,12 @@ class OCRProcessor:
             prompt = f"""Extract all data from this document. If it spans multiple pages,
             consolidate all line items, totals, and relevant metadata into a single flat JSON object.
             Ensure dynamic keys are descriptive strings (e.g., 'vendor_name', 'invoice_date').
+            Where a page prints a totals or summary block, also include an "invoice_summary" object
+            in that page's extracted_data with exactly these keys, each holding the printed figure as a
+            plain number (no currency symbols or thousands separators) or null when the document does
+            not print it: "subtotal", "total_tax", "cgst_total", "sgst_total", "igst_total",
+            "freight_charges", "other_charges", "discount", "tcs", "round_off" (signed the way it
+            changes the total, e.g. -0.30), "grand_total" (the final amount payable).
             Return ONLY the raw JSON without any markdown formatting or code blocks.
             You MUST return the data in a strict JSON format with the following structure:
             {{
