@@ -202,6 +202,15 @@ function lineDiscount(item: Record<string, unknown>): LineDiscount | null {
 }
 
 /**
+ * To the paisa. An invoice is written in two-decimal currency and totalled from
+ * those written figures, so every figure this file computes has to be put on
+ * that same grid before it is summed with another — see `computedTaxable`.
+ */
+function round2(value: number): number {
+	return parseFloat(value.toFixed(2));
+}
+
+/**
  * `unitPrice` with the line's discounts taken off. Rupee discounts are printed
  * per line and shared over `units`; they come off first, then the percentage
  * applies to the remainder. Null when an amount is printed but there is
@@ -1204,12 +1213,19 @@ interface Reconciliation {
 
 /**
  * Builds the ladder: the computed line subtotal, plus summary charges, less
- * summary discount, plus the tax printed in the invoice summary, plus
- * round-off — and compares it with the invoice's printed grand total.
+ * summary discount, plus the invoice's tax, plus round-off — and compares it
+ * with the invoice's printed grand total.
  *
  * Subtotal + Tax = Grand Total is the whole rule; nothing here is inferred
  * or tried as a fallback variant, so a mismatch always means the figures
  * genuinely disagree rather than a guess that happened not to land.
+ *
+ * The tax rung is read from the invoice summary where one is printed, and
+ * otherwise (`lineTaxTotal`) summed from the lines, which is where plenty of
+ * invoices print their only tax figures. That is not a guess — it is the same
+ * printed tax read from a different part of the page — and without it a
+ * document that reconciles perfectly is reported as a mismatch by exactly its
+ * own tax.
  *
  * The computed subtotal is already net of every discount applied line by
  * line (each line's own scheme/amount/percentage, taken off before its tax).
@@ -1225,6 +1241,7 @@ function reconcileGrandTotal(
 	summary: SummaryFigures,
 	documentTotal: number | null,
 	subtotalDiscountApplied = 0,
+	lineTaxTotal: number | null = null,
 ): Reconciliation {
 	const steps: ReconciliationStep[] = [
 		{
@@ -1262,6 +1279,13 @@ function reconcileGrandTotal(
 			label: 'Total tax',
 			fields: summary.taxTotal.keys,
 			amount: summary.taxTotal.value,
+		});
+	} else if (lineTaxTotal !== null) {
+		steps.push({
+			label: 'Total tax',
+			fields: [],
+			amount: lineTaxTotal,
+			note: 'summed from the line items; the invoice summary prints no tax total',
 		});
 	}
 
@@ -1723,15 +1747,23 @@ const ValidationResults = ({ items, documentScalars, sourceFilename }: Props) =>
 			// Unit price x qty, less the line's discount when it prints one —
 			// scheme and discount amounts first, then the percentage on the
 			// remainder, the order the invoice itself computes it in.
+			//
+			// Rounded to the paisa here, because the invoice is: it prints each
+			// line to two decimals and adds up those printed figures. Carrying
+			// the full-precision value instead leaves a fraction of a paisa on
+			// every discounted line — 7% of 522.06 is 485.5158 against a printed
+			// 485.52 — and twenty of those accumulate into a subtotal a whole
+			// paisa short of the invoice's own, which the reconciliation then
+			// reports as a mismatch against a document that is perfectly correct.
 			let computedTaxable: number | null = null;
 			let taxableFormula = '';
 			if (unitPriceField && !isNaN(quantity)) {
-				const gross = unitPriceField.value * quantity;
+				const gross = round2(unitPriceField.value * quantity);
 				taxableFormula = `${trimNum(unitPriceField.value)} × ${trimNum(quantity)}`;
 				if (disc) {
 					const net = netUnitPrice(gross, 1, disc);
 					if (net !== null) {
-						computedTaxable = net;
+						computedTaxable = round2(net);
 						const legs: string[] = [];
 						if (disc.scheme) legs.push(`${trimNum(disc.scheme)} scheme`);
 						if (disc.amount) legs.push(`${trimNum(disc.amount)} disc`);
@@ -1749,7 +1781,7 @@ const ValidationResults = ({ items, documentScalars, sourceFilename }: Props) =>
 				// Only worth running against a printed column; against our own
 				// computed base it would merely restate itself.
 				if (taxableField && computedTaxable !== null) {
-					const calculated = parseFloat(computedTaxable.toFixed(2));
+					const calculated = computedTaxable;
 					checks.push({
 						label: 'Taxable Value',
 						field: taxableField.key,
@@ -1841,8 +1873,7 @@ const ValidationResults = ({ items, documentScalars, sourceFilename }: Props) =>
 					// so the printed amount is rate x qty less discount, not cost x
 					// units. That basis is tried when the tax-inclusive one fails,
 					// rather than reporting a consistent invoice as broken.
-					const preTax =
-						computedTaxable !== null ? parseFloat(computedTaxable.toFixed(2)) : null;
+					const preTax = computedTaxable;
 					const preTaxOk =
 						preTax !== null && Math.abs(preTax - lineAmtField.value) <= 0.05;
 
@@ -1903,8 +1934,8 @@ const ValidationResults = ({ items, documentScalars, sourceFilename }: Props) =>
 				// discount that merely restates the line discounts is not taken off
 				// again.
 				if (disc && computedTaxable !== null && unitPriceField && !isNaN(quantity)) {
-					const gross = unitPriceField.value * quantity;
-					subtotalDiscountApplied += Math.max(0, gross - computedTaxable);
+					const gross = round2(unitPriceField.value * quantity);
+					subtotalDiscountApplied += Math.max(0, round2(gross - computedTaxable));
 				}
 			} else {
 				subtotalPartial = true;
@@ -1941,12 +1972,28 @@ const ValidationResults = ({ items, documentScalars, sourceFilename }: Props) =>
 			const sumRounded = parseFloat(lineAmountSum.toFixed(2));
 			const computedSubtotal = parseFloat(subtotalSum.toFixed(2));
 			const summary = findSummaryFigures(documentScalars, gtField?.key ?? null);
+			// The tax the lines themselves print, for invoices whose summary
+			// block prints none. Only when *every* line counted into the subtotal
+			// printed a tax figure: a partial sum would be a made-up total, and a
+			// line with no tax fields at all is one whose taxable basis is its own
+			// (tax-inclusive) amount, which this must never be added on top of.
+			const includedLines = subtotalContributions.filter((c) => c.taxable !== null);
+			const lineTaxComplete =
+				!summary.taxTotal &&
+				includedLines.length > 0 &&
+				includedLines.every((c) => c.tax !== null);
+			const lineTaxTotal = lineTaxComplete
+				? parseFloat(
+						includedLines.reduce((acc, c) => acc + (c.tax ?? 0), 0).toFixed(2),
+					) || null
+				: null;
 			const recon = reconcileGrandTotal(
 				computedSubtotal,
 				linesWithSubtotal,
 				summary,
 				documentTotal,
 				subtotalDiscountApplied,
+				lineTaxTotal,
 			);
 			grandTotalCheck = {
 				field: gtField?.key ?? null,

@@ -1,6 +1,7 @@
 import mimetypes
 import os
 import json
+import re
 import asyncio
 import tempfile
 from datetime import datetime, timezone
@@ -12,17 +13,138 @@ _MAX_RETRIES = 3
 _ENVIRONMENT = os.environ.get("ENVIRONMENT", "production")
 # Keywords that identify a Gemini rate-limit / quota error
 _RATE_LIMIT_SIGNALS = ("quota", "rate limit", "429", "resource exhausted", "too many requests")
+# Prefix on the errors a second attempt can plausibly fix: a reply that came
+# back truncated, unparseable or stuck repeating a row. Sampling alone decides
+# those, so the same file usually succeeds on the next call.
+_INCOMPLETE = "Incomplete extraction:"
+_RETRY_SIGNALS = _RATE_LIMIT_SIGNALS + (_INCOMPLETE.lower(),)
 
 # Gemini 3 Flash pricing (USD per 1M tokens)
 _INPUT_PRICE_PER_M = 0.50
 _OUTPUT_PRICE_PER_M = 3.00
 
 from google import genai
-from PIL import Image
-import io
+from google.genai import types
 
 from app.db import get_supabase
 from app.documents import record_processed_documents
+from app.schemas import Document, coerce_document, document_to_content, schema_outline
+
+
+# Headroom for a dense multi-page invoice — truncation loses the whole
+# document, not a field — and a ceiling on a reply that runs away.
+# Tune via OCR_MAX_OUTPUT_TOKENS.
+_MAX_OUTPUT_TOKENS = int(os.environ.get("OCR_MAX_OUTPUT_TOKENS", "50768"))
+
+
+_EXTRACTION_PROMPT = """You are extracting data from and performing OCR on a scanned or photographed business document, usually a GST tax invoice.
+Extract all the data correctly from this document.
+Read every printed value. Route each one to the field that matches its meaning, and leave a field out when the document does not print it.
+
+PAGES
+- One entry in `pages` per physical page, `page_number` starting at 1.
+- Emit each physical page exactly once. Never repeat a page or re-list its line items under a second entry.
+- Never merge line items or totals across pages. A figure printed on page 3 belongs to page 3.
+
+PARTIES
+- `supplier`: the party issuing the invoice — the letterhead, or the name above "Authorised Signatory".
+- `buyer`: "Buyer", "Bill to", "Billed to".
+- `consignee`: "Consignee", "Ship to". Fill it even when it repeats the buyer exactly.
+
+LINE ITEMS
+Item tables differ from vendor to vendor, so map every column by meaning, not by position:
+- "S.No", "Sl No.", "Sr." -> serial_no
+- "Description of Goods", "Item Description", "Product Description", "Particulars" -> sku_description
+- "HSN", "HSN/SAC", "HSN Code" -> hsn_code
+- "EAN", "Barcode" -> ean_code; "Item Code", "Product Code", "Article Code" -> sku_code
+- "Qty", "Quantity", "PCS", "Nos" -> quantity; "Free" -> free_quantity
+- "UOM", "Unit", "per" -> uom; "Pack Size", "Conversion Factor" -> uom_qty
+- "MRP" -> mrp, never invoice_price
+- "Rate", "Basic Rate", "B.Rate", "Basic Cost", "PC Price", "Rate Excl" -> invoice_price
+- "Rate Inc", "Rate Incl", "Rate Inc GST" -> invoice_price_incl, never invoice_price
+- "Cost Price" -> cost_price
+- "Gross Amount" -> gross_amount
+- "Disc %", "Disc. %", "C.D %", "Discount %" -> discount_pct
+- "Disc Amount", "Discount Amount" -> discount_amount
+- "Scheme", "Schemes", "Scheme Amount" -> scheme_amount
+- "Taxable Amount", "Taxable Value", "Assessable Value" -> taxable_value
+- "GST %", "GST Rate", "Tax %" -> gst_percent; "CGST %", "SGST %", "IGST %" -> cgst_percent, sgst_percent, igst_percent
+- A "CGST" / "SGST" / "IGST" column holding money -> cgst_amount / sgst_amount / igst_amount; holding a rate -> the matching *_percent
+- "Amount", "Net Amount", "Net Value" -> net_amount
+
+Line item rules:
+- A quantity cell that prints its unit ("6 Pcs", "12 NOS") gives quantity 6 and uom "Pcs".
+- A column headed only "Amount" is net_amount, even where the invoice adds tax further down and that figure is therefore pre-tax. taxable_value is only for a column that names itself: "Taxable Amount", "Taxable Value", "Assessable Value".
+- A column you cannot map confidently goes in that row's `additional_fields`, with the printed header as `key`. Never force it into a field above.
+
+TAX SUMMARY
+- The HSN-wise or rate-wise tax summary table goes in `tax_summary`, never in `line_items`.
+- Exclude its "Total" row: it would double every sum. Those figures belong in `invoice_summary`.
+- Grouped headers — a "CGST" header spanning "Rate" and "Amount" — map to cgst_percent and cgst_amount.
+
+TOTALS
+- `grand_total` is the final amount payable, and it is the first field to fill from the totals block. A row labelled only "Total", or a single closing figure with no label at all, is the grand total. Never put it in `charges`.
+- `charges` is for the component figures *between* the subtotal and the grand total — tax, freight, discount, round-off, and anything else the totals block lists. Keep each label exactly as printed, including labels printed inside the item table's own columns, such as "SGST", "CGST" or "Round Off" appearing under the description column.
+- Every charge whose label is recognisable must ALSO fill its named field: SGST -> sgst_total, CGST -> cgst_total, IGST -> igst_total, Total Tax -> total_tax, Freight -> freight_charges, TCS -> tcs, Round Off -> round_off, Discount -> discount, Subtotal or Taxable Value -> taxable_value. This is not optional: `charges` records how a figure was printed, it does not stand in for the named field.
+- `round_off` is signed the way it moves the total: -0.30 when it reduces the payable amount.
+- A "Total" row carrying both a quantity and an amount ("Total  99 Pcs  16,753.00") gives total_quantity 99, total_quantity_uom "Pcs" and grand_total 16753.
+- Report every figure as printed. Do not compute, correct or balance them.
+
+STAMPS AND HANDWRITING
+- Rubber stamps, inward or security seals, handwritten notes, ticks and margin scribbles go in `annotations` only.
+- They are never invoice data. A date inside a stamp is not `invoice_date`; a handwritten number is not `invoice_number`.
+
+NUMBERS AND DATES
+- Numbers are plain: strip currency symbols, thousands separators and a trailing "/-". "1,262.42" becomes 1262.42
+- Dates exactly as printed ("22-Aug-26"). Do not reformat them.
+
+OMISSIONS
+- `confidence_score` is 0 to 1 for the page as a whole. Lower it when the scan is skewed, blurred or partly obscured.
+
+OUTPUT
+- Return ONLY raw JSON, with no markdown fences and no commentary, in exactly this shape:
+""" + schema_outline() + """
+- Omit any key the document does not print. Never emit null, "" or an empty list.
+- Use only the keys above. Anything else printed goes in the nearest `additional_fields` as {"key": "<label as printed>", "value": "<value as printed>"}.
+- Write each line item exactly once, in the order printed. Never repeat a row you have already written, and stop the array when the printed rows run out.
+"""
+
+
+_FENCE_OPEN_RE = re.compile(r"^```[a-zA-Z]*\n?")
+_FENCE_CLOSE_RE = re.compile(r"\n?```\s*$")
+
+
+def _json_payload(text: str) -> str:
+    """The JSON object inside a reply that may carry fences or a stray sentence."""
+    text = _FENCE_CLOSE_RE.sub("", _FENCE_OPEN_RE.sub("", text.strip())).strip()
+    start, end = text.find("{"), text.rfind("}")
+    return text[start:end + 1] if start != -1 and end > start else text
+
+
+def _repeated_line_items(document: Document) -> str | None:
+    """Names the decoder looping on one row, or None when the table looks real.
+
+    A stuck run comes back as byte-identical rows, and the stuck row is always
+    a partial one — it is the copy the model could not move past. Invoices do
+    legitimately repeat a row (the same SKU in two batches), so a handful of
+    matching rows is not enough: the run has to be at least three long and a
+    quarter of the page before it counts.
+    """
+    for page in document.pages:
+        rows = page.line_items
+        if len(rows) < 3:
+            continue
+        counts: dict[str, int] = {}
+        for row in rows:
+            key = row.model_dump_json()
+            counts[key] = counts.get(key, 0) + 1
+        worst = max(counts.values())
+        if worst >= 3 and worst * 4 >= len(rows):
+            return (
+                f"page {page.page_number} repeats one line item {worst} times "
+                f"across {len(rows)} rows"
+            )
+    return None
 
 
 class OCRProcessor:
@@ -50,35 +172,45 @@ class OCRProcessor:
             "total_cost_usd": round(total_cost, 6),
             "cost_per_page_usd": round(per_page_cost, 6),
         }
-        
-    async def process_image(self, file_bytes: bytes, filename: str) -> dict:
-        """Performs OCR on a single image."""
-        try:
-            img = Image.open(io.BytesIO(file_bytes))
-            
-            prompt = """
-            Perform OCR on this invoice image. Extract all data into a structured JSON format.
-            Return ONLY the raw JSON without any markdown formatting or code blocks.
-            """
-            
-            response = await self.client.aio.models.generate_content(
-                model='gemini-3-flash-preview',
-                contents=[
-                    prompt,
-                    img
-                ]
+
+    @staticmethod
+    def _parse_document(response) -> Document:
+        """Validated `Document` out of Gemini's JSON reply.
+
+        Gemini is asked for JSON but deliberately *not* pinned to a
+        `response_schema`. A schema as wide as `Document` — thirty optional
+        columns per line item, each with its own key/value escape hatch — sent
+        the constrained decoder into a repetition loop on a dense item table:
+        it would re-emit line item 1 until it either ran to MAX_TOKENS or gave
+        up and closed the array, so a 20-row invoice arrived holding one row.
+        Unconstrained, the same prompt and model read the table straight
+        through. The shape travels in the prompt instead (`schema_outline()`)
+        and `coerce_document()` puts the reply back on the models here, so
+        everything downstream still receives a validated `Document`.
+        """
+        candidates = getattr(response, "candidates", None) or []
+        finish_reason = getattr(candidates[0], "finish_reason", None) if candidates else None
+        if finish_reason is not None and str(finish_reason).endswith("MAX_TOKENS"):
+            raise ValueError(
+                f"{_INCOMPLETE} Gemini hit the output token limit before closing the JSON. "
+                "Raise OCR_MAX_OUTPUT_TOKENS or split the file."
             )
-            
-            return {
-                "filename": filename,
-                "content": response.text
-            }
-        except Exception as e:
-            return {
-                "filename": filename,
-                "error": str(e)
-            }
-            
+
+        text = (getattr(response, "text", None) or "").strip()
+        if not text:
+            raise ValueError(f"{_INCOMPLETE} Gemini returned no content (finish_reason={finish_reason})")
+
+        try:
+            raw = json.loads(_json_payload(text))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{_INCOMPLETE} Gemini returned unparseable JSON ({exc})") from exc
+
+        document = coerce_document(raw)
+        looping = _repeated_line_items(document)
+        if looping:
+            raise ValueError(f"{_INCOMPLETE} {looping}")
+        return document
+
     async def process_single_file(
         self,
         file_bytes: bytes,
@@ -102,46 +234,22 @@ class OCRProcessor:
                 self.client.files.upload,
                 file=temp_file_path
             )
-            
-            # print(self.client.files.get(name=uploaded_file.name))
-            
-            prompt = f"""Extract all data from this document. If it spans multiple pages,
-            consolidate all line items, totals, and relevant metadata into a single flat JSON object.
-            Ensure dynamic keys are descriptive strings (e.g., 'vendor_name', 'invoice_date').
-            Where a page prints a totals or summary block, also include an "invoice_summary" object
-            in that page's extracted_data with exactly these keys, each holding the printed figure as a
-            plain number (no currency symbols or thousands separators) or null when the document does
-            not print it: "subtotal", "total_tax", "cgst_total", "sgst_total", "igst_total",
-            "freight_charges", "other_charges", "discount", "tcs", "round_off" (signed the way it
-            changes the total, e.g. -0.30), "grand_total" (the final amount payable).
-            Return ONLY the raw JSON without any markdown formatting or code blocks.
-            You MUST return the data in a strict JSON format with the following structure:
-            {{
-              "total_pages": <number of pages in the document>,
-              "pages": [
-                {{
-                  "page_number": <the specific page number starting at 1>,
-                  "extracted_data": {{
-                      {{
-                          <dynamic keys and values found ONLY on this specific page>,
-                          "confidence_score": <a number between 0 and 1 representing the confidence in the data>,
-                      }}
-                  }}
-                }}
-              ]
-            }}
-            Do not consolidate items across pages. Keep the extracted_data specific to its page_number.
-            """
-            
+
             response = await self.client.aio.models.generate_content(
                 model='gemini-3-flash-preview',
                 contents=[
-                    prompt,
+                    _EXTRACTION_PROMPT,
                     uploaded_file
-                ]
+                ],
+                config=types.GenerateContentConfig(
+                    # No `response_schema`: see `_parse_document` for why
+                    # constraining the decoder breaks dense item tables.
+                    response_mime_type="application/json",
+                    max_output_tokens=_MAX_OUTPUT_TOKENS,
+                ),
             )
-            
-            content = json.loads(response.text)
+
+            content = document_to_content(self._parse_document(response))
             total_pages = content.get("total_pages", 1)
 
             usage = response.usage_metadata
@@ -167,7 +275,7 @@ class OCRProcessor:
         finally:
             if uploaded_file:
                 try:
-                    await asyncio.to_thread(self.client.file.delete, uploaded_file.name)
+                    await asyncio.to_thread(self.client.files.delete, name=uploaded_file.name)
                 except Exception:
                     pass
             if temp_file_path and os.path.exists(temp_file_path):
@@ -194,13 +302,16 @@ class OCRProcessor:
                         if result["status"] == "success":
                             break
                         msg = result.get("message", "").lower()
-                        is_rate_limit = any(sig in msg for sig in _RATE_LIMIT_SIGNALS)
-                        if is_rate_limit and attempt < _MAX_RETRIES:
+                        if not any(sig in msg for sig in _RETRY_SIGNALS) or attempt >= _MAX_RETRIES:
+                            break
+                        if any(sig in msg for sig in _RATE_LIMIT_SIGNALS):
                             wait = 2 ** attempt
                             print(f"Rate limit hit for {filename}, retrying in {wait}s (attempt {attempt + 1})")
                             await asyncio.sleep(wait)
-                            continue
-                        break
+                        else:
+                            # A truncated or looping reply is a sampling accident,
+                            # so retry straight away rather than backing off.
+                            print(f"Retrying {filename}: {result.get('message')} (attempt {attempt + 1})")
                     if any(sig in result.get("message", "").lower() for sig in _RATE_LIMIT_SIGNALS):
                         result = {**result, "message": "Processing failed. Please try again later."}
             except Exception as e:
@@ -234,6 +345,7 @@ class OCRProcessor:
         # Yield each result as soon as it arrives in the queue
         for _ in range(total_files):
             index, result = await queue.get()
+            print(result)
             if result.get("status") == "success":
                 run_successful += 1
                 tu = result.get("token_usage", {})
@@ -344,15 +456,3 @@ class OCRProcessor:
             "remaining_credits": remaining_credits,
         }) + "\n"
             
-    async def process_multiple_images(self, files: List[tuple]):
-        """ 
-        Processes multiple images in parallel.
-        Yeilds results one by one as they finish.
-        """
-        
-        tasks = [self.process_image(f_bytes, f_name) for f_bytes, f_name in files]
-        
-        for task in asyncio.as_completed(tasks):
-            result = await task
-            
-            yield json.dumps(result) + "\n"

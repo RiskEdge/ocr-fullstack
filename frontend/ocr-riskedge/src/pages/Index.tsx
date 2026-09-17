@@ -249,6 +249,15 @@ function scalarsForPage(root: Record<string, unknown>): Record<string, unknown> 
   return out;
 }
 
+// Where one file's validation has got to. Absent means never started.
+type ValidationFileState = "validating" | "done" | "error";
+
+// Files validate in parallel, but not all at once: the browser caps concurrent
+// requests per origin anyway, and the server shares a single Gemini semaphore
+// across every request, so a small pool keeps the queue on our side — where
+// progress is visible — rather than inside the browser's socket pool.
+const VALIDATE_ALL_CONCURRENCY = 4;
+
 function extractDocumentScalars(content: RawContent): Record<string, unknown> {
   const scalars: Record<string, unknown> = {};
   for (const page of content.pages) {
@@ -283,8 +292,26 @@ const Index = () => {
   const [lastRunCreditsUsed, setLastRunCreditsUsed] = useState<number | null>(null);
   const [rawContentByFile, setRawContentByFile] = useState<Record<number, RawContent>>({});
   const [dataTab, setDataTab] = useState<"extracted" | "validation">("extracted");
-  const [validationState, setValidationState] = useState<"idle" | "validating" | "done">("idle");
+  // Per file, not global: "Validate All" runs several files at once, so one
+  // file's spinner must never stand in for another's.
+  const [validationStateByFile, setValidationStateByFile] = useState<Record<number, ValidationFileState>>({});
+  const [validateAllRunning, setValidateAllRunning] = useState(false);
   const [validationByFile, setValidationByFile] = useState<Record<number, ValidatedItem[]>>({});
+  // Every file that finished extraction with a payload to validate. Restored
+  // history lands here too, so a reopened document validates like a fresh one.
+  const validatableIndexes = useMemo(
+    () =>
+      Object.keys(rawContentByFile)
+        .map(Number)
+        .filter((index) => !Number.isNaN(index))
+        .sort((a, b) => a - b),
+    [rawContentByFile],
+  );
+  const activeValidationState = validationStateByFile[activeFileIndex];
+  const validateAllCompleted = validatableIndexes.filter((index) => {
+    const state = validationStateByFile[index];
+    return state === "done" || state === "error";
+  }).length;
   const [dataPanelFullscreen, setDataPanelFullscreen] = useState(false);
   // Duplicate detection — populated on file select, before Extract is usable
   const [duplicateInfo, setDuplicateInfo] = useState<Map<File, DuplicateEntry>>(new Map());
@@ -565,7 +592,7 @@ const Index = () => {
     setSelectedHistoryId(null);
     setRawContentByFile({});
     setValidationByFile({});
-    setValidationState("idle");
+    setValidationStateByFile({});
 
     setDataTab("extracted");
   };
@@ -597,7 +624,7 @@ const Index = () => {
     // total check) available on a document reopened from history.
     setRawContentByFile(item.rawContent ? { 0: item.rawContent } : {});
     setValidationByFile({});
-    setValidationState("idle");
+    setValidationStateByFile({});
 
     setDataTab("extracted");
   };
@@ -852,24 +879,71 @@ const Index = () => {
     }
   }, [previewUrls, token, credits, setCredits, refreshCredits, processingMode, activeFileIndex, selectedHistoryId, buildSessionEntry]);
 
-  const handleValidate = useCallback(async () => {
-    if (!token) return;
-    const content = rawContentByFile[activeFileIndex];
-    if (!content) return;
-    const items = extractLineItems(content);
-    if (items.length === 0) return;
+  // Validating one file. Both the single-file button and the batch runner go
+  // through here, so the state bookkeeping exists once; the outcome is
+  // returned so the batch can tally it without reading state back.
+  const validateFile = useCallback(
+    async (index: number): Promise<"done" | "error" | "skipped"> => {
+      if (!token) return "skipped";
+      const content = rawContentByFile[index];
+      if (!content) return "skipped";
+      const items = extractLineItems(content);
+      if (items.length === 0) return "skipped";
 
-    setValidationState("validating");
+      setValidationStateByFile((prev) => ({ ...prev, [index]: "validating" }));
+      try {
+        const { validated_items } = await validateItems(items, token, selectedFiles[index]?.name);
+        setValidationByFile((prev) => ({ ...prev, [index]: validated_items }));
+        setValidationStateByFile((prev) => ({ ...prev, [index]: "done" }));
+        return "done";
+      } catch {
+        setValidationStateByFile((prev) => ({ ...prev, [index]: "error" }));
+        return "error";
+      }
+    },
+    [token, rawContentByFile, selectedFiles],
+  );
+
+  const handleValidate = useCallback(async () => {
     setDataTab("validation");
-    try {
-      const { validated_items } = await validateItems(items, token, currentFile?.name);
-      setValidationByFile((prev) => ({ ...prev, [activeFileIndex]: validated_items }));
-      setValidationState("done");
-    } catch {
-      setValidationState("idle");
-      setDataTab("extracted");
+    await validateFile(activeFileIndex);
+  }, [validateFile, activeFileIndex]);
+
+  const handleValidateAll = useCallback(async () => {
+    if (!token) return;
+    const targets = validatableIndexes;
+    if (targets.length === 0) return;
+
+    setDataTab("validation");
+    setValidateAllRunning(true);
+
+    // A shared queue rather than fixed slices: one slow 200-line invoice would
+    // otherwise hold up every file that happened to land behind it.
+    const queue = [...targets];
+    const tally = { done: 0, error: 0, skipped: 0 };
+    const worker = async () => {
+      for (let index = queue.shift(); index !== undefined; index = queue.shift()) {
+        tally[await validateFile(index)] += 1;
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(VALIDATE_ALL_CONCURRENCY, queue.length) }, worker),
+    );
+
+    setValidateAllRunning(false);
+    if (tally.error > 0) {
+      toast.error(
+        `Validated ${tally.done} of ${targets.length} files — ${tally.error} failed`,
+      );
+    } else if (tally.done > 0) {
+      toast.success(
+        `Validated ${tally.done} ${tally.done === 1 ? "file" : "files"}` +
+          (tally.skipped > 0 ? ` — ${tally.skipped} had no line items` : ""),
+      );
+    } else {
+      toast.info("No line items found to validate");
     }
-  }, [token, rawContentByFile, activeFileIndex, currentFile]);
+  }, [token, validatableIndexes, validateFile]);
 
   // Update extracted data when switching files
   useEffect(() => {
@@ -880,9 +954,15 @@ const Index = () => {
     }
   }, [activeFileIndex, extractedDataByFile]);
 
-  // Auto-switch away from validation tab if the new file has no results
+  // Auto-switch away from validation tab if the new file has no results.
+  // A file still being validated by "Validate All" keeps the tab: its spinner
+  // is the answer, and bouncing to Extracted mid-run would fight the user.
   useEffect(() => {
-    if (dataTab === "validation" && !validationByFile[activeFileIndex]) {
+    if (
+      dataTab === "validation" &&
+      !validationByFile[activeFileIndex] &&
+      !validationStateByFile[activeFileIndex]
+    ) {
       setDataTab("extracted");
     }
   }, [activeFileIndex]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -1070,7 +1150,7 @@ const Index = () => {
                           setTotalToProcess(0);
                           setRawContentByFile({});
                           setValidationByFile({});
-                          setValidationState("idle");
+                          setValidationStateByFile({});
                           setDataTab("extracted");
                         }}
                         className="gap-2 flex-1 sm:flex-none"
@@ -1083,11 +1163,25 @@ const Index = () => {
                       <Button
                         variant="outline"
                         onClick={handleValidate}
-                        disabled={validationState === "validating"}
+                        disabled={activeValidationState === "validating" || validateAllRunning}
                         className="gap-2 flex-1 sm:flex-none"
                       >
                         <ShieldCheck className="w-4 h-4" />
-                        {validationState === "validating" ? "Validating..." : "Validate"}
+                        {activeValidationState === "validating" ? "Validating..." : "Validate"}
+                      </Button>
+                    )}
+                    {processingState === "completed" && validatableIndexes.length > 1 && (
+                      <Button
+                        variant="outline"
+                        onClick={handleValidateAll}
+                        disabled={validateAllRunning}
+                        title={`Validate all ${validatableIndexes.length} extracted files`}
+                        className="gap-2 flex-1 sm:flex-none"
+                      >
+                        <ShieldCheck className="w-4 h-4" />
+                        {validateAllRunning
+                          ? `Validating ${validateAllCompleted}/${validatableIndexes.length}...`
+                          : `Validate All (${validatableIndexes.length})`}
                       </Button>
                     )}
                     <Button
@@ -1320,10 +1414,16 @@ const Index = () => {
 
                     {/* Validation view */}
                     <div className={dataTab === "validation" ? "" : "hidden"}>
-                      {validationState === "validating" ? (
+                      {activeValidationState === "validating" ? (
                         <div className="flex items-center justify-center py-12 text-muted-foreground gap-2">
                           <div className="w-4 h-4 border-2 border-primary border-t-transparent rounded-full animate-spin" />
                           Validating items against master data...
+                        </div>
+                      ) : activeValidationState === "error" && !validationByFile[activeFileIndex] ? (
+                        <div className="flex flex-col items-center justify-center py-12 text-muted-foreground">
+                          <ShieldCheck className="w-10 h-10 mb-3 opacity-30" />
+                          <p className="font-medium">Validation failed for this file</p>
+                          <p className="text-sm mt-1">Click "Validate" to try again.</p>
                         </div>
                       ) : validationByFile[activeFileIndex] ? (
                         <>
