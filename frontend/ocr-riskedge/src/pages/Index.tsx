@@ -967,15 +967,20 @@ const Index = () => {
     }
   }, [activeFileIndex]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Close fullscreen data panel on Escape
+  // Fullscreen data panel: Escape closes it, arrow keys switch files — the
+  // thumbnail strip is hidden behind the overlay, so this is the only other
+  // way to move between invoices without leaving fullscreen.
   useEffect(() => {
     if (!dataPanelFullscreen) return;
     const handler = (e: KeyboardEvent) => {
       if (e.key === "Escape") setDataPanelFullscreen(false);
+      else if (e.key === "ArrowLeft") setActiveFileIndex((prev) => Math.max(0, prev - 1));
+      else if (e.key === "ArrowRight")
+        setActiveFileIndex((prev) => Math.min(selectedFiles.length - 1, prev + 1));
     };
     document.addEventListener("keydown", handler);
     return () => document.removeEventListener("keydown", handler);
-  }, [dataPanelFullscreen]);
+  }, [dataPanelFullscreen, selectedFiles.length]);
 
   // Cleanup preview URLs on unmount — use refs so the closure always sees
   // the latest values and doesn't fire on every state change.
@@ -1382,6 +1387,43 @@ const Index = () => {
                         )}
                       </button>
                     </div>
+
+                    {/* File navigation — only needed in fullscreen, where the
+                        thumbnail strip and preview panel are hidden behind
+                        the overlay and would otherwise be the only way to
+                        switch invoices. */}
+                    {dataPanelFullscreen && selectedFiles.length > 1 && (
+                      <div className="flex items-center gap-2">
+                        <Button
+                          variant="outline"
+                          size="icon"
+                          className="h-8 w-8"
+                          onClick={() => setActiveFileIndex((prev) => Math.max(0, prev - 1))}
+                          disabled={activeFileIndex === 0}
+                          title="Previous file"
+                        >
+                          <ChevronLeft className="w-4 h-4" />
+                        </Button>
+                        <span
+                          className="text-sm text-muted-foreground max-w-[240px] truncate"
+                          title={selectedFiles[activeFileIndex]?.name}
+                        >
+                          {activeFileIndex + 1} / {selectedFiles.length} — {selectedFiles[activeFileIndex]?.name}
+                        </span>
+                        <Button
+                          variant="outline"
+                          size="icon"
+                          className="h-8 w-8"
+                          onClick={() =>
+                            setActiveFileIndex((prev) => Math.min(selectedFiles.length - 1, prev + 1))
+                          }
+                          disabled={activeFileIndex === selectedFiles.length - 1}
+                          title="Next file"
+                        >
+                          <ChevronRight className="w-4 h-4" />
+                        </Button>
+                      </div>
+                    )}
 
                     <Button
                       variant="ghost"

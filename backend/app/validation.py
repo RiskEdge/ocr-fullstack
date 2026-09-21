@@ -1211,7 +1211,9 @@ def derive_cost_price(item: dict, master: dict) -> tuple[Optional[float], Option
 
     The tax leg falls back to the GST rate when the invoice prints no tax
     amounts; the two routes are algebraically the same, since the printed
-    SGST + CGST is itself qty * price * rate.
+    SGST + CGST is itself qty * price * rate. When the line prints no rate
+    either — the format keeps its rates in an HSN summary block instead — the
+    matched catalog row's tax_pct stands in, and `source` says so.
 
     A discount on the line comes off the rate before anything else, since the
     catalog's cost is net of it:
@@ -1282,11 +1284,21 @@ def derive_cost_price(item: dict, master: dict) -> tuple[Optional[float], Option
         source       = "tax_amounts"
         tax_formula  = f"{_fmt_num(tax_total)} / {_fmt_num(total_units)}"
     else:
-        rate = _gst_rate(item)
+        # The line's own rate when it prints one. Plenty of formats print
+        # neither a tax amount nor a GST% on the line — they carry the rates
+        # in an HSN-wise summary block the item never sees — and the whole
+        # derivation used to be abandoned there, leaving the cost price blank
+        # on every line of such an invoice. The catalog row we matched holds
+        # the same rate, so it stands in; `source` records which one was used
+        # so the UI can say so rather than implying the vendor printed it.
+        rate   = _gst_rate(item)
+        source = "gst_rate"
+        if rate is None:
+            rate   = _to_float(master.get("gst_percent"))
+            source = "catalog_rate"
         if rate is None:
             return None, None
         tax_per_unit = base_unit_cost * rate / 100.0
-        source       = "gst_rate"
         tax_formula  = f"{_fmt_num(base_unit_cost)} x {_fmt_num(rate)}%"
 
     cost_price = round(base_unit_cost + tax_per_unit, _COST_PRECISION)
@@ -1428,8 +1440,12 @@ def _derive_blocker(item: dict, master: dict) -> str:
             return "no unit price and no taxable value on the line"
         if quantity is None or quantity < _MIN_DERIVE_INPUT:
             return "taxable value present but quantity missing"
-    if _tax_total(item) is None and _gst_rate(item) is None:
-        return "no tax amount and no gst rate on the line"
+    if (
+        _tax_total(item) is None
+        and _gst_rate(item) is None
+        and _to_float(master.get("gst_percent")) is None
+    ):
+        return "no tax amount or gst rate on the line, and no rate on the matched catalog row"
     if disc and disc["pct"] and disc["pct"] >= 100:
         return "discount is 100% or more"
     return "inputs present but non-positive"

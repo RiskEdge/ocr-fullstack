@@ -26,10 +26,11 @@ export interface PluOption {
 export interface DerivedField {
   value: number;
   /**
-   * How the value was reached: tax from printed amounts, tax from the GST
-   * rate, or a printed cost price with the line's discount taken off.
+   * How the value was reached: tax from printed amounts, tax from the line's
+   * GST rate, tax from the matched catalog row's rate when the line printed
+   * none, or a printed cost price with the line's discount taken off.
    */
-  source: "tax_amounts" | "gst_rate" | "printed_discount";
+  source: "tax_amounts" | "gst_rate" | "catalog_rate" | "printed_discount";
   formula: string;
   unit_price?: number;
   price_source?: string;

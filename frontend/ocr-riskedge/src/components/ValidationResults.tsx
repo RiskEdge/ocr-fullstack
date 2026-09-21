@@ -312,7 +312,7 @@ function deriveCostPrice(item: ValidatedItem, master: PluOption): DerivedField |
 		source = 'tax_amounts';
 		taxFormula = `${trimNum(taxTotal)} / ${trimNum(totalUnits)}`;
 	} else {
-		const rate =
+		const lineRate =
 			num(item['gst_percent']) ??
 			num(item['tax_pct']) ??
 			(() => {
@@ -321,9 +321,14 @@ function deriveCostPrice(item: ValidatedItem, master: PluOption): DerivedField |
 					.filter((n): n is number => n !== null);
 				return halves.length ? halves.reduce((a, b) => a + b, 0) : null;
 			})();
+		// Formats that keep their rates in an HSN summary print neither a tax
+		// amount nor a GST% on the line. The catalog row holds the same rate, so
+		// it stands in rather than abandoning the derivation — `source` records
+		// which of the two was used.
+		const rate = lineRate ?? num(master.tax_pct);
 		if (rate === null) return null;
 		taxPerUnit = (baseUnitCost * rate) / 100;
-		source = 'gst_rate';
+		source = lineRate === null ? 'catalog_rate' : 'gst_rate';
 		taxFormula = `${trimNum(baseUnitCost)} x ${trimNum(rate)}%`;
 	}
 
@@ -441,7 +446,12 @@ function DerivedBadge({ derived }: { derived: DerivedField }) {
 						{derived.uom_qty ? ` ÷ ${trimNum(derived.uom_qty)} units` : ''}
 						{derived.source === 'tax_amounts'
 							? ", plus the line's GST spread over every unit."
-							: ", plus GST at the line's rate."}
+							: derived.source === 'catalog_rate'
+								? // The invoice printed no rate on this line, so saying
+									// "the line's rate" would credit the vendor with a
+									// figure that came from the catalog.
+									", plus GST at the catalog's rate — the line prints none."
+								: ", plus GST at the line's rate."}
 					</p>
 				)}
 			</TooltipContent>
@@ -1346,6 +1356,53 @@ function sumFields(
 	return keys.length ? { keys, value: parseFloat(total.toFixed(4)) } : null;
 }
 
+/** Standard Indian GST slabs, for recognising a tax-inclusive column when the
+ *  invoice states no rate anywhere the line can see. */
+const GST_SLABS = [5, 12, 18, 28];
+
+/**
+ * Whether this invoice's line-amount column is printed before or after tax.
+ *
+ * A line on its own cannot tell: 1,150.00 is a plausible pre-tax total and a
+ * plausible tax-inclusive one, and reporting an arithmetic error against the
+ * wrong basis states the wrong expected figure. The rest of the invoice can
+ * tell, though — the lines that *do* reconcile all reconcile on the same
+ * basis, because one vendor's template prints one of them. So the basis is
+ * decided by vote across every line and applied to the one that fails.
+ *
+ * Deliberately reads only what the invoice printed — rate, quantity, discount,
+ * tax rate, amount — so it does not depend on a catalog match and gives the
+ * same answer for a matched and an unmatched line.
+ */
+function lineAmountBasis(items: ValidatedItem[]): 'pre_tax' | 'tax_inclusive' | 'unknown' {
+	let preTaxHits = 0;
+	let inclusiveHits = 0;
+	for (const raw of items) {
+		const item = raw as Record<string, unknown>;
+		const amountField = findFieldValue(item, LINE_AMOUNT_CANDIDATES);
+		const unitPrice = findFieldOrdered(item, UNIT_PRICE_CANDIDATES);
+		const quantity = num(item['quantity']);
+		if (!amountField || !unitPrice || quantity === null) continue;
+		const amount = amountField.value;
+
+		const disc = lineDiscount(item);
+		const gross = round2(unitPrice.value * quantity);
+		const net = disc ? netUnitPrice(gross, 1, disc) : gross;
+		if (net === null) continue;
+
+		if (Math.abs(round2(net) - amount) <= 0.05) {
+			preTaxHits += 1;
+			continue;
+		}
+		const rate = findFieldOrdered(item, TAX_PCT_CANDIDATES)?.value;
+		if (rate === undefined) continue;
+		if (Math.abs(round2(net * (1 + rate / 100)) - amount) <= 0.05) inclusiveHits += 1;
+	}
+	if (preTaxHits > inclusiveHits) return 'pre_tax';
+	if (inclusiveHits > preTaxHits) return 'tax_inclusive';
+	return 'unknown';
+}
+
 interface CalcCheck {
 	label: string;
 	field: string;
@@ -1464,6 +1521,10 @@ const ValidationResults = ({ items, documentScalars, sourceFilename }: Props) =>
 	const [hintMap, setHintMap] = useState<Map<string, FieldHint>>(new Map());
 	// Ref for the copy event listener (copied_summary signal)
 	const containerRef = useRef<HTMLDivElement>(null);
+	// Data-row elements by index, so the Grand Total panel can jump straight to
+	// the line it says is causing a shortfall instead of leaving the user to
+	// scroll and hunt for it.
+	const rowRefs = useRef<Map<number, HTMLTableRowElement>>(new Map());
 
 	// Fire flag-exposure for discrepancies/match-types as rows are expanded.
 	useEffect(() => {
@@ -1532,7 +1593,16 @@ const ValidationResults = ({ items, documentScalars, sourceFilename }: Props) =>
 		});
 	}, [items]);
 
-	// Collect all unique field keys across all items (preserve insertion order, skip 'validation')
+	// Collect all unique field keys across all items (preserve insertion order,
+	// skip 'validation'), then append any key that exists only as a derived
+	// value.
+	//
+	// A cost price the invoice never printed a column for is the whole reason
+	// for the second pass: it lives in validation.derived_fields, never on the
+	// item, so building the columns from item keys alone gave it nowhere to
+	// render and the figure was visible only inside an expanded row. Derived
+	// keys go last so the invoice's own columns keep the order it printed them
+	// in.
 	const fieldKeys = useMemo(() => {
 		const keys: string[] = [];
 		const seen = new Set<string>();
@@ -1544,8 +1614,19 @@ const ValidationResults = ({ items, documentScalars, sourceFilename }: Props) =>
 				}
 			}
 		}
+		for (let idx = 0; idx < items.length; idx++) {
+			for (const key of Object.keys(effectiveDerivedFields(idx))) {
+				if (!seen.has(key)) {
+					seen.add(key);
+					keys.push(key);
+				}
+			}
+		}
 		return keys;
-	}, [items]);
+		// effectiveDerivedFields reads pluSelections: picking a PLU can derive a
+		// cost for a row that had none, which needs a column of its own.
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [items, pluSelections]);
 
 	// chevron + # + fieldKeys + PLU + Match + Status
 	const totalCols = fieldKeys.length + 5;
@@ -1619,6 +1700,10 @@ const ValidationResults = ({ items, documentScalars, sourceFilename }: Props) =>
 		let linesWithSubtotal = 0;
 		let subtotalPartial = false;
 		let subtotalDiscountApplied = 0;
+
+		// Decided across the whole invoice, so a line whose amount reconciles on
+		// neither basis is still reported against the one this vendor prints.
+		const amountBasis = lineAmountBasis(items);
 
 		for (let idx = 0; idx < items.length; idx++) {
 			const item = items[idx] as Record<string, unknown>;
@@ -1854,51 +1939,92 @@ const ValidationResults = ({ items, documentScalars, sourceFilename }: Props) =>
 				// (rate / b.rate / basic rate / unit price) onto invoice_price before
 				// the item reaches us, so they could never fire.
 
-				// Line Amount = Cost Price x Qty x pack size
-				// With packSize 1 this is the plain cost x qty it has always been.
-				if (
-					!isNaN(effectiveCostPrice) &&
-					!isNaN(quantity) &&
-					totalUnits > 0 &&
-					lineAmtField
-				) {
-					const calculated = parseFloat((checkCost * totalUnits).toFixed(2));
-					// Every unit carries up to half a paisa of rounding, so a flat 0.02
-					// reads a 50-unit line as broken when it is merely rounded.
-					const tolerance = Math.max(0.02, 0.005 * totalUnits);
-					const inclusiveOk = Math.abs(calculated - lineAmtField.value) <= tolerance;
+				// The printed amount has two admissible bases here, and which one a
+				// vendor uses is a property of the template, not of the line:
+				//
+				//   pre-tax         rate x qty, less the line's discount
+				//   tax-inclusive   that same base plus the line's GST — read off
+				//                   the cost price when one is available, else
+				//                   grossed up at the line's own rate
+				//
+				// Both are checked and the line passes on either, because an invoice
+				// that totals its lines before tax and charges the GST in the
+				// summary is not broken. What `amountBasis` decides is which one is
+				// *reported* when both fail: quoting a tax-inclusive expectation at
+				// a pre-tax column names the wrong figure as the correct one, which
+				// is worse than not checking at all. That was the hole a wrong
+				// pre-tax amount used to fall through — with no cost price
+				// derivable there was no check on the line whatsoever.
+				const preTax = computedTaxable;
+				const amt = lineAmtField?.value ?? NaN;
 
-					// An invoice that prints a rate and a GST% but no tax amount often
-					// totals the line before tax and charges the GST in the summary —
-					// so the printed amount is rate x qty less discount, not cost x
-					// units. That basis is tried when the tax-inclusive one fails,
-					// rather than reporting a consistent invoice as broken.
-					const preTax = computedTaxable;
-					const preTaxOk =
-						preTax !== null && Math.abs(preTax - lineAmtField.value) <= 0.05;
+				const bases: Array<{
+					calculated: number;
+					formula: string;
+					taxInclusive: boolean;
+					ok: boolean;
+				}> = [];
 
-					if (!inclusiveOk && preTaxOk) {
-						checks.push({
-							label: 'Line Amount',
-							field: lineAmtField.key,
-							formula: taxableFormula,
-							calculated: preTax!,
-							actual: lineAmtField.value,
-							ok: true,
-						});
-					} else {
-						checks.push({
-							label: 'Line Amount',
-							field: lineAmtField.key,
-							formula:
-								packSize > 1
-									? `${costLabel} × ${trimNum(quantity)} × ${trimNum(packSize)}`
-									: `${costLabel} × ${trimNum(quantity)}`,
-							calculated,
-							actual: lineAmtField.value,
-							ok: inclusiveOk,
-						});
-					}
+				if (preTax !== null) {
+					bases.push({
+						calculated: preTax,
+						formula: taxableFormula,
+						taxInclusive: false,
+						ok: Math.abs(preTax - amt) <= 0.05,
+					});
+				}
+				if (!isNaN(effectiveCostPrice) && !isNaN(quantity) && totalUnits > 0) {
+					const calculated = round2(checkCost * totalUnits);
+					// Every unit carries up to half a paisa of rounding, so a flat
+					// 0.02 reads a 50-unit line as broken when it is merely rounded.
+					bases.push({
+						calculated,
+						formula:
+							packSize > 1
+								? `${costLabel} × ${trimNum(quantity)} × ${trimNum(packSize)}`
+								: `${costLabel} × ${trimNum(quantity)}`,
+						taxInclusive: true,
+						ok: Math.abs(calculated - amt) <= Math.max(0.02, 0.005 * totalUnits),
+					});
+				} else if (preTax !== null && !isNaN(linePct)) {
+					// No catalog row to price the units, but the line states its own
+					// rate — enough to test the tax-inclusive basis on its own terms.
+					const calculated = round2(preTax * (1 + linePct / 100));
+					bases.push({
+						calculated,
+						formula: `${taxableFormula} + ${trimNum(linePct)}% GST`,
+						taxInclusive: true,
+						ok: Math.abs(calculated - amt) <= 0.05,
+					});
+				}
+
+				if (lineAmtField && bases.length) {
+					// Nothing on the line says which slab applies and the other lines
+					// did not agree on a basis either, so an amount that is the
+					// pre-tax base grossed up by *some* standard slab is taken as a
+					// tax-inclusive column. Guessing wrong here would flag every line
+					// of a perfectly ordinary invoice.
+					const slabOk =
+						amountBasis === 'unknown' &&
+						!bases.some((b) => b.taxInclusive) &&
+						preTax !== null &&
+						GST_SLABS.some((r) => Math.abs(round2(preTax * (1 + r / 100)) - amt) <= 0.05);
+
+					const chosen =
+						bases.find((b) => b.ok) ??
+						(amountBasis === 'pre_tax'
+							? bases.find((b) => !b.taxInclusive)
+							: bases.find((b) => b.taxInclusive)) ??
+						bases[0];
+
+					checks.push({
+						label: 'Line Amount',
+						field: lineAmtField.key,
+						formula: chosen.formula,
+						calculated: chosen.calculated,
+						actual: lineAmtField.value,
+						ok: bases.some((b) => b.ok) || slabOk,
+					});
 				}
 			}
 
@@ -2064,6 +2190,18 @@ const ValidationResults = ({ items, documentScalars, sourceFilename }: Props) =>
 				next.add(idx);
 			}
 			return next;
+		});
+	}
+
+	// Expands a line (if not already) and scrolls it into view — used by the
+	// Grand Total panel to jump straight to the line it says is causing a
+	// shortfall, rather than leaving the user to scroll and hunt for it.
+	function goToLine(itemIdx: number) {
+		setExpanded((prev) => (prev.has(itemIdx) ? prev : new Set(prev).add(itemIdx)));
+		requestAnimationFrame(() => {
+			rowRefs.current
+				.get(itemIdx)
+				?.scrollIntoView({ behavior: 'smooth', block: 'center' });
 		});
 	}
 
@@ -2394,17 +2532,10 @@ const ValidationResults = ({ items, documentScalars, sourceFilename }: Props) =>
 	}
 
 	function downloadValidationCsv() {
-		// Derived fields the invoice printed no column for (a cost price worked
-		// out from pack size and tax) get their own columns, or the export would
-		// have nowhere to put them.
-		const derivedOnlyKeys: string[] = [];
-		items.forEach((_, idx) => {
-			for (const key of Object.keys(effectiveDerivedFields(idx))) {
-				if (!fieldKeys.includes(key) && !derivedOnlyKeys.includes(key))
-					derivedOnlyKeys.push(key);
-			}
-		});
-		const exportKeys = [...fieldKeys, ...derivedOnlyKeys];
+		// fieldKeys already carries the keys that exist only as derived values —
+		// a cost price worked out from pack size and tax — so the export and the
+		// table now write the same columns.
+		const exportKeys = fieldKeys;
 
 		const headers = [
 			...exportKeys.map(fieldLabel),
@@ -2606,8 +2737,9 @@ const ValidationResults = ({ items, documentScalars, sourceFilename }: Props) =>
 				</div>
 
 				{/* Main table */}
-				<div className='border border-border rounded-lg'>
-					<Table wrapperClassName='overflow-visible'>
+				<Table
+					wrapperClassName='overflow-visible'
+					className='border border-border rounded-lg'>
 						<TableHeader sticky>
 							<UITableRow className='bg-muted/50 hover:bg-muted/50'>
 								<TableHead className='w-8 px-2' />
@@ -2720,6 +2852,10 @@ const ValidationResults = ({ items, documentScalars, sourceFilename }: Props) =>
 									<Fragment key={idx}>
 										{/* Data row */}
 										<UITableRow
+											ref={(el) => {
+												if (el) rowRefs.current.set(idx, el);
+												else rowRefs.current.delete(idx);
+											}}
 											className={`cursor-pointer hover:bg-muted/30 ${
 												isExpanded ? 'bg-muted/20' : ''
 											}`}
@@ -3965,8 +4101,7 @@ const ValidationResults = ({ items, documentScalars, sourceFilename }: Props) =>
 								);
 							})}
 						</TableBody>
-					</Table>
-				</div>
+				</Table>
 			</div>
 
 			{/* Grand Total — Subtotal (computed from the line items, each on its
@@ -3982,6 +4117,35 @@ const ValidationResults = ({ items, documentScalars, sourceFilename }: Props) =>
 						gt.documentTotal === null
 							? null
 							: parseFloat((gt.expectedTotal - gt.documentTotal).toFixed(2));
+					// Which line(s) this shortfall traces back to, so a mismatch is a
+					// lead to follow rather than an unexplained number. Only the two
+					// checks that feed the subtotal a line contributes are relevant
+					// here — a Tax Amount or Cost Price check failing doesn't move
+					// this ladder's Subtotal rung the way a wrong Taxable Value or
+					// Line Amount does.
+					const explainers = !gt.ok
+						? calcResults.lineResults
+								.flatMap((r) =>
+									r.checks
+										.filter(
+											(c) =>
+												!c.ok &&
+												(c.label === 'Line Amount' ||
+													c.label === 'Taxable Value'),
+										)
+										.map((c) => ({ idx: r.idx, check: c })),
+								)
+								.map(({ idx, check }) => ({
+									idx,
+									name: String(
+										items[idx]?.['sku_description'] ??
+											items[idx]?.sku_desc ??
+											items[idx]?.product_name ??
+											`Row ${idx + 1}`,
+									),
+									check,
+								}))
+						: [];
 					const summaryParts: string[] = [];
 					if (gt.printedSubtotal)
 						summaryParts.push(
@@ -4112,6 +4276,28 @@ const ValidationResults = ({ items, documentScalars, sourceFilename }: Props) =>
 										)}
 									</tbody>
 								</table>
+
+								{explainers.length > 0 && (
+									<div className='mt-3 border border-destructive/30 bg-destructive/5 rounded-lg px-3 py-2'>
+										<p className='text-xs font-semibold text-destructive flex items-center gap-1.5'>
+											<Calculator className='w-3.5 h-3.5' />
+											Traces to {explainers.length} line
+											{explainers.length !== 1 ? 's' : ''} with a calculation mismatch
+										</p>
+										<ul className='mt-1.5 space-y-1'>
+											{explainers.map(({ idx, name, check }, i) => (
+												<li key={i}>
+													<button
+														type='button'
+														onClick={() => goToLine(idx)}
+														className='text-xs text-left text-destructive underline decoration-dotted underline-offset-2 hover:decoration-solid'>
+														Line {idx + 1} ({name}) — {check.label} printed {String(check.actual)} vs expected {String(check.calculated)}
+													</button>
+												</li>
+											))}
+										</ul>
+									</div>
+								)}
 
 								<div className='mt-3 space-y-1 text-xs text-muted-foreground'>
 									<p>
